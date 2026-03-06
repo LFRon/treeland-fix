@@ -147,6 +147,7 @@ set(SOURCES
     utils/wcursorimage.cpp
     utils/wextimagecapturesourcev1impl.cpp
     utils/wbufferdumper.cpp
+    utils/wcontainerof.h
 
     platformplugin/qwlrootsintegration.cpp
     platformplugin/qwlrootscreen.cpp
@@ -246,6 +247,7 @@ set(HEADERS
     utils/wextimagecapturesourcev1impl.h
     utils/wbufferdumper.h
     utils/WBufferDumper
+    utils/WContainerOf
 
     protocols/wxdgshell.h
     protocols/WXdgShell
