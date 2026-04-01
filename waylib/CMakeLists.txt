@@ -16,6 +16,9 @@ option(DISABLE_XWAYLAND "Disable the xwayland support" OFF)
 option(INSTALL_TINYWL "A minimum viable product Wayland compositor based on waylib" OFF)
 option(ADDRESS_SANITIZER "Enable address sanitize" OFF)
 option(WAYLIB_USE_PERCOMPILE_HEADERS "Use precompile headers to build waylib" OFF)
+# wlroots version options
+option(USE_WLROOTS_20 "Use wlroots 0.20 version" ON)
+option(USE_WLROOTS_19 "Use wlroots 0.19 version" OFF)
 
 find_package(Qt6 COMPONENTS Core Gui Quick REQUIRED)
 if(Qt6_VERSION VERSION_GREATER_EQUAL 6.10)
@@ -24,6 +27,9 @@ endif()
 if(WITH_SUBMODULE_QWLROOTS)
     # Use qwlroots from project root directory
     include(${CMAKE_SOURCE_DIR}/qwlroots/cmake/WaylandScannerHelpers.cmake)
+    # Pass wlroots version options to qwlroots
+    set(USE_WLROOTS_20 ${USE_WLROOTS_20})
+    set(USE_WLROOTS_19 ${USE_WLROOTS_19})
     add_subdirectory(${CMAKE_SOURCE_DIR}/qwlroots qwlroots)
     message("Using QWlroots from submodule")
 else()

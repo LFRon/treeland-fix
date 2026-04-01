@@ -59,6 +59,9 @@ set(LOCAL_QML_IMPORT_PATH "${PROJECT_BINARY_DIR}/qt/qml")
 if(WITH_SUBMODULE_WAYLIB)
     set(WITH_SUBMODULE_QWLROOTS ON)
     include(${CMAKE_CURRENT_SOURCE_DIR}/qwlroots/cmake/WaylandScannerHelpers.cmake)
+    # Pass wlroots version options to qwlroots
+    set(USE_WLROOTS_20 ${USE_WLROOTS_20})
+    set(USE_WLROOTS_19 ${USE_WLROOTS_19})
     add_subdirectory(waylib)
     list(APPEND LOCAL_QML_IMPORT_PATH "${PROJECT_BINARY_DIR}/waylib/src/server")
 else()
@@ -71,7 +74,19 @@ set(QML_IMPORT_PATH "${LOCAL_QML_IMPORT_PATH}" CACHE STRING "For LSP" FORCE)
 find_package(PkgConfig REQUIRED)
 find_package(Qt6 CONFIG REQUIRED Core DBus Gui Qml Quick QuickControls2 LinguistTools Test QuickTest)
 
-pkg_check_modules(WLROOTS REQUIRED IMPORTED_TARGET wlroots-0.19)
+# Support both wlroots-0.19 and wlroots-0.20
+option(USE_WLROOTS_20 "Use wlroots 0.20 version" ON)
+option(USE_WLROOTS_19 "Use wlroots 0.19 version" OFF)
+
+if (USE_WLROOTS_20)
+    pkg_check_modules(WLROOTS REQUIRED IMPORTED_TARGET wlroots-0.20)
+    message("Using wlroots-0.20")
+elseif (USE_WLROOTS_19)
+    pkg_check_modules(WLROOTS REQUIRED IMPORTED_TARGET wlroots-0.19)
+    message("Using wlroots-0.19")
+else()
+    message(FATAL_ERROR "Neither USE_WLROOTS_20 nor USE_WLROOTS_19 is enabled")
+endif()
 
 qt_standard_project_setup(REQUIRES 6.8)
 

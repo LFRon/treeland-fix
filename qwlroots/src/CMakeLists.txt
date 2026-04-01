@@ -19,6 +19,9 @@ find_package(PkgConfig REQUIRED)
 if (USE_WLROOTS_19)
     set(wlr wlroots-0.19)
     set(WLROOTS_MINIMUM_REQUIRED 0.19.0)
+elseif (USE_WLROOTS_20)
+    set(wlr wlroots-0.20)
+    set(WLROOTS_MINIMUM_REQUIRED 0.20.0)
 else ()
     set(wlr wlroots-0.18)
     set(WLROOTS_MINIMUM_REQUIRED 0.18.0)
@@ -68,7 +71,7 @@ ws_generate(server wayland-protocols unstable/tablet/tablet-unstable-v2.xml tabl
 ws_generate(server wayland-protocols unstable/pointer-constraints/pointer-constraints-unstable-v1.xml pointer-constraints-unstable-v1-protocol)
 ws_generate(server wayland-protocols staging/alpha-modifier/alpha-modifier-v1.xml alpha-modifier-v1-protocol)
 ws_generate(server wayland-protocols staging/ext-transient-seat/ext-transient-seat-v1.xml ext-transient-seat-v1-protocol)
-if (USE_WLROOTS_19)
+if (USE_WLROOTS_19 OR USE_WLROOTS_20)
     ws_generate(server wayland-protocols staging/color-management/color-management-v1.xml color-management-v1-protocol)
     ws_generate(server wayland-protocols staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml ext-image-copy-capture-v1-protocol)
     ws_generate(server wayland-protocols staging/ext-image-capture-source/ext-image-capture-source-v1.xml ext-image-capture-source-v1-protocol)
@@ -167,7 +170,7 @@ set(HEADERS
     interfaces/qwtabletpadinterface.h
 )
 
-if (USE_WLROOTS_19)  # 0.19
+if (USE_WLROOTS_19 OR USE_WLROOTS_20)  # 0.19
     list(APPEND HEADERS
         types/qwcolormanagerv1.h
         types/qwextimagecopycapturev1.h
