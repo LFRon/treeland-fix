@@ -1,4 +1,4 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "wsurfaceitem.h"
@@ -161,6 +161,17 @@ public:
     WSurfaceItemContentPrivate([[maybe_unused]] WSurfaceItemContent *qq){}
 
     ~WSurfaceItemContentPrivate() {
+        adjustClientBufferIgnoreLocks(buffer.get(), -1);
+        adjustClientBufferIgnoreLocks(pendingBuffer.get(), -1);
+    }
+
+    // Adjust n_ignore_locks to allow wlr_client_buffer_apply_damage to reuse client buffers.
+    static void adjustClientBufferIgnoreLocks(qw_buffer *buf, int delta) {
+        if (buf) {
+            if (auto cb = qw_client_buffer::get(*buf)) {
+                cb->handle()->n_ignore_locks += delta;
+            }
+        }
     }
 
     void cleanTextureProvider();
@@ -181,6 +192,7 @@ public:
         Q_ASSERT(!updateTextureConnection);
 
         if (dontCacheLastBuffer) {
+            adjustClientBufferIgnoreLocks(buffer.get(), -1);
             buffer.reset();
             cleanTextureProvider();
             q->update();
@@ -208,27 +220,23 @@ public:
 
                 if (!live) {
                     // Non-live mode: update pendingBuffer
-                    // CRITICAL FIX: Only reset if the buffer pointer actually changed.
-                    // If pendingBuffer.get() == newBuffer (same pointer), calling reset() would:
-                    // 1. Call deleter (unlocker) on the old pointer → unlock()
-                    // 2. Set the new pointer (which is the same object)
-                    // 3. Then we call lock() again
-                    // This unlock-then-lock of the same buffer can cause n_locks to temporarily
-                    // hit 0, triggering wlroots' assert(buffer->n_locks > 0) in wlr_buffer_unlock().
                     if (pendingBuffer.get() != newBuffer) {
+                        if (Q_LIKELY(newBuffer)) {
+                            newBuffer->lock();
+                            adjustClientBufferIgnoreLocks(newBuffer, +1);
+                        }
+                        adjustClientBufferIgnoreLocks(pendingBuffer.get(), -1);
                         pendingBuffer.reset(newBuffer);
-                        if (Q_LIKELY(pendingBuffer))
-                            pendingBuffer->lock();
                     }
                 } else {
                     // Live mode: update buffer immediately
-                    // Same fix as above: only reset if the buffer pointer actually changed
-                    // to avoid double-unlock of the same buffer when surface commits without buffer change.
                     if (buffer.get() != newBuffer) {
+                        if (Q_LIKELY(newBuffer)) {
+                            newBuffer->lock();
+                            adjustClientBufferIgnoreLocks(newBuffer, +1);
+                        }
+                        adjustClientBufferIgnoreLocks(buffer.get(), -1);
                         buffer.reset(newBuffer);
-                        // lock buffer to ensure the WSurfaceItem can keep the last frame after WSurface destroyed.
-                        if (Q_LIKELY(buffer))
-                            buffer->lock();
                     }
 
                     q->update();
@@ -304,6 +312,7 @@ public:
 
     inline void swapBufferIfNeeded() {
         if (pendingBuffer) {
+            adjustClientBufferIgnoreLocks(buffer.get(), -1);
             buffer.reset(pendingBuffer.release());
         }
     }
