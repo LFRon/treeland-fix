@@ -73,6 +73,8 @@ personalization_font_context_v1::personalization_font_context_v1(
                                    [](struct wl_resource *resource) {
                                        auto *p =
                                            personalization_font_context_v1::fromResource(resource);
+                                       if (!p)
+                                           return;
                                        Q_EMIT p->beforeDestroy();
                                        wl_resource_set_user_data(resource, nullptr);
                                        delete p;
