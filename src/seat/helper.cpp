@@ -1688,7 +1688,7 @@ void Helper::forceActivateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reaso
             !(reason == Qt::TabFocusReason || reason == Qt::BacktabFocusReason));
     }
 
-    if (!wrapper->surface()->mapped()) {
+    if (!wrapper->surface() || !wrapper->surface()->mapped()) {
         qCWarning(treelandShell) << "Can't activate unmapped surface: " << wrapper;
         return;
     }
