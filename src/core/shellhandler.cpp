@@ -186,6 +186,12 @@ void ShellHandler::createPrelaunchSplash(const QString &appId,
         iconBuffer->unlock();
     }
     m_prelaunchWrappers.append(wrapper);
+    // Guard against dangling pointers: no matter how the wrapper is destroyed
+    // (timeout, close request, match, workspace cleanup, parent destruction, etc.),
+    // remove it from the prelaunch list.
+    connect(wrapper, &QObject::destroyed, this, [this, wrapper]() {
+        m_prelaunchWrappers.removeAll(wrapper);
+    });
     m_workspace->addSurface(wrapper);
     setupSurfaceActiveWatcher(wrapper);
     registerSurfaceToForeignToplevel(wrapper);
