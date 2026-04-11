@@ -67,8 +67,8 @@ treeland_window_management_v1 *treeland_window_management_v1::create(qw_display 
 void treeland_window_management_v1::set_desktop(uint32_t state)
 {
     this->state = state;
-    wl_resource *resource;
-    wl_list_for_each(resource, &this->resources, link)
+    wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_window_management_v1_send_show_desktop(resource, state);
     }

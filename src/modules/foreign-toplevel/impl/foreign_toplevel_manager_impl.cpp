@@ -296,8 +296,8 @@ static void treeland_foreign_toplevel_handle_destroy([[maybe_unused]] struct wl_
 static void toplevel_idle_send_done(void *data)
 {
     auto *toplevel = static_cast<treeland_foreign_toplevel_handle_v1 *>(data);
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &toplevel->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &toplevel->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_done(resource);
     }
@@ -320,8 +320,8 @@ void treeland_foreign_toplevel_handle_v1::set_title(const QString &title)
         return;
     this->title = title;
 
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_title(resource, title.toUtf8());
     }
@@ -335,8 +335,8 @@ void treeland_foreign_toplevel_handle_v1::set_app_id(const QString &app_id)
         return;
     this->app_id = app_id;
 
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_app_id(resource, app_id.toLocal8Bit());
     }
@@ -348,8 +348,8 @@ void treeland_foreign_toplevel_handle_v1::set_pid(const pid_t pid)
 {
     this->pid = pid;
 
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_pid(resource, pid);
     }
@@ -361,8 +361,8 @@ void treeland_foreign_toplevel_handle_v1::set_identifier(uint32_t identifier)
 {
     this->identifier = identifier;
 
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_identifier(resource, identifier);
     }
@@ -389,8 +389,8 @@ static void send_output_to_resource(wl_resource *resource, wlr_output *output, b
 
 void treeland_foreign_toplevel_handle_v1::send_output(qw_output *output, bool enter)
 {
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         send_output_to_resource(resource, output->handle(), enter);
     }
@@ -414,8 +414,8 @@ void treeland_foreign_toplevel_handle_v1::output_enter(qw_output *output)
     connect(output, &qw_output::notify_bind, this, [toplevel_output](wlr_output_event_bind *event) {
         const wl_client *client = wl_resource_get_client(event->resource);
 
-        struct wl_resource *resource;
-        wl_resource_for_each(resource, &toplevel_output.toplevel->resources)
+        struct wl_resource *resource, *tmp;
+        wl_resource_for_each_safe(resource, tmp, &toplevel_output.toplevel->resources)
         {
             if (wl_resource_get_client(resource) == client) {
                 send_output_to_resource(resource, toplevel_output.output->handle(), true);
@@ -480,8 +480,8 @@ void treeland_foreign_toplevel_handle_v1::send_state()
     wl_array_init(&states);
     bool r = fill_array_from_toplevel_state(&states, this->state);
     if (!r) {
-        struct wl_resource *resource;
-        wl_resource_for_each(resource, &this->resources)
+        struct wl_resource *resource, *tmp;
+        wl_resource_for_each_safe(resource, tmp, &this->resources)
         {
             wl_resource_post_no_memory(resource);
         }
@@ -490,8 +490,8 @@ void treeland_foreign_toplevel_handle_v1::send_state()
         return;
     }
 
-    struct wl_resource *resource;
-    wl_resource_for_each(resource, &this->resources)
+    struct wl_resource *resource, *tmp;
+    wl_resource_for_each_safe(resource, tmp, &this->resources)
     {
         treeland_foreign_toplevel_handle_v1_send_state(resource, &states);
     }
