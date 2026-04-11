@@ -98,7 +98,10 @@ personalization_appearance_context_v1::personalization_appearance_context_v1(
         this,
         [](struct wl_resource *resource) {
             auto *p = personalization_appearance_context_v1::fromResource(resource);
+            if (!p)
+                return;
             Q_EMIT p->beforeDestroy();
+            wl_resource_set_user_data(resource, nullptr);
             delete p;
         });
 

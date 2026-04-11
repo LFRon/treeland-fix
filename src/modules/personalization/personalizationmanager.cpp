@@ -196,26 +196,32 @@ void PersonalizationV1::onAppearanceContextCreated(personalization_appearance_co
 
     connect(context, &Appearance::roundCornerRadiusChanged, this, [this](int32_t radius) {
         Helper::instance()->config()->setWindowRadius(radius);
-        for (auto *context : m_appearanceContexts) {
-            context->sendRoundCornerRadius(radius);
+        // Copy the list to guard against re-entrant modification if a send
+        // triggers client destruction (which removes entries from the vector).
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendRoundCornerRadius(radius);
         }
     });
     connect(context, &Appearance::iconThemeChanged, this, [this](const QString &theme) {
         Helper::instance()->config()->setIconThemeName(theme);
-        for (auto *context : m_appearanceContexts) {
-            context->sendIconTheme(theme.toUtf8());
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendIconTheme(theme.toUtf8());
         }
     });
     connect(context, &Appearance::activeColorChanged, this, [this](const QString &color) {
         Helper::instance()->config()->setActiveColor(color);
-        for (auto *context : m_appearanceContexts) {
-            context->sendActiveColor(color.toUtf8());
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendActiveColor(color.toUtf8());
         }
     });
     connect(context, &Appearance::windowOpacityChanged, this, [this](uint32_t opacity) {
         Helper::instance()->config()->setWindowOpacity(opacity);
-        for (auto *context : m_appearanceContexts) {
-            context->sendWindowOpacity(opacity);
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendWindowOpacity(opacity);
         }
     });
     connect(context, &Appearance::windowThemeTypeChanged, this, [this](int32_t type) {
@@ -223,14 +229,16 @@ void PersonalizationV1::onAppearanceContextCreated(personalization_appearance_co
         if (dconfigType.has_value()) {
             Helper::instance()->config()->setWindowThemeType(*dconfigType);
         }
-        for (auto *context : m_appearanceContexts) {
-            context->sendWindowThemeType(type);
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendWindowThemeType(type);
         }
     });
     connect(context, &Appearance::titlebarHeightChanged, this, [this](uint32_t height) {
         Helper::instance()->config()->setWindowTitlebarHeight(height);
-        for (auto *context : m_appearanceContexts) {
-            context->sendWindowTitlebarHeight(height);
+        const auto contexts = m_appearanceContexts;
+        for (auto *ctx : contexts) {
+            ctx->sendWindowTitlebarHeight(height);
         }
     });
 
