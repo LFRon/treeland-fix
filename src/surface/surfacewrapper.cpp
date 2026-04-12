@@ -996,8 +996,21 @@ void SurfaceWrapper::markWrapperToRemoved()
     }
     m_subSurfaces.clear();
     m_shellSurface = nullptr;
-    if (m_surfaceItem)
+    if (m_surfaceItem) {
         m_surfaceItem->disconnect(this);
+        // Hide the surfaceItem immediately to prevent the scene graph renderer
+        // from accessing stale wlr_surface/wlr_buffer data during the next
+        // render frame.  The underlying wlroots resources are already freed at
+        // this point (the wayland client disconnected or the surface was
+        // destroyed), but deleteLater() won't run until the next event-loop
+        // iteration.  Without hiding, the QSG renderer will traverse the still-
+        // visible WSurfaceItem and read freed GPU buffer memory, causing heap
+        // corruption ("corrupted size vs. prev_size").
+        m_surfaceItem->setVisible(false);
+    }
+
+    // Also hide the wrapper itself so the scene graph skips the entire subtree.
+    QQuickItem::setVisible(false);
 
     if (!isWindowAnimationRunning()) {
         deleteLater();
