@@ -817,10 +817,22 @@ static void treeland_foreign_toplevel_manager_handle_get_dock_preview_context(
     context->destroy_listener_wrapper.context = context;
     context->destroy_listener_wrapper.wrapped_listener.notify = [](struct wl_listener *listener, [[maybe_unused]] void *data) {
         treeland_dock_preview_context_v1::TDPCPODWrapper *wrapper = wl_container_of(listener, wrapper, wrapped_listener);
-        wl_resource_destroy(wrapper->context->resource);
-
-        // wl_list_remove(&context->destroy_listener.link);
-        // context->relative_surface = nullptr;
+        // Only remove the listener from the signal and clear the surface reference.
+        // Do NOT call wl_resource_destroy() here: if the relative_surface belongs
+        // to the same wl_client as the dock preview context, we would modify the
+        // client's resource map during wl_map_for_each iteration inside
+        // wl_client_destroy, corrupting the map and causing a crash (null pointer
+        // in wl_signal_emit).  Even for cross-client cases, calling
+        // wl_resource_destroy from within a wl_signal_emit on the surface's
+        // destroy signal is unsafe because the subsequent
+        // treeland_dock_preview_context_resource_destroy would wl_list_remove the
+        // listener that is currently being dispatched.
+        //
+        // The context resource will be cleaned up when the dock client disconnects
+        // or explicitly calls the destroy request.
+        wl_list_remove(&wrapper->wrapped_listener.link);
+        wl_list_init(&wrapper->wrapped_listener.link);
+        wrapper->context->relative_surface = nullptr;
     };
 
     wl_signal_add(&context->relative_surface->events.destroy, &context->destroy_listener_wrapper.wrapped_listener);
