@@ -1,4 +1,4 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include <QObject>
@@ -105,6 +105,11 @@ void WServerPrivate::init()
     int fd = wl_event_loop_get_fd(loop);
 
     auto processWaylandEvents = [this] {
+        if (isProcessingEvents)
+            return;
+
+        QScopedValueRollback<bool> guard(isProcessingEvents, true);
+
         int ret = wl_event_loop_dispatch(loop, 0);
         if (ret)
             fprintf(stderr, "wl_event_loop_dispatch error: %d\n", ret);
@@ -139,7 +144,9 @@ void WServerPrivate::stop()
     }
 
     sockNot.reset();
-    QThread::currentThread()->eventDispatcher()->disconnect(q);
+    if (auto dispatcher = QThread::currentThread()->eventDispatcher()) {
+        QObject::disconnect(dispatcher, nullptr, q, nullptr);
+    }
 }
 
 void WServerPrivate::initSocket(WSocket *socketServer)
