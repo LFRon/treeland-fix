@@ -90,7 +90,7 @@ personalization_window_context_v1::~personalization_window_context_v1()
 
 static void personalization_window_context_resource_destroy(struct wl_resource *resource)
 {
-    if (resource)
+    if (!resource)
         return;
 
     auto window_context = personalization_window_context_v1::from_resource(resource);
@@ -222,7 +222,7 @@ personalization_wallpaper_context_v1::~personalization_wallpaper_context_v1()
 
 static void personalization_wallpaper_context_resource_destroy(struct wl_resource *resource)
 {
-    if (resource)
+    if (!resource)
         return;
 
     auto wallpaper_context = personalization_wallpaper_context_v1::from_resource(resource);
@@ -312,7 +312,7 @@ personalization_cursor_context_v1::~personalization_cursor_context_v1()
 
 static void personalization_cursor_context_resource_destroy(struct wl_resource *resource)
 {
-    if (resource)
+    if (!resource)
         return;
 
     auto cursor_context = personalization_cursor_context_v1::from_resource(resource);
@@ -360,15 +360,11 @@ treeland_personalization_manager_v1 *treeland_personalization_manager_v1::from_r
 
 static void treeland_personalization_manager_resource_destroy(struct wl_resource *resource)
 {
-    if (resource)
+    if (!resource)
         return;
 
-    auto manager = treeland_personalization_manager_v1::from_resource(resource);
-    if (!manager) {
-        return;
-    }
-
-    delete manager;
+    // Do not delete the manager here — the manager is a singleton owned by
+    // the display.  Only remove the per-client resource from the list.
     wl_list_remove(wl_resource_get_link(resource));
 }
 
