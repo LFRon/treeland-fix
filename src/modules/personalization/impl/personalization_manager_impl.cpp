@@ -99,7 +99,9 @@ static void personalization_window_context_resource_destroy(struct wl_resource *
     }
 
     delete window_context;
-    wl_list_remove(wl_resource_get_link(resource));
+    // Do NOT call wl_list_remove here — libwayland's remove_and_destroy_resource
+    // already removes the resource link from the list after calling this callback.
+    // Calling it here would double-remove and corrupt the list.
 }
 
 namespace Personalization {
@@ -231,7 +233,7 @@ static void personalization_wallpaper_context_resource_destroy(struct wl_resourc
     }
 
     delete wallpaper_context;
-    wl_list_remove(wl_resource_get_link(resource));
+    // Do NOT call wl_list_remove here — libwayland handles it.
 }
 
 void set_cursor_theme([[maybe_unused]] struct wl_client *client, struct wl_resource *resource, const char *name)
@@ -321,7 +323,7 @@ static void personalization_cursor_context_resource_destroy(struct wl_resource *
     }
 
     delete cursor_context;
-    wl_list_remove(wl_resource_get_link(resource));
+    // Do NOT call wl_list_remove here — libwayland handles it.
 }
 
 void create_personalization_window_context_listener(struct wl_client *client,
@@ -360,12 +362,11 @@ treeland_personalization_manager_v1 *treeland_personalization_manager_v1::from_r
 
 static void treeland_personalization_manager_resource_destroy(struct wl_resource *resource)
 {
-    if (!resource)
-        return;
-
-    // Do not delete the manager here — the manager is a singleton owned by
-    // the display.  Only remove the per-client resource from the list.
-    wl_list_remove(wl_resource_get_link(resource));
+    // Do not delete the manager — it is a singleton owned by the display.
+    // Do not call wl_list_remove here — libwayland's remove_and_destroy_resource
+    // already calls wl_list_remove(&resource->link) after this callback returns.
+    // Doing it here would double-remove and corrupt the linked list.
+    Q_UNUSED(resource);
 }
 
 void create_personalization_window_context_listener(struct wl_client *client,
