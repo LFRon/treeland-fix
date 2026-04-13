@@ -580,7 +580,10 @@ void CaptureSourceSelector::doneSelection()
             this,
             &CaptureSourceSelector::createImage);
     m_internalContentItem->setVisible(false);
-    m_canvas->surfaceItem()->setSubsurfacesVisible(false);
+    // m_canvas may be null when no mask surface exists (e.g. capture via
+    // xdg-desktop-portal without a mask).  Guard against null dereference.
+    if (m_canvas && m_canvas->surfaceItem())
+        m_canvas->surfaceItem()->setSubsurfacesVisible(false);
 }
 
 void CaptureSourceSelector::cancelSelection()
