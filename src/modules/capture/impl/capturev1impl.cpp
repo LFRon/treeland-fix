@@ -138,19 +138,26 @@ treeland_capture_manager_v1::treeland_capture_manager_v1(wl_display *display, QO
 void treeland_capture_manager_v1::addClientResource(wl_client *client, wl_resource *resource)
 {
     WClient *wClient = WClient::get(client);
+    // Do NOT connect WClient::destroyed to wl_resource_destroy here.
+    // When wl_client_destroy runs, it iterates the client's resource map
+    // and destroys each resource.  Calling wl_resource_destroy from within
+    // a WClient::destroyed handler (which fires during that iteration)
+    // corrupts the resource map and causes "double free or corruption".
+    // The resource will be automatically cleaned up by libwayland.
+    // We only need to track the entry for explicit destroy requests and
+    // remove stale entries when the client goes away.
     connect(wClient, &WClient::destroyed, this, [this, wClient, resource]() {
-        destroyClientResource(wClient, resource);
+        clientResources.removeOne({ wClient, resource });
     });
     clientResources.push_back({ wClient, resource });
 }
 
 void treeland_capture_manager_v1::destroyClientResource(WClient *client, wl_resource *resource)
 {
-    for (const auto &pair : clientResources) {
-        if (pair.first == client && pair.second == resource) {
-            wl_resource_destroy(pair.second);
-            clientResources.removeOne(pair);
-        }
+    // Called from the explicit protocol destroy request only (not during client teardown).
+    QPair<WClient *, wl_resource *> entry{ client, resource };
+    if (clientResources.removeOne(entry)) {
+        wl_resource_destroy(resource);
     }
 }
 
@@ -292,8 +299,12 @@ void treeland_capture_context_v1::sendSourceReady(QRect region, uint32_t source_
 void treeland_capture_context_v1::setResource(wl_client *client, wl_resource *resource)
 {
     WClient *wClient = WClient::get(client);
+    // Do NOT call wl_resource_destroy from WClient::destroyed.
+    // libwayland already destroys all client resources during wl_client_destroy;
+    // doing so again from this handler corrupts the resource map ("double free").
+    // Just null out the pointer so we don't send on a stale resource.
     connect(wClient, &WClient::destroyed, this, [this] {
-        wl_resource_destroy(this->resource);
+        this->resource = nullptr;
     });
     this->resource = resource;
 }
@@ -321,8 +332,11 @@ void handle_treeland_capture_frame_v1_copy(wl_client *client,
 void treeland_capture_session_v1::setResource(wl_client *client, wl_resource *resource)
 {
     WClient *wClient = WClient::get(client);
+    // Do NOT call wl_resource_destroy from WClient::destroyed.
+    // libwayland already destroys all client resources during wl_client_destroy;
+    // doing so again from this handler corrupts the resource map ("double free").
     connect(wClient, &WClient::destroyed, this, [this] {
-        wl_resource_destroy(this->resource);
+        this->resource = nullptr;
     });
     this->resource = resource;
 }
@@ -348,8 +362,11 @@ void treeland_capture_session_v1::sendSourceResizeCancel()
 void treeland_capture_frame_v1::setResource(wl_client *client, wl_resource *resource)
 {
     WClient *wClient = WClient::get(client);
+    // Do NOT call wl_resource_destroy from WClient::destroyed.
+    // libwayland already destroys all client resources during wl_client_destroy;
+    // doing so again from this handler corrupts the resource map ("double free").
     connect(wClient, &WClient::destroyed, this, [this] {
-        wl_resource_destroy(this->resource);
+        this->resource = nullptr;
     });
     this->resource = resource;
 }
