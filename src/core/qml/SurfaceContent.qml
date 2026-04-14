@@ -52,6 +52,12 @@ Item {
 
             if (!root.wrapper)
                 return false;
+
+            // FIXME(YaoBing Xiao): Affected the functionality of the rounded corners.
+            if (content.bufferSourceRect.x >0 ||
+                    content.bufferSourceRect.y > 0)
+                return false;
+
             return (cornerRadius > 0) &&
                     !root.wrapper.noCornerRadius &&
                     root.wrapper.decoration &&
