@@ -221,6 +221,10 @@ void SurfaceContainer::geometryChange(const QRectF &newGeo, const QRectF &oldGeo
 
 bool SurfaceContainer::doAddSurface(SurfaceWrapper *surface, bool setContainer)
 {
+	// Check if surface is about to be removed to avoid accessing invalid state
+    if (surface->isWrapperAboutToRemove())
+        return false;
+
     if (m_model->hasSurface(surface))
         return false;
 

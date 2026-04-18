@@ -195,6 +195,9 @@ public:
     bool isAnimationRunning() const;
     bool isWindowAnimationRunning() const;
 
+	// Check if wrapper is about to be removed
+    bool isWrapperAboutToRemove() const { return m_wrapperAboutToRemove; }
+
     qreal radius() const;
     void setRadius(qreal newRadius);
 
