@@ -181,6 +181,9 @@ WQuickCursorPrivate::WQuickCursorPrivate(WQuickCursor *)
 void WQuickCursorPrivate::cleanTextureProvider()
 {
     if (textureProvider) {
+        textureProvider->reset();
+        textureProvider->invalidate();
+
         class WQuickCursorCleanupJob : public QRunnable
         {
         public:
@@ -192,8 +195,12 @@ void WQuickCursorPrivate::cleanTextureProvider()
         };
 
         // Delay clean the textures on the next render after.
-        window->scheduleRenderJob(new WQuickCursorCleanupJob(textureProvider),
-                                  QQuickWindow::AfterRenderingStage);
+        if (window) {
+            window->scheduleRenderJob(new WQuickCursorCleanupJob(textureProvider),
+                                      QQuickWindow::AfterRenderingStage);
+        } else {
+            delete textureProvider;
+        }
         textureProvider = nullptr;
     }
 }
@@ -241,7 +248,7 @@ void WQuickCursorPrivate::setSurface(WSurface *surface)
 
 void WQuickCursorPrivate::enterOutput(WOutput *output)
 {
-    if (!output)
+    if (!output || output->isInvalidated() || !output->handle())
         return;
     if (!cursorSurfaceItem)
         return;
@@ -253,7 +260,7 @@ void WQuickCursorPrivate::enterOutput(WOutput *output)
 
 void WQuickCursorPrivate::leaveOutput(WOutput *output)
 {
-    if (!output)
+    if (!output || output->isInvalidated() || !output->handle())
         return;
     if (!cursorSurfaceItem)
         return;

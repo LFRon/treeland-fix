@@ -1533,6 +1533,8 @@ bool WSurfaceItem::setShellSurface(WToplevelSurface *surface)
 void WSurfaceItemContentPrivate::cleanTextureProvider()
 {
     if (textureProvider) {
+        textureProvider->invalidate();
+
         // needs check window, because maybe this item's window always is nullptr,
         // so not call WSurfaceItemContent::releaseResources before destroy.
         if (window) {

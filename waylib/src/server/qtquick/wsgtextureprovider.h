@@ -24,6 +24,7 @@ class WAYLIB_SERVER_EXPORT WSGTextureProvider : public QSGTextureProvider, publi
 
 public:
     explicit WSGTextureProvider(WOutputRenderWindow *window);
+    ~WSGTextureProvider() override;
 
     WOutputRenderWindow *window() const;
 

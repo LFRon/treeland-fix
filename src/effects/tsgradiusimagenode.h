@@ -26,6 +26,7 @@ class TSGRadiusImageNode
     Q_OBJECT
 public:
     TSGRadiusImageNode();
+    ~TSGRadiusImageNode() override;
 
     void setRect(const QRectF &rect);
     void setAntialiasingWidth(float width);
@@ -49,6 +50,9 @@ public Q_SLOTS:
     void handleTextureChange();
 
 protected:
+    bool hasRadius() const;
+    bool usesRadiusMaterial() const;
+    void syncGeometryMode();
     void updateMaterialAntialiasing();
     void setMaterialTexture(QSGTexture *texture);
     bool updateMaterialBlending();
@@ -80,4 +84,5 @@ private:
 
     uint m_antialiasing : 1;
     uint m_dirtyGeometry : 1;
+    uint m_usingRadiusGeometry : 1;
 };

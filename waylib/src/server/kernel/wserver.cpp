@@ -92,7 +92,11 @@ void WServerPrivate::init()
 
     // free follow display
     [[maybe_unused]] auto ddm = qw_data_device_manager::create(*display);
-    [[maybe_unused]] auto psm = qw_primary_selection_v1_device_manager::create(*display);
+    // primary-selection-v1 is optional; keep it opt-in with wlroots 0.19.0
+    // because stale resource-list entries abort during keyboard focus changes.
+    if (qEnvironmentVariableIntValue("TREELAND_ENABLE_PRIMARY_SELECTION_V1") == 1) {
+        [[maybe_unused]] auto psm = qw_primary_selection_v1_device_manager::create(*display);
+    }
 
     W_Q(WServer);
 

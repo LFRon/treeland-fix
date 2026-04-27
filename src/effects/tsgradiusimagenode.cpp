@@ -152,6 +152,7 @@ QSGMaterialShader *TSGRadiusSmoothTextureMaterial::createShader(
 TSGRadiusImageNode::TSGRadiusImageNode()
     : m_antialiasing(false)
     , m_dirtyGeometry(false)
+    , m_usingRadiusGeometry(false)
 {
     setFlag(QSGNode::UsePreprocess);
 
@@ -164,6 +165,11 @@ TSGRadiusImageNode::TSGRadiusImageNode()
 #ifdef QSG_RUNTIME_DESCRIPTION
     qsgnode_set_description(this, QLatin1String("tradiusimage"));
 #endif
+}
+
+TSGRadiusImageNode::~TSGRadiusImageNode()
+{
+    setTextureProvider(nullptr);
 }
 
 void TSGRadiusImageNode::setRect(const QRectF &rect)
@@ -210,8 +216,9 @@ void TSGRadiusImageNode::setAntialiasingWidth(float width)
 void TSGRadiusImageNode::preprocess()
 {
     bool doDirty = false;
-    if (m_provider && m_provider->texture()) {
-        setTexture(m_provider->texture());
+    auto providerTexture = m_provider ? m_provider->texture() : nullptr;
+    if (providerTexture) {
+        setTexture(providerTexture);
         if (QSGDynamicTexture *dt = qobject_cast<QSGDynamicTexture *>(texture())) {
             doDirty = dt->updateTexture();
         }
@@ -230,9 +237,9 @@ void TSGRadiusImageNode::preprocess()
         }
     }
 
-    if (m_node.parent() && !m_provider->texture()) {
+    if (m_node.parent() && !providerTexture) {
         removeChildNode(&m_node);
-    } else if (!m_node.parent() && m_provider->texture()) {
+    } else if (!m_node.parent() && providerTexture) {
         appendChildNode(&m_node);
     }
 }
@@ -285,6 +292,7 @@ void TSGRadiusImageNode::setRadius(qreal radius)
 {
     if (radius != m_radius) {
         m_radius = radius;
+        syncGeometryMode();
         m_dirtyGeometry = true;
     }
 }
@@ -293,6 +301,7 @@ void TSGRadiusImageNode::setTopLeftRadius(qreal radius)
 {
     if (radius != m_topLeftRadius) {
         m_topLeftRadius = radius;
+        syncGeometryMode();
         m_dirtyGeometry = true;
     }
 }
@@ -301,6 +310,7 @@ void TSGRadiusImageNode::setTopRightRadius(qreal radius)
 {
     if (radius != m_topRightRadius) {
         m_topRightRadius = radius;
+        syncGeometryMode();
         m_dirtyGeometry = true;
     }
 }
@@ -309,6 +319,7 @@ void TSGRadiusImageNode::setBottomLeftRadius(qreal radius)
 {
     if (radius != m_bottomLeftRadius) {
         m_bottomLeftRadius = radius;
+        syncGeometryMode();
         m_dirtyGeometry = true;
     }
 }
@@ -317,6 +328,7 @@ void TSGRadiusImageNode::setBottomRightRadius(qreal radius)
 {
     if (radius != m_bottomRightRadius) {
         m_bottomRightRadius = radius;
+        syncGeometryMode();
         m_dirtyGeometry = true;
     }
 }
@@ -327,8 +339,31 @@ void TSGRadiusImageNode::setAntialiasing(bool antialiasing)
         return;
 
     m_antialiasing = antialiasing;
-    if (m_radius > 0 || m_topLeftRadius > 0 || m_topRightRadius > 0 || m_bottomLeftRadius > 0
-        || m_bottomRightRadius > 0) {
+    syncGeometryMode();
+    m_dirtyGeometry = true;
+}
+
+bool TSGRadiusImageNode::hasRadius() const
+{
+    return m_radius > 0 || m_topLeftRadius > 0 || m_topRightRadius > 0 || m_bottomLeftRadius > 0
+        || m_bottomRightRadius > 0;
+}
+
+bool TSGRadiusImageNode::usesRadiusMaterial() const
+{
+    return hasRadius() && m_antialiasing;
+}
+
+void TSGRadiusImageNode::syncGeometryMode()
+{
+    const bool useRadiusGeometry = usesRadiusMaterial();
+    if (m_usingRadiusGeometry == useRadiusGeometry) {
+        updateMaterialAntialiasing();
+        return;
+    }
+
+    m_usingRadiusGeometry = useRadiusGeometry;
+    if (useRadiusGeometry) {
         m_node.setGeometry(new QSGGeometry(radiusImageAttributeSet(), 0));
     } else {
         m_node.setGeometry(new QSGGeometry(QSGGeometry::defaultAttributes_TexturedPoint2D(), 4));
@@ -350,11 +385,13 @@ void TSGRadiusImageNode::setTextureProvider(QSGTextureProvider *p)
         }
 
         m_provider = p;
-        connect(m_provider.data(),
-                &QSGTextureProvider::textureChanged,
-                this,
-                &TSGRadiusImageNode::handleTextureChange,
-                Qt::DirectConnection);
+        if (m_provider) {
+            connect(m_provider.data(),
+                    &QSGTextureProvider::textureChanged,
+                    this,
+                    &TSGRadiusImageNode::handleTextureChange,
+                    Qt::DirectConnection);
+        }
     }
 }
 
@@ -365,8 +402,7 @@ void TSGRadiusImageNode::handleTextureChange()
 
 void TSGRadiusImageNode::updateMaterialAntialiasing()
 {
-    if (m_radius > 0 || m_topLeftRadius > 0 || m_topRightRadius > 0 || m_bottomLeftRadius > 0
-        || m_bottomRightRadius > 0) {
+    if (usesRadiusMaterial()) {
         m_node.setMaterial(&m_radiusMaterial);
         m_node.setOpaqueMaterial(nullptr);
     } else {
@@ -401,8 +437,7 @@ bool TSGRadiusImageNode::updateMaterialBlending()
 void TSGRadiusImageNode::updateGeometry()
 {
     QRectF textRect = QRectF(0, 0, 1, 1);
-    if (m_radius > 0 || m_topLeftRadius > 0 || m_topRightRadius > 0 || m_bottomLeftRadius > 0
-        || m_bottomRightRadius > 0) {
+    if (hasRadius()) {
         updateTexturedRadiusGeometry(m_targetRect, textRect);
     } else {
         QSGGeometry::updateTexturedRectGeometry(m_node.geometry(), m_targetRect, textRect);
@@ -500,16 +535,20 @@ void TSGRadiusImageNode::updateTexturedRadiusGeometry(const QRectF &rect, [[mayb
     float innerYLeftPrev = 0.;
     float innerYRightPrev = 0.;
 
-    const float angleTL = 0.5f * float(M_PI) / segmentsTL;
+    const auto angleForSegments = [] (int segments) {
+        return segments > 0 ? 0.5f * float(M_PI) / segments : 0.0f;
+    };
+
+    const float angleTL = angleForSegments(segmentsTL);
     const float cosStepTL = qFastCos(angleTL);
     const float sinStepTL = qFastSin(angleTL);
-    const float angleTR = 0.5f * float(M_PI) / segmentsTR;
+    const float angleTR = angleForSegments(segmentsTR);
     const float cosStepTR = qFastCos(angleTR);
     const float sinStepTR = qFastSin(angleTR);
-    const float angleBL = 0.5f * float(M_PI) / segmentsBL;
+    const float angleBL = angleForSegments(segmentsBL);
     const float cosStepBL = qFastCos(angleBL);
     const float sinStepBL = qFastSin(angleBL);
-    const float angleBR = 0.5f * float(M_PI) / segmentsBR;
+    const float angleBR = angleForSegments(segmentsBR);
     const float cosStepBR = qFastCos(angleBR);
     const float sinStepBR = qFastSin(angleBR);
 

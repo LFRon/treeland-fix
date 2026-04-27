@@ -106,6 +106,7 @@
 #include <qwidlenotifyv1.h>
 #include <qwinputdevice.h>
 #include <qwlayershellv1.h>
+#include <qwlinuxdmabufv1.h>
 #include <qwlogging.h>
 #include <qwoutput.h>
 #include <qwoutputpowermanagementv1.h>
@@ -1469,7 +1470,18 @@ void Helper::init(Treeland::Treeland *treeland)
     }
 
     m_allocator = qw_allocator::autocreate(*m_backend->handle(), *m_renderer);
-    m_renderer->init_wl_display(*m_server->handle());
+    if (!m_renderer->init_wl_shm(*m_server->handle())) {
+        qCFatal(treelandCore) << "Failed to initialize wl_shm";
+    }
+    if (m_renderer->get_texture_formats(WLR_BUFFER_CAP_DMABUF) && m_renderer->get_drm_fd() >= 0) {
+        // wlroots 0.19 surface feedback (linux-dmabuf v4) can leave a stale
+        // feedback resource link when clients rapidly destroy wl_surfaces.
+        // Advertise v3 for now: clients still get dmabuf buffers, without the
+        // per-surface feedback object that appears in the crash stack.
+        if (!qw_linux_dmabuf_v1::create_with_renderer(*m_server->handle(), 3, *m_renderer)) {
+            qCFatal(treelandCore) << "Failed to create linux-dmabuf";
+        }
+    }
     qw_drm::create(*m_server->handle(), *m_renderer);
 
     // free follow display
