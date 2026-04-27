@@ -177,6 +177,10 @@ public:
 
     }
 
+    ~SGTextureProviderNode() override {
+        setTextureProvider(nullptr);
+    }
+
     void setTextureProvider(QSGTextureProvider *tp) {
         if (m_tp == tp)
             return;
@@ -188,8 +192,10 @@ public:
 
         m_tp = tp;
         onTextureChanged();
-        connect(tp, &QSGTextureProvider::textureChanged,
-                this, &SGTextureProviderNode::onTextureChanged, Qt::DirectConnection);
+        if (tp) {
+            connect(tp, &QSGTextureProvider::textureChanged,
+                    this, &SGTextureProviderNode::onTextureChanged, Qt::DirectConnection);
+        }
     }
 
     inline QSGTextureProvider *textureProvider() const {

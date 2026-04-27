@@ -41,7 +41,10 @@ public:
 
     void cleanTexture() {
         if (rhiTexture) {
-            Q_ASSERT(window);
+            QRhiTexture *textureToDelete = rhiTexture;
+            qtTexture.setTexture(nullptr);
+            rhiTexture = nullptr;
+
             class TextureCleanupJob : public QRunnable
             {
             public:
@@ -53,10 +56,14 @@ public:
                 QRhiTexture *texture;
             };
 
-            // Delay clean the qt rhi textures.
-            window->scheduleRenderJob(new TextureCleanupJob(rhiTexture),
-                                      QQuickWindow::AfterSynchronizingStage);
-            rhiTexture = nullptr;
+            // Delay clean the Qt RHI wrapper until the current scene graph pass
+            // has stopped using the old native texture.
+            if (window) {
+                window->scheduleRenderJob(new TextureCleanupJob(textureToDelete),
+                                          QQuickWindow::AfterSynchronizingStage);
+            } else {
+                textureToDelete->deleteLater();
+            }
         }
 
         if (ownsTexture && texture)
@@ -98,6 +105,11 @@ WSGTextureProvider::WSGTextureProvider(WOutputRenderWindow *window)
 
 }
 
+WSGTextureProvider::~WSGTextureProvider()
+{
+    QObject::disconnect(this, nullptr, nullptr, nullptr);
+}
+
 WOutputRenderWindow *WSGTextureProvider::window() const
 {
     W_D(const WSGTextureProvider);
@@ -106,7 +118,8 @@ WOutputRenderWindow *WSGTextureProvider::window() const
 
 void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 {
-    if (buffer == qwBuffer()) {
+    W_D(WSGTextureProvider);
+    if (buffer == d->buffer && (!buffer || d->rhiTexture)) {
         // The buffer object is not changed, but maybe the buffer's content is changed.
         // So should emit textureChanged() signal too.
         if (buffer)
@@ -114,7 +127,6 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
         return;
     }
 
-    W_D(WSGTextureProvider);
     d->cleanTexture();
     d->buffer = buffer;
 
@@ -147,6 +159,13 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
 {
     W_D(WSGTextureProvider);
+    if (d->texture == texture && (!texture || d->rhiTexture)) {
+        d->buffer = srcBuffer;
+        if (texture)
+            Q_EMIT textureChanged();
+        return;
+    }
+
     d->cleanTexture();
     d->texture = texture;
     d->buffer = srcBuffer;

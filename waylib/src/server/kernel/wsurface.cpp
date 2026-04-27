@@ -321,6 +321,8 @@ void WSurface::notifyFrameDone()
 void WSurface::enterOutput(WOutput *output)
 {
     W_D(WSurface);
+    if (!output || output->isInvalidated() || !output->handle())
+        return;
     if (d->outputs.contains(output))
         return;
     wlr_surface_send_enter(d->nativeHandle(), output->handle()->handle());
@@ -353,6 +355,15 @@ void WSurface::leaveOutput(WOutput *output)
     W_D(WSurface);
     if (!d->outputs.contains(output))
         return;
+
+    if (!output || output->isInvalidated() || !output->handle()) {
+        if (output)
+            output->safeDisconnect(this);
+        d->outputs.removeAll(output);
+        d->updatePreferredBufferScale();
+        return;
+    }
+
     wlr_surface_send_leave(d->nativeHandle(), output->handle()->handle());
 
     output->safeDisconnect(this);

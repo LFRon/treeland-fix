@@ -26,6 +26,7 @@ public:
     void cleanTextureProvider()
     {
         if (textureProvider) {
+            textureProvider->invalidate();
             delete textureProvider;
             textureProvider = nullptr;
         }
