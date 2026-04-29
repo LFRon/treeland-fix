@@ -311,11 +311,14 @@ qw_buffer *WSurface::buffer() const
 void WSurface::notifyFrameDone()
 {
     W_D(WSurface);
+    auto surface = d->nativeHandle();
+    if (!surface || !surface->resource)
+        return;
     /* This lets the client know that we've displayed that frame and it can
-    * prepare another one now if it likes. */
+     * prepare another one now if it likes. */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    wlr_surface_send_frame_done(d->nativeHandle(), &now);
+    wlr_surface_send_frame_done(surface, &now);
 }
 
 void WSurface::enterOutput(WOutput *output)
@@ -325,7 +328,10 @@ void WSurface::enterOutput(WOutput *output)
         return;
     if (d->outputs.contains(output))
         return;
-    wlr_surface_send_enter(d->nativeHandle(), output->handle()->handle());
+    auto surface = d->nativeHandle();
+    if (!surface || !surface->resource)
+        return;
+    wlr_surface_send_enter(surface, output->handle()->handle());
 
     connect(output, &WOutput::aboutToBeInvalidated, this, [this, output] {
         leaveOutput(output);
@@ -337,7 +343,6 @@ void WSurface::enterOutput(WOutput *output)
     d->updateOutputs();
 
     // for subsurface
-    auto surface = d->nativeHandle();
     wlr_subsurface *subsurface;
     wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
         d->ensureSubsurface(subsurface)->enterOutput(output);
@@ -364,13 +369,15 @@ void WSurface::leaveOutput(WOutput *output)
         return;
     }
 
-    wlr_surface_send_leave(d->nativeHandle(), output->handle()->handle());
+    auto surface = d->nativeHandle();
+    if (!surface || !surface->resource)
+        return;
+    wlr_surface_send_leave(surface, output->handle()->handle());
 
     output->safeDisconnect(this);
     d->updateOutputs();
 
     // for subsurface
-    auto surface = d->nativeHandle();
     wlr_subsurface *subsurface;
     wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
         d->ensureSubsurface(subsurface)->leaveOutput(output);
