@@ -1323,8 +1323,19 @@ void SurfaceWrapper::onAnimationReady()
     Q_ASSERT(m_pendingState != m_surfaceState);
     Q_ASSERT(m_pendingGeometry.isValid());
 
+    // Temporarily set the target state so that updateTitleBar() can set the
+    // correct padding
+    const State originalState = m_surfaceState.value();
+    m_surfaceState.setValueBypassingBindings(m_pendingState);
+    updateTitleBar();
+    m_surfaceState.setValueBypassingBindings(originalState);
+
     if (!resize(m_pendingGeometry.size())) {
         // abort change state if resize failed
+
+        // restore titlebar
+        updateTitleBar();
+
         m_geometryAnimation->disconnect(this);
         m_geometryAnimation->deleteLater();
         m_geometryAnimation = nullptr;
