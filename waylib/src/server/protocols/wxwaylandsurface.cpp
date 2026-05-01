@@ -41,6 +41,8 @@ public:
     }
 
     wl_client *waylandClient() const override {
+        if (!surface)
+            return nullptr;
         return surface->handle()->handle()->resource->client;
     }
 

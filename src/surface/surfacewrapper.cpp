@@ -995,11 +995,13 @@ void SurfaceWrapper::markWrapperToRemoved()
         subS->m_parentSurface = nullptr;
     }
     m_subSurfaces.clear();
-    if (auto client = m_shellSurface->waylandClient()) {
-        disconnect(client->socket(),
-                   &WSocket::enabledChanged,
-                   this,
-                   &SurfaceWrapper::onSocketEnabledChanged);
+    if (m_shellSurface) {
+        if (auto client = m_shellSurface->waylandClient()) {
+            disconnect(client->socket(),
+                       &WSocket::enabledChanged,
+                       this,
+                       &SurfaceWrapper::onSocketEnabledChanged);
+        }
     }
     m_shellSurface = nullptr;
     if (m_surfaceItem)
