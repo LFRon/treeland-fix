@@ -1323,8 +1323,32 @@ void SurfaceWrapper::onAnimationReady()
     Q_ASSERT(m_pendingState != m_surfaceState);
     Q_ASSERT(m_pendingGeometry.isValid());
 
+    if (m_surfaceItem) {
+        if (m_pendingState == State::Fullscreen) {
+            m_recoverPadding = QMarginsF(m_surfaceItem->leftPadding(),
+                                         m_surfaceItem->topPadding(),
+                                         m_surfaceItem->rightPadding(),
+                                         m_surfaceItem->bottomPadding());
+            m_surfaceItem->setTopPadding(0);
+            m_surfaceItem->setLeftPadding(0);
+            m_surfaceItem->setRightPadding(0);
+            m_surfaceItem->setBottomPadding(0);
+        } else if (m_surfaceState == State::Fullscreen) {
+            m_surfaceItem->setTopPadding(m_recoverPadding.top());
+            m_surfaceItem->setLeftPadding(m_recoverPadding.left());
+            m_surfaceItem->setRightPadding(m_recoverPadding.right());
+            m_surfaceItem->setBottomPadding(m_recoverPadding.bottom());
+        }
+    }
+
     if (!resize(m_pendingGeometry.size())) {
         // abort change state if resize failed
+        if(m_surfaceItem && m_pendingState == State::Fullscreen) {
+            m_surfaceItem->setTopPadding(m_recoverPadding.top());
+            m_surfaceItem->setLeftPadding(m_recoverPadding.left());
+            m_surfaceItem->setRightPadding(m_recoverPadding.right());
+            m_surfaceItem->setBottomPadding(m_recoverPadding.bottom());
+        }
         m_geometryAnimation->disconnect(this);
         m_geometryAnimation->deleteLater();
         m_geometryAnimation = nullptr;
