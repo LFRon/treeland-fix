@@ -1197,10 +1197,12 @@ void Helper::onSurfaceWrapperAboutToRemove(SurfaceWrapper *wrapper)
         m_extForeignToplevelListV1->removeSurface(wrapper->shellSurface());
     }
     // Ensure the wrapper is removed from active history early to avoid cascading on half-invalid entries
-    if (wrapper) {
+    if (wrapper && wrapper->workspaceId() != -1) {
         auto ws = workspace();
-        if (ws)
+        if (ws) {
+            Q_ASSERT(ws == wrapper->container());
             ws->removeActivedSurface(wrapper);
+        }
     }
 }
 
@@ -2839,7 +2841,7 @@ void Helper::handleRequestDragForSeat(WSeat *seat, WSurface *)
             DDEActiveInterface::sendDrop(seat);
     });
 
-    QObject::connect(qw_drag::from(drag), &qw_drag::before_destroy, this, [this, seat, drag] {
+    QObject::connect(qw_drag::from(drag), &qw_drag::before_destroy, this, [seat, drag] {
         drag->data = NULL;
         seat->setAlwaysUpdateHoverTarget(false);
     });
