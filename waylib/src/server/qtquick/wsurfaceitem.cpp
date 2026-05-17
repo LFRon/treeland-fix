@@ -10,6 +10,7 @@
 #include "woutputviewport.h"
 #include "wsgtextureprovider.h"
 #include "woutputrenderwindow.h"
+#include "wxwaylandsurface.h"
 
 #include <qwcompositor.h>
 #include <qwsubcompositor.h>
@@ -542,6 +543,12 @@ QRectF WSurfaceItemContent::bufferSourceRect() const
 {
     W_DC(WSurfaceItemContent);
     const auto sourceSize = d->bufferSourceBox.size();
+    const qreal dpr = d->devicePixelRatio > 0 ? d->devicePixelRatio : 1.0;
+    if (d->surface && d->surface->getAttachedData<WXWaylandSurface>()) {
+        return QRectF(d->bufferSourceBox.topLeft() / dpr,
+                      sourceSize / dpr);
+    }
+
     if (d->surface && !sourceSize.isEmpty()) {
         const QSizeF surfaceSize(d->surface->size());
         if (!surfaceSize.isEmpty()) {
@@ -556,7 +563,6 @@ QRectF WSurfaceItemContent::bufferSourceRect() const
         }
     }
 
-    const qreal dpr = d->devicePixelRatio > 0 ? d->devicePixelRatio : 1.0;
     return QRectF(d->bufferSourceBox.topLeft() / dpr,
                   sourceSize / dpr);
 }
@@ -641,8 +647,9 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     node->setSourceRect(textureGeometry);
     QRectF targetGeometry(d->ignoreBufferOffset ? QPointF() : d->bufferOffset, size());
     const QSizeF sourceSize = textureGeometry.size();
+    const bool isXWaylandSurface = d->surface && d->surface->getAttachedData<WXWaylandSurface>();
     bool preferCrispFiltering = false;
-    if (d->devicePixelRatio > 0 && !sourceSize.isEmpty() && !targetGeometry.size().isEmpty()) {
+    if (!isXWaylandSurface && d->devicePixelRatio > 0 && !sourceSize.isEmpty() && !targetGeometry.size().isEmpty()) {
         const qreal sourceScaleX = sourceSize.width() / targetGeometry.width();
         const qreal sourceScaleY = sourceSize.height() / targetGeometry.height();
         const auto closeToDevicePixelRatio = [dpr = d->devicePixelRatio] (qreal scale) {
