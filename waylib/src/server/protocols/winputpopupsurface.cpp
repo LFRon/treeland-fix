@@ -21,6 +21,7 @@ public:
         : WToplevelSurfacePrivate(qq)
         , parent(parentSurface)
         , cursorRect()
+        , cursorRectSent(false)
     {
         initHandle(surface);
     }
@@ -38,6 +39,7 @@ public:
 
     WSurface *const parent;
     QRect cursorRect;
+    bool cursorRectSent;
 };
 
 WInputPopupSurface::WInputPopupSurface(qw_input_popup_surface_v2 *surface, WSurface *parentSurface, QObject *parent)
@@ -103,9 +105,10 @@ QRect WInputPopupSurface::cursorRect() const
 void WInputPopupSurface::sendCursorRect(QRect rect)
 {
     W_D(WInputPopupSurface);
-    if (d->cursorRect == rect)
+    if (d->cursorRectSent && d->cursorRect == rect)
         return;
     d->cursorRect = rect;
+    d->cursorRectSent = true;
     d->handle()->send_text_input_rectangle(qw_box(rect));
 
     Q_EMIT cursorRectChanged();
