@@ -15,6 +15,7 @@
 
 #include <wcursor.h>
 #include <winputpopupsurface.h>
+#include <winputpopupsurfaceitem.h>
 #include <wlayersurface.h>
 #include <woutputhelper.h>
 #include <woutputitem.h>
@@ -33,6 +34,34 @@
 #define SAME_APP_OFFSET_FACTOR 1.0
 #define DIFF_APP_OFFSET_FACTOR 2.0
 #define POPUP_EDGE_MARGIN 10
+
+static QPointF inputPopupOffset(SurfaceWrapper *surface, WInputPopupSurface *inputPopupSurface)
+{
+    const auto cursorRect = inputPopupSurface->cursorRect();
+    if (!cursorRect.isNull()) {
+        return cursorRect.bottomLeft();
+    }
+
+    auto parent = surface->parentSurface();
+    if (!parent || !parent->surfaceItem()) {
+        return {};
+    }
+
+    const QPointF parentContentTopLeft = parent->position() + parent->surfaceItem()->position();
+    const QRectF parentContentRect(parentContentTopLeft, parent->surfaceItem()->size());
+    if (auto cursor = Helper::instance()->seat()->cursor()) {
+        const QPointF cursorPos = cursor->position();
+        if (parentContentRect.contains(cursorPos)) {
+            return cursorPos - parentContentTopLeft;
+        }
+    }
+
+    if (!parentContentRect.isEmpty()) {
+        return parentContentRect.center() - parentContentTopLeft;
+    }
+
+    return {};
+}
 
 Output *Output::create(WOutput *output, QQmlEngine *engine, QObject *parent)
 {
@@ -450,6 +479,12 @@ void Output::addSurface(SurfaceWrapper *surface)
                 // Reposition should ignore positionAutomatic
                 arrangePopupSurface(surface);
             });
+        } else if (surface->type() == SurfaceWrapper::Type::InputPopup) {
+            auto inputPopupSurfaceItem = qobject_cast<WInputPopupSurfaceItem *>(surface->surfaceItem());
+            connect(inputPopupSurfaceItem, &WInputPopupSurfaceItem::referenceRectChanged, this, [surface, this] {
+                // Reposition should ignore positionAutomatic
+                arrangePopupSurface(surface);
+            });
         }
     }
 }
@@ -768,7 +803,7 @@ void Output::handleLayerShellPopup(SurfaceWrapper *surface, const QRectF &normal
     }
 
     QPointF dPos = xdgPopupSurfaceItem ? xdgPopupSurfaceItem->implicitPosition()
-                                       : inputPopupSurface->cursorRect().bottomLeft();
+                                       : inputPopupOffset(surface, inputPopupSurface);
 
     QPointF pos = calculateBasePosition(surface, dPos);
     if (pos.isNull()) {
@@ -797,7 +832,7 @@ void Output::handleRegularPopup(SurfaceWrapper *surface, const QRectF &normalGeo
     }
 
     QPointF dPos = xdgPopupSurfaceItem ? xdgPopupSurfaceItem->implicitPosition()
-                                       : inputPopupSurface->cursorRect().bottomLeft();
+                                       : inputPopupOffset(surface, inputPopupSurface);
 
     QPointF pos = calculateBasePosition(surface, dPos);
     if (pos.isNull()) {
@@ -850,8 +885,12 @@ void Output::arrangePopupSurface(SurfaceWrapper *surface)
         return;
     }
 
-    WOutputItem* targetOutput = Helper::instance()->getOutputAtCursor()->outputItem();
     bool isSubMenu = (parentSurfaceWrapper->type() == SurfaceWrapper::Type::XdgPopup);
+    WOutputItem *targetOutput = Helper::instance()->getOutputAtCursor()->outputItem();
+    if (qobject_cast<WInputPopupSurface *>(surface->shellSurface())
+        && parentSurfaceWrapper->ownsOutput()) {
+        targetOutput = parentSurfaceWrapper->ownsOutput()->outputItem();
+    }
 
     if (parentSurfaceWrapper->type() == SurfaceWrapper::Type::Layer) {
         handleLayerShellPopup(surface, normalGeo);
