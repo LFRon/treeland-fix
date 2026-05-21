@@ -24,7 +24,7 @@ public:
     explicit WOutputCursor(WOutputItem *parent);
 
     inline WOutputItem *output() const {
-        return static_cast<WOutputItem*>(parent());;
+        return m_output;
     }
 
     WCursor *cursor() const;
@@ -37,6 +37,7 @@ private:
     void setVisible(bool newVisible);
 
     QPointer<WCursor> m_cursor;
+    QPointer<WOutputItem> m_output;
     QQuickItem *item = nullptr;
     bool m_visible = true;
 };
