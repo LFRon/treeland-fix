@@ -44,6 +44,23 @@ public:
     uint maximized:1;
     uint minimized:1;
     uint fullscreen:1;
+
+    QString tag;
+    QString description;
+
+    void setTag(const QString &tag) {
+        if (this->tag == tag)
+            return;
+        this->tag = tag;
+        Q_EMIT q_func()->tagChanged();
+    }
+
+    void setDescription(const QString &description) {
+        if (this->description == description)
+            return;
+        this->description = description;
+        Q_EMIT q_func()->descriptionChanged();
+    }
 };
 
 WXdgToplevelSurfacePrivate::WXdgToplevelSurfacePrivate(WXdgToplevelSurface *qq, qw_xdg_toplevel *hh)
@@ -297,6 +314,18 @@ QString WXdgToplevelSurface::appId() const
     return QString::fromLocal8Bit(d->nativeHandle()->app_id);
 }
 
+QString WXdgToplevelSurface::tag() const
+{
+    W_DC(WXdgToplevelSurface);
+    return d->tag;
+}
+
+QString WXdgToplevelSurface::description() const
+{
+    W_DC(WXdgToplevelSurface);
+    return d->description;
+}
+
 bool WXdgToplevelSurface::isInitialized() const
 {
     W_DC(WXdgToplevelSurface);
@@ -317,6 +346,18 @@ WSurface *WXdgToplevelSurface::parentSurface() const
     if (!parent)
         return nullptr;
     return WSurface::fromHandle(parent->base->surface);
+}
+
+void WXdgToplevelSurface::setTag(const QString &tag)
+{
+    W_D(WXdgToplevelSurface);
+    d->setTag(tag);
+}
+
+void WXdgToplevelSurface::setDescription(const QString &description)
+{
+    W_D(WXdgToplevelSurface);
+    d->setDescription(description);
 }
 
 void WXdgToplevelSurface::setResizeing(bool resizeing)
