@@ -144,6 +144,18 @@ WTextInput *WInputMethodHelper::enabledTextInput() const
     return d->enabledTextInput;
 }
 
+WSurface *WInputMethodHelper::textInputFocusSurface() const
+{
+    auto ti = enabledTextInput();
+    return ti ? ti->focusedSurface() : nullptr;
+}
+
+QRect WInputMethodHelper::textInputCursorRect() const
+{
+    auto ti = enabledTextInput();
+    return ti ? ti->cursorRect() : QRect();
+}
+
 void WInputMethodHelper::setEnabledTextInput(WTextInput *ti)
 {
     W_D(WInputMethodHelper);
@@ -427,6 +439,7 @@ void WInputMethodHelper::handleFocusedTICommitted()
         im->sendDone();
     }
     updateAllPopupSurfaces(ti->cursorRect());
+    Q_EMIT textInputCursorRectChanged(ti->cursorRect());
 }
 
 void WInputMethodHelper::handleIMCommitted()

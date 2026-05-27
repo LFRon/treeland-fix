@@ -117,6 +117,8 @@ qt_add_qml_module(libtreeland
         ${APP_CONFIG}
         common/treelandlogging.cpp
         common/treelandlogging.h
+        common/xcbutils.cpp
+        common/xcbutils.h
         core/layersurfacecontainer.cpp
         core/layersurfacecontainer.h
         core/popupsurfacecontainer.cpp

@@ -81,6 +81,7 @@ class SurfaceWrapper : public QQuickItem
     Q_PROPERTY(bool coverEnabled READ coverEnabled NOTIFY coverEnabledChanged FINAL)
     Q_PROPERTY(bool acceptKeyboardFocus READ acceptKeyboardFocus NOTIFY acceptKeyboardFocusChanged FINAL)
     Q_PROPERTY(bool isActivated READ isActivated NOTIFY isActivatedChanged FINAL)
+    Q_PROPERTY(bool isIMEPopupBehavior READ isIMEPopupBehavior NOTIFY isIMEPopupBehaviorChanged FINAL)
 
 public:
     enum class Type
@@ -277,6 +278,8 @@ public:
     void setAcceptKeyboardFocus(bool accept);
 
     bool isActivated() const;
+    bool isIMEPopupBehavior() const;
+    void setIMEPopupBehavior(bool on);
 
     bool attention() const;
     bool setAttention(bool attention);
@@ -343,6 +346,7 @@ Q_SIGNALS:
     void aboutToBeInvalidated();
     void acceptKeyboardFocusChanged();
     void isActivatedChanged();
+    void isIMEPopupBehaviorChanged();
     void attentionChanged();
     void surfaceItemCreated(); // Emitted once after surfaceItem is constructed
     void prelaunchSplashChanged();
@@ -462,6 +466,7 @@ private:
     uint m_confirmHideByLockScreen : 1;
     uint m_blur : 1;
     uint m_isActivated : 1;
+    uint m_isIMEPopupBehavior : 1;
     uint m_attention : 1;
     SurfaceRole m_surfaceRole = SurfaceRole::Normal;
     quint32 m_autoPlaceYOffset = 0;

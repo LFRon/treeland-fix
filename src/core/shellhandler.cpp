@@ -4,6 +4,7 @@
 #include "shellhandler.h"
 
 #include "common/treelandlogging.h"
+#include "common/xcbutils.h"
 #include "core/qmlengine.h"
 #include "core/windowconfigstore.h"
 #include "layersurfacecontainer.h"
@@ -13,6 +14,7 @@
 #include "modules/prelaunch-splash/prelaunchsplash.h"
 #include "modules/wine-window-state/winewindowstate.h"
 #include "modules/wine-window-management/winewindowmanagement.h"
+#include "output/output.h"
 #include "rootsurfacecontainer.h"
 #include "seat/helper.h"
 #include "surface/surfacewrapper.h"
@@ -334,6 +336,16 @@ void ShellHandler::init(WServer *server, WSeat *seat)
             &WInputMethodHelper::inputPopupSurfaceV2Removed,
             this,
             &ShellHandler::onInputPopupSurfaceV2Removed);
+    connect(m_inputMethodHelper,
+            &WInputMethodHelper::textInputCursorRectChanged,
+            this,
+            &ShellHandler::onTextInputCursorRectChanged);
+    connect(this,
+            &ShellHandler::surfaceWrapperAboutToRemove,
+            this,
+            [this](SurfaceWrapper *wrapper) {
+                m_imePopupBehaviorWrappers.removeAll(wrapper);
+            });
 }
 
 WXWayland *ShellHandler::createXWayland(WServer *server,
@@ -439,6 +451,27 @@ void ShellHandler::ensureXdgWrapper(WXdgToplevelSurface *surface, const QString 
         m_workspace->addSurface(wrapper);
         isNewWrapper = true; // newly created
     }
+
+    // Tag cannot be set before xdg_toplevel is created (protocol ordering),
+    // so IME popup matching only happens via tagChanged handler below.
+    Q_ASSERT_X(!shouldTreatAsIMEPopupByTag(surface->tag()), Q_FUNC_INFO,
+               "Tag should be empty at toplevel creation time");
+
+    // Handle runtime tag changes: apply IME popup behavior when tag is set
+    surface->safeConnect(&WXdgToplevelSurface::tagChanged, this, [this, surface]() {
+        auto wrapper = m_rootSurfaceContainer->getSurface(surface->surface());
+        if (!wrapper)
+            return;
+        if (wrapper->isIMEPopupBehavior())
+            return;
+        if (!shouldTreatAsIMEPopupByTag(surface->tag()))
+            return;
+        auto container = wrapper->container();
+        if (!container || container == m_popupContainer)
+            return;
+        container->removeSurface(wrapper);
+        applyIMEPopupBehavior(wrapper, surface->parentSurface());
+    });
 
     // Initialize wrapper
     if (DDEShellSurfaceInterface::get(surface->surface())) {
@@ -645,6 +678,13 @@ void ShellHandler::ensureXwaylandWrapper(WXWaylandSurface *surface, const QStrin
                                      targetAppId);
         m_workspace->addSurface(wrapper);
         isNewWrapper = true; // newly created
+    }
+
+    if (isNewWrapper && shouldTreatAsIMEPopupByXprop(surface)) {
+        m_workspace->removeSurface(wrapper);
+        applyIMEPopupBehavior(wrapper, surface->parentSurface());
+        Q_EMIT surfaceWrapperAdded(wrapper);
+        return;
     }
 
     // Initialize wrapper
@@ -995,4 +1035,100 @@ void ShellHandler::setResourceManagerAtom(WAYLIB_SERVER_NAMESPACE::WXWayland *xw
                         value.size(),
                         value.constData());
     xcb_flush(xcb_conn);
+}
+
+static const QLatin1String IME_POPUP_NAME("org.deepin.treeland.im-candidate-panel");
+
+bool ShellHandler::shouldTreatAsIMEPopupByXprop(WXWaylandSurface *surface)
+{
+    if (!surface)
+        return false;
+
+    auto *xwayland = surface->xwayland();
+    auto *xcb_conn = xwayland ? xwayland->xcbConnection() : nullptr;
+    if (!xcb_conn)
+        return false;
+
+    constexpr auto propName = "_DEEPIN_IM_CANDIDATE_PANEL";
+    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(xcb_conn, false, strlen(propName), propName);
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(xcb_conn, cookie, nullptr);
+    if (!reply || !reply->atom) {
+        free(reply);
+        return false;
+    }
+    xcb_atom_t atom = reply->atom;
+    free(reply);
+
+    auto data = readWindowProperty(xcb_conn,
+                                   surface->handle()->handle()->window_id,
+                                   atom,
+                                   XCB_ATOM_CARDINAL);
+    if (data.size() < static_cast<qsizetype>(sizeof(uint32_t)))
+        return false;
+    return *reinterpret_cast<const uint32_t *>(data.constData()) == 1;
+}
+
+bool ShellHandler::shouldTreatAsIMEPopupByTag(const QString &tag)
+{
+    // TODO: better matching rules
+    return tag == IME_POPUP_NAME;
+}
+
+void ShellHandler::applyIMEPopupBehavior(SurfaceWrapper *wrapper, WSurface *parentSurface)
+{
+    auto parentWrapper = parentSurface
+        ? m_rootSurfaceContainer->getSurface(parentSurface)
+        : nullptr;
+    if (parentWrapper)
+        wrapper->setOwnsOutput(parentWrapper->ownsOutput());
+    m_popupContainer->addSurface(wrapper);
+    // Intentionally NOT calling setHasInitializeContainer(true): unlike
+    // XdgPopup/InputPopup whose type triggers arrangePopupSurface in
+    // arrangeNonLayerSurface, this wrapper's type is still XdgToplevel,
+    // which would hit placeSmartCascaded and crash. Position is
+    // controlled entirely by onTextInputCursorRectChanged.
+    wrapper->setIMEPopupBehavior(true);
+    wrapper->surfaceItem()->setFocusPolicy(Qt::NoFocus);
+    m_imePopupBehaviorWrappers.append(wrapper);
+}
+
+void ShellHandler::onTextInputCursorRectChanged(QRect cursorRect)
+{
+    if (m_imePopupBehaviorWrappers.isEmpty())
+        return;
+
+    auto focusSurface = m_inputMethodHelper->textInputFocusSurface();
+    if (!focusSurface)
+        return;
+
+    auto focusedWrapper = m_rootSurfaceContainer->getSurface(focusSurface);
+    if (!focusedWrapper || !focusedWrapper->surfaceItem())
+        return;
+
+    // Replicate InputPopup positioning: popupDPos() + calculateBasePosition()
+    QPointF dPos = cursorRect.bottomLeft();
+    if (auto sh = focusedWrapper->shellSurface()) {
+        const QPoint offset = sh->getContentGeometry().topLeft();
+        dPos -= QPointF(offset.x(), offset.y());
+    }
+
+    const qreal titlebarOffset = focusedWrapper->titlebarGeometry().isNull()
+        ? 0.0
+        : focusedWrapper->titlebarGeometry().height();
+
+    QPointF pos(focusedWrapper->x() + focusedWrapper->surfaceItem()->x() + dPos.x(),
+                focusedWrapper->y() + focusedWrapper->surfaceItem()->y() + dPos.y() + titlebarOffset);
+
+    const auto output = focusedWrapper->ownsOutput();
+    const QRectF outputRect = output ? output->geometry() : QRectF();
+
+    for (auto *wrapper : m_imePopupBehaviorWrappers) {
+        QPointF adjustedPos = pos;
+        if (output && !outputRect.isEmpty())
+            output->adjustToOutputBounds(adjustedPos, QRectF(0, 0, wrapper->width(), wrapper->height()), outputRect);
+
+        wrapper->setXwaylandPositionFromSurface(false);
+        wrapper->setPositionAutomatic(false);
+        wrapper->moveNormalGeometryInOutput(adjustedPos);
+    }
 }

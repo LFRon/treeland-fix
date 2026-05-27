@@ -62,6 +62,7 @@ SurfaceWrapper::SurfaceWrapper(QmlEngine *qmlEngine,
     , m_confirmHideByLockScreen(false)
     , m_blur(false)
     , m_isActivated(false)
+    , m_isIMEPopupBehavior(false)
     , m_attention(false)
     , m_appId(appId)
 {
@@ -95,6 +96,7 @@ SurfaceWrapper::SurfaceWrapper(SurfaceWrapper *original, QQuickItem *parent)
     , m_confirmHideByLockScreen(false)
     , m_blur(false)
     , m_isActivated(false)
+    , m_isIMEPopupBehavior(false)
     , m_attention(false)
     , m_appId(original->m_appId)
 {
@@ -161,6 +163,7 @@ SurfaceWrapper::SurfaceWrapper(QmlEngine *qmlEngine,
     , m_confirmHideByLockScreen(false)
     , m_blur(false)
     , m_isActivated(false)
+    , m_isIMEPopupBehavior(false)
     , m_attention(false)
     , m_appId(appId)
 {
@@ -1036,6 +1039,21 @@ bool SurfaceWrapper::isActivated() const
     return m_isActivated;
 }
 
+bool SurfaceWrapper::isIMEPopupBehavior() const
+{
+    return m_isIMEPopupBehavior;
+}
+
+void SurfaceWrapper::setIMEPopupBehavior(bool on)
+{
+    if (m_isIMEPopupBehavior == on)
+        return;
+    m_isIMEPopupBehavior = on;
+    Q_EMIT isIMEPopupBehaviorChanged();
+    Q_EMIT radiusChanged();
+    Q_EMIT showOnAllWorkspaceChanged();
+}
+
 bool SurfaceWrapper::attention() const
 {
     return m_attention;
@@ -1199,6 +1217,9 @@ void SurfaceWrapper::geometryChange(const QRectF &newGeo, const QRectF &oldGeome
 
 void SurfaceWrapper::createNewOrClose(uint direction)
 {
+    if (m_isIMEPopupBehavior)
+        return;
+
     if (!m_windowAnimationEnabled)
         return;
 
@@ -1552,7 +1573,7 @@ void SurfaceWrapper::startShowDesktopAnimation(bool show)
 qreal SurfaceWrapper::radius() const
 {
     // TODO: move to dconfig
-    if (m_type == Type::InputPopup)
+    if (m_type == Type::InputPopup || m_isIMEPopupBehavior)
         return 0;
     if (m_type == Type::XdgPopup)
         return 8;
@@ -1957,7 +1978,8 @@ void SurfaceWrapper::setAlwaysOnTop(bool alwaysOnTop)
 
 bool SurfaceWrapper::showOnAllWorkspace() const
 {
-    if (m_type == Type::Layer || m_type == Type::XdgPopup || m_type == Type::InputPopup)
+    if (m_type == Type::Layer || m_type == Type::XdgPopup
+        || m_type == Type::InputPopup || m_isIMEPopupBehavior)
         [[unlikely]]
         return true;
     return m_workspaceId == Workspace::ShowOnAllWorkspaceId;

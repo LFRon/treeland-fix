@@ -17,6 +17,7 @@
 #include "core/lockscreen.h"
 #endif
 #include "common/treelandlogging.h"
+#include "common/xcbutils.h"
 #include "core/layersurfacecontainer.h"
 #include "core/qmlengine.h"
 #include "core/rootsurfacecontainer.h"
@@ -140,38 +141,6 @@
 
 #define EXT_DATA_CONTROL_MANAGER_V1_VERSION 1
 #define WLR_FRACTIONAL_SCALE_V1_VERSION 1
-
-static QByteArray readWindowProperty(xcb_connection_t *connection,
-                                     xcb_window_t win,
-                                     xcb_atom_t atom,
-                                     xcb_atom_t type)
-{
-    QByteArray data;
-    int offset = 0;
-    int remaining = 0;
-
-    do {
-        xcb_get_property_cookie_t cookie =
-            xcb_get_property(connection, false, win, atom, type, offset, 1024);
-        xcb_get_property_reply_t *reply = xcb_get_property_reply(connection, cookie, NULL);
-        if (!reply)
-            break;
-
-        remaining = 0;
-
-        if (reply->type == type) {
-            int len = xcb_get_property_value_length(reply);
-            char *datas = (char *)xcb_get_property_value(reply);
-            data.append(datas, len);
-            remaining = reply->bytes_after;
-            offset += len;
-        }
-
-        free(reply);
-    } while (remaining > 0);
-
-    return data;
-}
 
 Helper *Helper::m_instance = nullptr;
 
@@ -1054,6 +1023,9 @@ void Helper::onRestoreCopyOutput(VirtualOutputInterfaceV1 *interface)
 
 void Helper::onSurfaceWrapperAdded(SurfaceWrapper *wrapper)
 {
+    if (wrapper->isIMEPopupBehavior())
+        return;
+
     bool isXdgToplevel = wrapper->type() == SurfaceWrapper::Type::XdgToplevel;
     bool isXdgPopup = wrapper->type() == SurfaceWrapper::Type::XdgPopup;
     bool isXwayland = wrapper->type() == SurfaceWrapper::Type::XWayland;
@@ -1206,6 +1178,9 @@ void Helper::onSurfaceWrapperAdded(SurfaceWrapper *wrapper)
 
 void Helper::onSurfaceWrapperAboutToRemove(SurfaceWrapper *wrapper)
 {
+    if (wrapper->isIMEPopupBehavior())
+        return;
+
     if (!wrapper->skipDockPreView()) {
         m_foreignToplevel->removeSurface(wrapper->shellSurface());
         m_extForeignToplevelListV1->removeSurface(wrapper->shellSurface());
@@ -1656,6 +1631,9 @@ WSeat *Helper::getSeatForEvent(QInputEvent *event) const
 
 void Helper::activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason)
 {
+    if (wrapper && wrapper->isIMEPopupBehavior())
+        return;
+
     WSeat *interactingSeat = m_currentEventSeat ? m_currentEventSeat : getLastInteractingSeat(wrapper);
     if (m_blockActivateSurface && wrapper && wrapper->type() != SurfaceWrapper::Type::LockScreen) {
         auto sh = wrapper->shellSurface();
@@ -1942,7 +1920,8 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
         WSeat *eventSeat = getSeatForEvent(event);
         if (eventSeat && surface) {
             // LayerSurface cannot be activated, nor should it be activated.
-            if (surface->type() == SurfaceWrapper::Type::Layer) {
+            if (surface->type() == SurfaceWrapper::Type::Layer
+                || surface->isIMEPopupBehavior()) {
                 return false;
             }
 

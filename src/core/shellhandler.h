@@ -120,6 +120,7 @@ private Q_SLOTS:
 
     void setupDockPreview();
     void onInputPopupSurfaceV2Removed(WAYLIB_SERVER_NAMESPACE::WInputPopupSurface *surface);
+    void onTextInputCursorRectChanged(QRect cursorRect);
 
 private:
     void setupSurfaceActiveWatcher(SurfaceWrapper *wrapper);
@@ -154,6 +155,8 @@ private:
     // Unified parent/container update for Xdg & XWayland toplevel wrappers.
     void updateWrapperContainer(SurfaceWrapper *wrapper,
                                 WAYLIB_SERVER_NAMESPACE::WSurface *parentSurface);
+    // Apply IME popup behavior: move wrapper to popupContainer, set flags
+    void applyIMEPopupBehavior(SurfaceWrapper *wrapper, WAYLIB_SERVER_NAMESPACE::WSurface *parentSurface);
 
     WAYLIB_SERVER_NAMESPACE::WXdgShell *m_xdgShell = nullptr;
     WAYLIB_SERVER_NAMESPACE::WLayerShell *m_layerShell = nullptr;
@@ -189,4 +192,8 @@ private:
     // New protocol based app id resolver (optional, may be null if module not loaded)
     AppIdResolverManager *m_appIdResolverManager = nullptr;
     WindowConfigStore *m_windowConfigStore = nullptr;
+    // XWayland windows with IME popup behavior
+    QList<SurfaceWrapper *> m_imePopupBehaviorWrappers;
+    static bool shouldTreatAsIMEPopupByXprop(WAYLIB_SERVER_NAMESPACE::WXWaylandSurface *surface);
+    static bool shouldTreatAsIMEPopupByTag(const QString &tag);
 };
