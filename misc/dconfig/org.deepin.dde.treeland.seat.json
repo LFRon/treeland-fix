@@ -1,0 +1,160 @@
+{
+    "magic": "dsg.config.meta",
+    "version": "1.0",
+    "contents": {
+        "pointerScrollFactor": {
+            "value": 1.0,
+            "serial": 0,
+            "flags": [],
+            "name": "Pointer Scroll Factor",
+            "name[zh_CN]": "指针滚动因子",
+            "description": "Pointer scroll factor",
+            "description[zh_CN]": "指针滚动因子",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "pointerHandMode": {
+            "value": "Right",
+            "serial": 0,
+            "flags": [],
+            "name": "Pointer Hand Mode",
+            "name[zh_CN]": "指针惯用手模式",
+            "description": "Pointer hand mode, allow value: Right, Left",
+            "description[zh_CN]": "指针惯用手模式，可选值为：Right、Left",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "mouseAccelSpeed": {
+            "value": 0.0,
+            "serial": 0,
+            "flags": [],
+            "name": "Mouse Acceleration Speed",
+            "name[zh_CN]": "鼠标加速速度",
+            "description": "Mouse acceleration speed",
+            "description[zh_CN]": "鼠标加速速度",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "mouseAccelerationProfile": {
+            "value": 0,
+            "serial": 0,
+            "flags": [],
+            "name": "Mouse Acceleration Profile",
+            "name[zh_CN]": "鼠标加速配置",
+            "description": "Mouse acceleration profile",
+            "description[zh_CN]": "鼠标加速配置",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "mouseNaturalScroll": {
+            "value": false,
+            "serial": 0,
+            "flags": [],
+            "name": "Mouse Natural Scroll",
+            "name[zh_CN]": "鼠标自然滚动",
+            "description": "Whether natural scrolling is enabled for mouse",
+            "description[zh_CN]": "是否为鼠标启用自然滚动",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadAccelSpeed": {
+            "value": 0.0,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Acceleration Speed",
+            "name[zh_CN]": "触控板加速速度",
+            "description": "Touchpad acceleration speed",
+            "description[zh_CN]": "触控板加速速度",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadAccelerationProfile": {
+            "value": 0,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Acceleration Profile",
+            "name[zh_CN]": "触控板加速配置",
+            "description": "Touchpad acceleration profile",
+            "description[zh_CN]": "触控板加速配置",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadDisableWhileTyping": {
+            "value": false,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Disable While Typing",
+            "name[zh_CN]": "触控板打字时禁用",
+            "description": "Disable touchpad while typing",
+            "description[zh_CN]": "打字时禁用触控板",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadTapToClick": {
+            "value": false,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Tap To Click",
+            "name[zh_CN]": "触控板轻触点击",
+            "description": "Enable tap to click on touchpad",
+            "description[zh_CN]": "启用触控板轻触点击",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadNaturalScroll": {
+            "value": false,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Natural Scroll",
+            "name[zh_CN]": "触控板自然滚动",
+            "description": "Whether natural scrolling is enabled for touchpad",
+            "description[zh_CN]": "是否为触控板启用自然滚动",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "touchpadSendEventsMode": {
+            "value": 0,
+            "serial": 0,
+            "flags": [],
+            "name": "Touchpad Send Events Mode",
+            "name[zh_CN]": "触控板发送事件模式",
+            "description": "Touchpad send events mode",
+            "description[zh_CN]": "触控板发送事件模式",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "keyboardRate": {
+            "value": 25,
+            "serial": 0,
+            "flags": [],
+            "name": "Keyboard Repeat Rate",
+            "name[zh_CN]": "键盘重复速率",
+            "description": "Key repeat rate in characters per second",
+            "description[zh_CN]": "按键重复速率（字符/秒）",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "keyboardDelay": {
+            "value": 600,
+            "serial": 0,
+            "flags": [],
+            "name": "Keyboard Repeat Delay",
+            "name[zh_CN]": "键盘重复延迟",
+            "description": "Delay before key repeat starts (in milliseconds)",
+            "description[zh_CN]": "按键重复开始前的延迟（以毫秒为单位）",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
+        "keyboardNumLock": {
+            "value": true,
+            "serial": 0,
+            "flags": [],
+            "name": "Keyboard Num Lock",
+            "name[zh_CN]": "键盘数字锁定",
+            "description": "Whether Num Lock is enabled by default",
+            "description[zh_CN]": "是否默认启用数字锁定",
+            "permissions": "readwrite",
+            "visibility": "public"
+        }
+    }
+}

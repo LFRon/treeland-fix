@@ -90,6 +90,13 @@ dtk_add_config_to_cpp(
 )
 
 dtk_add_config_to_cpp(
+    SEAT_INPUT_CONFIG
+    "${PROJECT_SOURCE_DIR}/misc/dconfig/org.deepin.dde.treeland.seat.json"
+    OUTPUT_FILE_NAME "seatinputconfig.hpp"
+    CLASS_NAME "SeatInputDConfig"
+)
+
+dtk_add_config_to_cpp(
     APP_CONFIG
     "${PROJECT_SOURCE_DIR}/misc/dconfig/org.deepin.dde.treeland.app.json"
     OUTPUT_FILE_NAME "appconfig.hpp"
@@ -115,6 +122,7 @@ qt_add_qml_module(libtreeland
         ${TREELAND_USER_CONFIG}
         ${OUTPUT_CONFIG}
         ${APP_CONFIG}
+        ${SEAT_INPUT_CONFIG}
         common/treelandlogging.cpp
         common/treelandlogging.h
         core/layersurfacecontainer.cpp
