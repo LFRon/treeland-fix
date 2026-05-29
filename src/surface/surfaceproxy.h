@@ -19,7 +19,6 @@ class SurfaceProxy : public QQuickItem
 
 public:
     explicit SurfaceProxy(QQuickItem *parent = nullptr);
-    ~SurfaceProxy() override;
 
     SurfaceWrapper *surface() const;
     void setSurface(SurfaceWrapper *newSurface);
