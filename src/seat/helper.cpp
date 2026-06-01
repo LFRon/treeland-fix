@@ -1094,6 +1094,9 @@ void Helper::onRestoreCopyOutput(VirtualOutputInterfaceV1 *interface)
 
 void Helper::onSurfaceWrapperAdded(SurfaceWrapper *wrapper)
 {
+    if (wrapper->isIMCandidatePanel())
+        return;
+
     bool isXdgToplevel = wrapper->type() == SurfaceWrapper::Type::XdgToplevel;
     bool isXdgPopup = wrapper->type() == SurfaceWrapper::Type::XdgPopup;
     bool isXwayland = wrapper->type() == SurfaceWrapper::Type::XWayland;
@@ -1248,6 +1251,9 @@ void Helper::onSurfaceWrapperAdded(SurfaceWrapper *wrapper)
 
 void Helper::onSurfaceWrapperAboutToRemove(SurfaceWrapper *wrapper)
 {
+    if (wrapper->isIMCandidatePanel())
+        return;
+
     if (!wrapper->skipDockPreView()) {
         m_foreignToplevel->removeSurface(wrapper->shellSurface());
         m_extForeignToplevelListV1->removeSurface(wrapper->shellSurface());
@@ -1711,6 +1717,9 @@ WSeat *Helper::getSeatForEvent(QInputEvent *event) const
 
 void Helper::activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason)
 {
+    if (wrapper && wrapper->isIMCandidatePanel())
+        return;
+
     WSeat *interactingSeat = m_currentEventSeat ? m_currentEventSeat : getLastInteractingSeat(wrapper);
     if (m_blockActivateSurface && wrapper && wrapper->type() != SurfaceWrapper::Type::LockScreen) {
         auto sh = wrapper->shellSurface();
@@ -1998,6 +2007,11 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
 
         WSeat *eventSeat = getSeatForEvent(event);
         if (eventSeat && surface) {
+            // IM candidate panel should not be activated.
+            if (surface->isIMCandidatePanel()) {
+                return false;
+            }
+
             const auto seats = m_seatManager->seats();
             for (auto *seat : seats) {
                 if (seat != eventSeat && surface) {
