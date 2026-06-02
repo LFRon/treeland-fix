@@ -251,9 +251,9 @@ bool ShortcutController::isValidShortcutCombination(QKeyCombination combination)
         & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier | Qt::ShiftModifier);
     const Qt::Key key = normalized.key();
 
-    // Modifier-only combinations: only Meta is accepted as a standalone shortcut.
+    // Modifier-only combinations: Meta and Alt are accepted as standalone shortcuts.
     if (key == Qt::Key_unknown)
-        return mods == Qt::MetaModifier;
+        return mods == Qt::MetaModifier || mods == Qt::AltModifier;
 
     // Rule 1: Ctrl / Alt / Meta + any non-modifier key.
     if (mods & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))
