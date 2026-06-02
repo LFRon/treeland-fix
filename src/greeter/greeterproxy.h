@@ -248,6 +248,7 @@ Q_SIGNALS:
 
     void switchUser();
 
+    void socketConnected();
     void socketDisconnected();
 
     /////////////////////////////

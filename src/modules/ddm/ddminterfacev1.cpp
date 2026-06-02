@@ -3,66 +3,156 @@
 
 #include "ddminterfacev1.h"
 #include "common/treelandlogging.h"
+#include "greeterproxy.h"
 #include "helper.h"
 #include "usermodel.h"
-#include "qwayland-server-treeland-ddm-v1.h"
-
-#include <wayland-server-core.h>
-#include <wayland-server.h>
-#include <wayland-util.h>
 
 #include <qwdisplay.h>
 
 #include <QDebug>
+#include <QFile>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QRemoteObjectHost>
 
-class DDMInterfaceV1Private : public QtWaylandServer::treeland_ddm_v1
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+
+namespace {
+constexpr auto remoteObjectName = "TreelandDDMRemote";
+constexpr auto remoteObjectSocketName = "org.deepin.TreelandDDMRemote";
+constexpr auto ddmServiceCgroup = "/ddm.service";
+
+bool readPeerCredentials(qintptr socketDescriptor, struct ucred *credentials)
 {
-public:
-    explicit DDMInterfaceV1Private(DDMInterfaceV1 *_q);
-    wl_global *global() const;
+    const auto fd = static_cast<int>(socketDescriptor);
+    if (fd < 0)
+        return false;
 
-    DDMInterfaceV1 *q = nullptr;
-protected:
-    void destroy(Resource *resource) override;
-    void bind_resource(Resource *resource) override;
-    void switch_to_greeter(Resource *resource) override;
-    void switch_to_user(Resource *resource, const QString &username) override;
-    void activate_session(Resource *resource) override;
-    void deactivate_session(Resource *resource) override;
-    void enable_render(Resource *resource) override;
-    void disable_render(Resource *resource, uint32_t callback) override;
-};
+    socklen_t length = sizeof(*credentials);
+    return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, credentials, &length) == 0
+        && length == sizeof(*credentials);
+}
+
+bool peerCgroupContains(pid_t pid, const QString &marker)
+{
+    QFile file(QStringLiteral("/proc/%1/cgroup").arg(pid));
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+
+    while (!file.atEnd()) {
+        if (QString::fromUtf8(file.readLine()).contains(marker))
+            return true;
+    }
+
+    return false;
+}
+
+bool isExpectedDdmPeer(const QLocalSocket &socket)
+{
+    struct ucred credentials {};
+    if (!readPeerCredentials(socket.socketDescriptor(), &credentials)) {
+        qCCritical(treelandCore) << "Failed to read DDM peer credentials:" << strerror(errno);
+        return false;
+    }
+
+    if (credentials.uid != 0) {
+        qCWarning(treelandCore) << "Rejecting DDM remote peer with unexpected uid"
+                                << credentials.uid;
+        return false;
+    }
+
+    if (!peerCgroupContains(credentials.pid, QString::fromLatin1(ddmServiceCgroup))) {
+        qCWarning(treelandCore) << "Rejecting DDM remote peer outside ddm.service cgroup:"
+                                << credentials.pid;
+        return false;
+    }
+
+    return true;
+}
+}
 
 DDMInterfaceV1Private::DDMInterfaceV1Private(DDMInterfaceV1 *_q)
-    : QtWaylandServer::treeland_ddm_v1()
+    : TreelandDDMRemoteSource()
     , q(_q)
 {
 }
 
-wl_global *DDMInterfaceV1Private::global() const
+void DDMInterfaceV1Private::startHost()
 {
-    return m_global;
+    if (host)
+        return;
+
+    QLocalServer::removeServer(QString::fromLatin1(remoteObjectSocketName));
+
+    server = new QLocalServer(q);
+    server->setSocketOptions(QLocalServer::UserAccessOption);
+    if (!server->listen(QString::fromLatin1(remoteObjectSocketName))) {
+        qCCritical(treelandCore) << "Failed to listen DDM remote socket:"
+                                 << server->errorString();
+        delete server;
+        server = nullptr;
+        return;
+    }
+
+    host = new QRemoteObjectHost(q);
+    if (!host->enableRemoting(this, QString::fromLatin1(remoteObjectName))) {
+        qCCritical(treelandCore) << "Failed to enable DDM remote object";
+        delete host;
+        host = nullptr;
+        delete server;
+        server = nullptr;
+        QLocalServer::removeServer(QString::fromLatin1(remoteObjectSocketName));
+        return;
+    }
+
+    QObject::connect(server, &QLocalServer::newConnection, q, [this] {
+        while (server && server->hasPendingConnections()) {
+            auto *socket = server->nextPendingConnection();
+            if (!socket)
+                continue;
+
+            QObject::connect(socket, &QLocalSocket::disconnected, socket, &QObject::deleteLater);
+            if (!isExpectedDdmPeer(*socket)) {
+                socket->disconnectFromServer();
+                continue;
+            }
+
+            host->addHostSideConnection(socket);
+        }
+    });
+
+    qCInfo(treelandCore) << "DDM remote object is listening on"
+                         << server->fullServerName();
 }
 
-void DDMInterfaceV1Private::destroy(Resource *resource)
+void DDMInterfaceV1Private::stopHost()
 {
-    wl_resource_destroy(resource->handle);
+    if (server) {
+        server->close();
+        delete server;
+        server = nullptr;
+        QLocalServer::removeServer(QString::fromLatin1(remoteObjectSocketName));
+    }
+
+    if (!host)
+        return;
+
+    delete host;
+    host = nullptr;
+    qCInfo(treelandCore) << "DDM remote object stopped";
 }
 
-void DDMInterfaceV1Private::bind_resource(Resource *resource)
+void DDMInterfaceV1Private::switchToGreeter()
 {
-    Q_UNUSED(resource)
-}
-
-void DDMInterfaceV1Private::switch_to_greeter([[maybe_unused]] Resource *resource)
-{
-    qCWarning(treelandCore) << "DDM protocol: switch_to_greeter";
+    qCWarning(treelandCore) << "DDM remote: switchToGreeter";
     Helper::instance()->showLockScreen(false);
 }
 
-void DDMInterfaceV1Private::switch_to_user([[maybe_unused]] Resource *resource, const QString &username)
+void DDMInterfaceV1Private::switchToUser(QString username)
 {
-    qCWarning(treelandCore) << "DDM protocol: switch_to_user" << username;
+    qCWarning(treelandCore) << "DDM remote: switchToUser" << username;
     auto helper = Helper::instance();
     if (username == "dde") {
         helper->showLockScreen(false);
@@ -72,31 +162,28 @@ void DDMInterfaceV1Private::switch_to_user([[maybe_unused]] Resource *resource, 
     }
 }
 
-void DDMInterfaceV1Private::activate_session([[maybe_unused]] Resource *resource)
+void DDMInterfaceV1Private::activateSession()
 {
-    qCWarning(treelandCore) << "DDM protocol: activate_session";
+    qCWarning(treelandCore) << "DDM remote: activateSession";
     Helper::instance()->activateSession();
 }
 
-void DDMInterfaceV1Private::deactivate_session([[maybe_unused]] Resource *resource)
+void DDMInterfaceV1Private::deactivateSession()
 {
-    qCWarning(treelandCore) << "DDM protocol: deactivate_session";
+    qCWarning(treelandCore) << "DDM remote: deactivateSession";
     Helper::instance()->deactivateSession();
 }
 
-void DDMInterfaceV1Private::enable_render([[maybe_unused]] Resource *resource)
+void DDMInterfaceV1Private::enableRender()
 {
-    qCWarning(treelandCore) << "DDM protocol: enable_render";
+    qCWarning(treelandCore) << "DDM remote: enableRender";
     Helper::instance()->enableRender();
 }
 
-void DDMInterfaceV1Private::disable_render(Resource *resource, uint32_t id)
+void DDMInterfaceV1Private::disableRender()
 {
+    qCWarning(treelandCore) << "DDM remote: disableRender";
     Helper::instance()->disableRender();
-    auto callback = wl_resource_create(resource->client(), &wl_callback_interface, 1, id);
-    auto serial = wl_display_get_serial(wl_client_get_display(resource->client()));
-    wl_callback_send_done(callback, serial);
-    wl_resource_destroy(callback);
 }
 
 DDMInterfaceV1::DDMInterfaceV1(QObject *parent)
@@ -110,25 +197,38 @@ DDMInterfaceV1::~DDMInterfaceV1() = default;
 
 QByteArrayView DDMInterfaceV1::interfaceName() const
 {
-    return d->interfaceName();
+    return QByteArrayView(remoteObjectName);
 }
 
 bool DDMInterfaceV1::isConnected() const
 {
-    return !d->resourceMap().isEmpty();
+    return d->host != nullptr;
 }
 
 void DDMInterfaceV1::create(WServer *server)
 {
-    d->init(server->handle()->handle(), InterfaceVersion);
+    Q_UNUSED(server)
+
+    auto *greeterProxy = Helper::instance()->greeterProxy();
+    Q_ASSERT(greeterProxy);
+
+    QObject::connect(greeterProxy, &GreeterProxy::socketConnected, this, [this] {
+        d->startHost();
+    }, Qt::UniqueConnection);
+    QObject::connect(greeterProxy, &GreeterProxy::socketDisconnected, this, [this] {
+        d->stopHost();
+    }, Qt::UniqueConnection);
+
+    if (greeterProxy->isConnected())
+        d->startHost();
 }
 
 void DDMInterfaceV1::destroy([[maybe_unused]] WServer *server)
 {
-    d->globalRemove();
+    d->stopHost();
 }
 
 wl_global *DDMInterfaceV1::global() const
 {
-    return d->global();
+    return nullptr;
 }

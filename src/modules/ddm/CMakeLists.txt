@@ -1,17 +1,30 @@
-find_package(TreelandProtocols REQUIRED)
-
-local_qtwayland_server_protocol_treeland(libtreeland
-    PROTOCOL ${TREELAND_PROTOCOLS_DATA_DIR}/treeland-ddm-v1.xml
-    BASENAME treeland-ddm-v1
+set(TREELAND_DDM_REMOTE_SOURCE_HEADER
+    ${CMAKE_CURRENT_BINARY_DIR}/rep_treelandddmremote_source.h
+)
+add_custom_command(
+    OUTPUT ${TREELAND_DDM_REMOTE_SOURCE_HEADER}
+    COMMAND $<TARGET_FILE:Qt6::repc> -o source
+            ${CMAKE_CURRENT_SOURCE_DIR}/treelandddmremote.rep
+            ${TREELAND_DDM_REMOTE_SOURCE_HEADER}
+    MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/treelandddmremote.rep
+    DEPENDS Qt6::repc
+    VERBATIM
+)
+set_source_files_properties(
+    ${TREELAND_DDM_REMOTE_SOURCE_HEADER}
+    PROPERTIES GENERATED TRUE
+)
+add_custom_target(generate_treeland_ddm_remote_source
+    DEPENDS ${TREELAND_DDM_REMOTE_SOURCE_HEADER}
 )
 
 impl_treeland(
     NAME
         module_ddm
     SOURCE
-        ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddminterfacev1.h
+        ${TREELAND_DDM_REMOTE_SOURCE_HEADER}
         ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddminterfacev1.cpp
-        ${CMAKE_BINARY_DIR}/src/modules/ddm/wayland-treeland-ddm-v1-server-protocol.c
     INCLUDE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
 )
+add_dependencies(libtreeland generate_treeland_ddm_remote_source)

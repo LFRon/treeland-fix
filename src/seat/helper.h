@@ -237,6 +237,7 @@ public:
 
     inline UserModel *userModel() const { return m_userModel; };
     inline SessionModel *sessionModel() const { return m_sessionModel; };
+    inline GreeterProxy *greeterProxy() const { return m_greeterProxy; };
     DDMInterfaceV1 *ddmInterfaceV1() const;
 
     void activateSession();

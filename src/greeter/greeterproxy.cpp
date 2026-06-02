@@ -396,6 +396,7 @@ bool GreeterProxy::isConnected() const
 void GreeterProxy::connected()
 {
     qCInfo(treelandGreeter) << "Connected to the ddm";
+    Q_EMIT socketConnected();
 
     SocketWriter(m_socket)
         << quint32(GreeterMessages::Connect)
