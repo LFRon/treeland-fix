@@ -23,7 +23,8 @@ WAYLIB_SERVER_END_NAMESPACE
 WAYLIB_SERVER_USE_NAMESPACE
 
 // Forward declaration - values defined in treeland-shortcut-manager-v2 protocol
-enum class ShortcutAction : uint32_t {
+enum class ShortcutAction : uint32_t
+{
     Notify                = 1,
     Workspace1            = 2,
     Workspace2            = 3,
@@ -46,7 +47,6 @@ enum class ShortcutAction : uint32_t {
     Lockscreen            = 20,
     ShutdownMenu          = 21,
     Quit                  = 22,
-    TaskSwitchEnter       = 23,
     TaskSwitchNext        = 24,
     TaskSwitchPrev        = 25,
     TaskSwitchSameAppNext = 26,
