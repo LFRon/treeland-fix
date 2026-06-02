@@ -7,8 +7,11 @@
 #include <QDBusObjectPath>
 #include <QObject>
 #include <QQmlEngine>
+#include <QScopedPointer>
 
 class QLocalSocket;
+class QRemoteObjectNode;
+class GreeterDDMRemoteReplica;
 
 class LockScreen;
 
@@ -224,7 +227,6 @@ private Q_SLOTS:
 
     void connected();
     void disconnected();
-    void readyRead();
     void error();
 
     //////////////////////////////
@@ -248,6 +250,7 @@ Q_SIGNALS:
 
     void switchUser();
 
+    void socketConnected();
     void socketDisconnected();
 
     /////////////////////////////
@@ -307,12 +310,16 @@ private:
      * @brief Update the DDM communication socket
      */
     void updateAuthSocket();
+    void syncRemoteState();
+    void resetRemote();
 
     /////////////////////
     // Property values //
     /////////////////////
 
     QLocalSocket *m_socket{ nullptr };
+    QScopedPointer<QRemoteObjectNode> m_remoteNode;
+    QScopedPointer<GreeterDDMRemoteReplica> m_remoteReplica;
     LockScreen *m_lockScreen{ nullptr };
 
     QString m_hostName{};

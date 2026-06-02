@@ -31,7 +31,7 @@
 #include "modules/capture/capture.h"
 #include "modules/dde-shell/ddeshellattached.h"
 #include "modules/dde-shell/ddeshellmanagerinterfacev1.h"
-#include "modules/ddm/ddminterfacev1.h"
+#include "modules/ddm/ddmremoteobjectv1.h"
 #include "modules/output-manager/outputmanagement.h"
 #include "modules/personalization/personalizationmanagerinterfacev1.h"
 #include "modules/screensaver/screensaverinterfacev1.h"
@@ -1271,7 +1271,7 @@ void Helper::init(Treeland::Treeland *treeland)
     m_backend = m_server->attach<WBackend>();
     m_seatManager = new SeatsManager(m_server, this);
 
-    m_ddmInterfaceV1 = m_server->attach<DDMInterfaceV1>();
+    m_ddmRemoteObjectV1 = m_server->attach<DDMRemoteObjectV1>();
 
     m_outputManager = m_server->attach<WOutputManagerV1>();
     connect(m_backend, &WBackend::outputAdded, this, &Helper::onOutputAdded);
@@ -2727,10 +2727,6 @@ void Helper::onPrepareForSleep(bool sleep)
         qCInfo(treelandCore) << "Re-enabled rendering after hibernate";
         enableRender();
     }
-}
-
-DDMInterfaceV1 *Helper::ddmInterfaceV1() const {
-    return m_ddmInterfaceV1;
 }
 
 void Helper::activateSession() {

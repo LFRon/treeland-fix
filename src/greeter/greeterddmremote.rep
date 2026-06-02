@@ -1,0 +1,26 @@
+// Copyright (C) 2026 UnionTech Software Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+
+class GreeterDDMRemote {
+    PROP(QString hostName)
+    PROP(bool canPowerOff=false)
+    PROP(bool canReboot=false)
+    PROP(bool canSuspend=false)
+    PROP(bool canHibernate=false)
+    PROP(bool canHybridSleep=false)
+    SIGNAL(loginFailed(QString user))
+    SIGNAL(informationMessage(QString message))
+    SIGNAL(switchToGreeter())
+    SIGNAL(userActivated(QString user, int sessionId))
+    SIGNAL(userLoggedIn(QString user, int sessionId))
+    SLOT(void connectGreeter())
+    SLOT(void login(QString user, QString password, int sessionType, QString sessionFile))
+    SLOT(void logout(int id))
+    SLOT(void lock(int id))
+    SLOT(void unlock(QString user, QString password))
+    SLOT(void powerOff())
+    SLOT(void reboot())
+    SLOT(void suspend())
+    SLOT(void hibernate())
+    SLOT(void hybridSleep())
+};

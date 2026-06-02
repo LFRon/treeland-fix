@@ -98,7 +98,7 @@ QW_USE_NAMESPACE
 
 class CaptureSourceSelector;
 class DDEShellManagerInterfaceV1;
-class DDMInterfaceV1;
+class DDMRemoteObjectV1;
 class ForeignToplevelManagerInterfaceV1;
 class FpsDisplayManager;
 class GreeterProxy;
@@ -237,7 +237,7 @@ public:
 
     inline UserModel *userModel() const { return m_userModel; };
     inline SessionModel *sessionModel() const { return m_sessionModel; };
-    DDMInterfaceV1 *ddmInterfaceV1() const;
+    inline GreeterProxy *greeterProxy() const { return m_greeterProxy; };
 
     void activateSession();
     void deactivateSession();
@@ -402,7 +402,7 @@ private:
     DDEShellManagerInterfaceV1 *m_ddeShellV1 = nullptr;
     VirtualOutputManagerInterfaceV1 *m_virtualOutputInterfaceV1 = nullptr;
     OutputManagerV1 *m_outputManagerV1 = nullptr;
-    DDMInterfaceV1 *m_ddmInterfaceV1 = nullptr;
+    DDMRemoteObjectV1 *m_ddmRemoteObjectV1 = nullptr;
     ScreensaverInterfaceV1 *m_screensaverInterfaceV1 = nullptr;
     TreelandWallpaperManagerInterfaceV1 *m_wallpaperManagerInterfaceV1 = nullptr;
     TreelandWallpaperNotifierInterfaceV1 *m_wallpaperNotifierInterfaceV1 = nullptr;
