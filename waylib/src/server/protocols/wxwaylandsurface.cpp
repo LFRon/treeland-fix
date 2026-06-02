@@ -52,6 +52,7 @@ public:
     void init();
     void updateChildren();
     void updateParent();
+    void onParentInvalidated();
     void updateWindowTypes();
 
     W_DECLARE_PUBLIC(WXWaylandSurface)
@@ -62,6 +63,7 @@ public:
 
     QList<WXWaylandSurface*> children;
     WXWaylandSurface *parent = nullptr;
+    QMetaObject::Connection parentInvalidatedConnection;
     QRect lastRequestConfigureGeometry;
     WXWaylandSurface::ConfigureFlags lastRequestConfigureFlags = {0};
     WXWaylandSurface::WindowTypes windowTypes = {0};
@@ -199,8 +201,14 @@ void WXWaylandSurfacePrivate::updateParent()
     if (parent)
         parent->d_func()->updateChildren();
     parent = newParent;
-    if (parent)
+    if (parentInvalidatedConnection)
+        QObject::disconnect(parentInvalidatedConnection);
+    if (parent) {
+        parentInvalidatedConnection = QObject::connect(parent, &WWrapObject::invalidated, q_func(), [this] {
+            onParentInvalidated();
+        });
         parent->d_func()->updateChildren();
+    }
 
     W_Q(WXWaylandSurface);
 
@@ -208,6 +216,14 @@ void WXWaylandSurfacePrivate::updateParent()
 
     if (hasParentChanged)
         Q_EMIT q->isToplevelChanged();
+}
+
+void WXWaylandSurfacePrivate::onParentInvalidated()
+{
+    W_Q(WXWaylandSurface);
+    parent = nullptr;
+    Q_EMIT q->parentXWaylandSurfaceChanged();
+    Q_EMIT q->isToplevelChanged();
 }
 
 void WXWaylandSurfacePrivate::updateWindowTypes()
