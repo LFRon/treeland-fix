@@ -1,0 +1,23 @@
+// Copyright (C) 2026 UnionTech Software Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+
+class DDMRemote {
+    PROP(QString hostName SOURCEONLYSETTER)
+    PROP(bool canPowerOff=false SOURCEONLYSETTER)
+    PROP(bool canReboot=false SOURCEONLYSETTER)
+    PROP(bool canSuspend=false SOURCEONLYSETTER)
+    PROP(bool canHibernate=false SOURCEONLYSETTER)
+    PROP(bool canHybridSleep=false SOURCEONLYSETTER)
+    SIGNAL(loginFailed(QString user))
+    SIGNAL(informationMessage(QString message))
+    SIGNAL(userSessionAdded(QString user, int sessionId))
+    SIGNAL(userSessionRemoved(QString user, int sessionId))
+    SLOT(bool connectGreeter())
+    SLOT(bool login(QString user, QString password, int sessionType, QString sessionFile))
+    SLOT(bool logout(int id))
+    SLOT(bool powerOff())
+    SLOT(bool reboot())
+    SLOT(bool suspend())
+    SLOT(bool hibernate())
+    SLOT(bool hybridSleep())
+};

@@ -29,7 +29,6 @@
 
 class QJsonObject;
 
-Q_MOC_INCLUDE(<QDBusObjectPath>)
 Q_MOC_INCLUDE(<qwgammacontorlv1.h>)
 Q_MOC_INCLUDE(<qwoutputmanagementv1.h>)
 Q_MOC_INCLUDE(<wlayersurface.h>)
@@ -43,7 +42,6 @@ Q_MOC_INCLUDE("treelandconfig.hpp")
 Q_MOC_INCLUDE("treelanduserconfig.hpp")
 
 QT_BEGIN_NAMESPACE
-class QDBusObjectPath;
 class QQuickItem;
 QT_END_NAMESPACE
 
@@ -98,7 +96,7 @@ QW_USE_NAMESPACE
 
 class CaptureSourceSelector;
 class DDEShellManagerInterfaceV1;
-class DDMInterfaceV1;
+class DDMRemoteObjectV1;
 class ForeignToplevelManagerInterfaceV1;
 class FpsDisplayManager;
 class GreeterProxy;
@@ -124,7 +122,7 @@ class SurfaceContainer;
 class SurfaceWrapper;
 class TreelandConfig;
 class TreelandUserConfig;
-class TreelandRemoteSource;
+class TreelandWindowTreeSource;
 class UserModel;
 class VirtualOutputManagerInterfaceV1;
 class WallpaperColorInterfaceV1;
@@ -237,7 +235,7 @@ public:
 
     inline UserModel *userModel() const { return m_userModel; };
     inline SessionModel *sessionModel() const { return m_sessionModel; };
-    DDMInterfaceV1 *ddmInterfaceV1() const;
+    inline GreeterProxy *greeterProxy() const { return m_greeterProxy; };
 
     void activateSession();
     void deactivateSession();
@@ -291,9 +289,6 @@ private Q_SLOTS:
     void onShowDesktop();
     void deleteTaskSwitch();
     void onPrepareForSleep(bool sleep);
-    void onSessionNew(const QString &sessionId, const QDBusObjectPath &objectPath);
-    void onSessionLock();
-    void onSessionUnlock();
 
 private:
     void onOutputAdded(WOutput *output);
@@ -402,7 +397,7 @@ private:
     DDEShellManagerInterfaceV1 *m_ddeShellV1 = nullptr;
     VirtualOutputManagerInterfaceV1 *m_virtualOutputInterfaceV1 = nullptr;
     OutputManagerV1 *m_outputManagerV1 = nullptr;
-    DDMInterfaceV1 *m_ddmInterfaceV1 = nullptr;
+    DDMRemoteObjectV1 *m_ddmRemoteObjectV1 = nullptr;
     ScreensaverInterfaceV1 *m_screensaverInterfaceV1 = nullptr;
     TreelandWallpaperManagerInterfaceV1 *m_wallpaperManagerInterfaceV1 = nullptr;
     TreelandWallpaperNotifierInterfaceV1 *m_wallpaperNotifierInterfaceV1 = nullptr;
@@ -440,7 +435,7 @@ private:
     bool m_isDDMDisplay{ false };
     void tryInitRemoteSource();
 
-    TreelandRemoteSource *m_treelandRemoteSource = nullptr;
+    TreelandWindowTreeSource *m_treelandRemoteSource = nullptr;
 
     struct PendingOutputConfig {
         qw_output_configuration_v1 *config = nullptr;

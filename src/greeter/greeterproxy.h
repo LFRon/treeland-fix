@@ -3,18 +3,20 @@
 
 #pragma once
 
-#include "QDBusContext"
-#include <QDBusObjectPath>
 #include <QObject>
 #include <QQmlEngine>
+#include <QRemoteObjectPendingCall>
+#include <QRemoteObjectReplica>
+
+#include <memory>
 
 class QLocalSocket;
+class QRemoteObjectNode;
+class DDMRemoteReplica;
 
 class LockScreen;
 
-class GreeterProxy
-    : public QObject
-    , protected QDBusContext
+class GreeterProxy : public QObject
 {
     Q_OBJECT
     Q_DISABLE_COPY(GreeterProxy)
@@ -51,37 +53,37 @@ public:
      * @brief Get the host name
      * @return Host name
      */
-    inline const QString &hostName() const { return m_hostName; };
+    QString hostName() const;
 
     /**
      * @brief Get the power off capability
      * @return true if can power off
      */
-    inline bool canPowerOff()      const { return m_canPowerOff;      };
+    bool canPowerOff() const;
 
     /**
      * @brief Get the reboot capability
      * @return true if can reboot
      */
-    inline bool canReboot()        const { return m_canReboot;        };
+    bool canReboot() const;
 
     /**
      * @brief Get the suspend capability
      * @return true if can suspend
      */
-    inline bool canSuspend()       const { return m_canSuspend;       };
+    bool canSuspend() const;
 
     /**
      * @brief Get the hibernate capability
      * @return true if can hibernate
      */
-    inline bool canHibernate()     const { return m_canHibernate;     };
+    bool canHibernate() const;
 
     /**
      * @brief Get the hybrid sleep capability
      * @return true if can hybrid sleep
      */
-    inline bool canHybridSleep()   const { return m_canHybridSleep;   };
+    bool canHybridSleep() const;
 
     /**
      * @brief Get the greeter's lock state
@@ -136,6 +138,12 @@ public:
      */
     void setShowShutdownView(bool show);
 
+    /**
+     * @brief Set the local lock state without sending a request to DDM.
+     * @param isLocked true to show lockscreen, false to hide it
+     */
+    void setLock(bool isLocked);
+
     ////////////////////
     // Public methods //
     ////////////////////
@@ -178,9 +186,8 @@ public Q_SLOTS:
     /** @brief Login given user with given password for given desktop session.
      * This function will call DDM to perform the login.
      *
-     * Listen to org.freedesktop.login1.Manager.SessionNew signal to
-     * detect if new sessions successfully logged in, and listen to
-     * failedAttempts property to detect failed login attempts.
+     * Listen to user session signals from DDM to detect session changes,
+     * and listen to failedAttempts property to detect failed login attempts.
      *
      * @param user Username
      * @param password Password
@@ -191,28 +198,15 @@ public Q_SLOTS:
     /** @brief Lock the current active session.
      * This function will call DDM to perform the lock.
      *
-     * Listen to org.freedesktop.login1.Session.Lock signal to detect
-     * if the session is successfully locked.
+     * Show the lockscreen locally (Treeland self-manages lock state).
      */
     void lock();
-
-    /** @brief Unlock given user with given password.
-     * This function will call DDM to perform the unlock.
-     *
-     * Listen to org.freedesktop.login1.Session.Unlock signal to
-     * detect if the session is successfully unlocked, and listen to
-     * failedAttempts property to detect failed unlock attempts.
-     *
-     * @param user Username
-     * @param password Password
-     */
-    void unlock(const QString &user, const QString &password);
 
     /** @brief Logout the current active session.
      * This function will call DDM to perform the logout.
      *
-     * Listen to org.freedesktop.login1.Manager.SessionRemoved signal to
-     * detect if the session is successfully logged out.
+     * Listen to userSessionRemoved from DDM to detect if the session is
+     * successfully logged out.
      */
     void logout();
 
@@ -224,30 +218,14 @@ private Q_SLOTS:
 
     void connected();
     void disconnected();
-    void readyRead();
     void error();
-
-    //////////////////////////////
-    // Logind session listeners //
-    //////////////////////////////
-
-    /** @brief Listener for org.freederktop.login1.Manager.SessionNew */
-    void onSessionNew(const QString &id, const QDBusObjectPath &session);
-
-    /** @brief Listener for org.freederktop.login1.Manager.SessionRemoved */
-    void onSessionRemoved(const QString &id, const QDBusObjectPath &session);
-
-    /** @brief Listener for org.freederktop.login1.Session.Lock */
-    void onSessionLock();
-
-    /** @brief Listener for org.freederktop.login1.Session.Unlock */
-    void onSessionUnlock();
 
 Q_SIGNALS:
     void informationMessage(const QString &message);
 
     void switchUser();
 
+    void socketConnected();
     void socketDisconnected();
 
     /////////////////////////////
@@ -293,35 +271,23 @@ private:
     // Private methods //
     /////////////////////
 
-    /**
-     * @brief Set the lock state
-     * This is the internal method to set the lock state (lockscreen
-     * visibility, etc.) directly without calling DDM and
-     * communicating with systemd-logind.
-     *
-     * @param isLocked true to set locked, false to set unlocked
-     */
-    void setLock(bool isLocked);
-
-    /**
-     * @brief Update the DDM communication socket
-     */
-    void updateAuthSocket();
+    void connectToDDM();
+    void resetRemote();
+    void onLoginFailed(const QString &user);
+    void addUserSession(const QString &user, int sessionId);
+    void removeUserSession(const QString &user, int sessionId);
+    void remoteStateChanged(QRemoteObjectReplica::State state, QRemoteObjectReplica::State oldState);
+    void watchRemoteCall(const char *operation, const QRemoteObjectPendingCall &call);
 
     /////////////////////
     // Property values //
     /////////////////////
 
     QLocalSocket *m_socket{ nullptr };
+    std::unique_ptr<QRemoteObjectNode> m_remoteNode;
+    std::unique_ptr<DDMRemoteReplica> m_remoteReplica;
     LockScreen *m_lockScreen{ nullptr };
 
-    QString m_hostName{};
-
-    bool m_canPowerOff      { false };
-    bool m_canReboot        { false };
-    bool m_canSuspend       { false };
-    bool m_canHibernate     { false };
-    bool m_canHybridSleep   { false };
 
     bool m_isLocked         { false };
     int  m_failedAttempts   { 0     };

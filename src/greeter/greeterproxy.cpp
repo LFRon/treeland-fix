@@ -12,20 +12,16 @@
 #include "core/lockscreen.h"
 
 // DDM
-#include <Login1Manager.h>
-#include <Login1Session.h>
-#include <Messages.h>
-#include <SocketWriter.h>
+#include <rep_ddmremote_replica.h>
 
 // Qt
 #include <QCommandLineOption>
 #include <QCommandLineParser>
-#include <QDBusInterface>
-#include <QDBusPendingCall>
-#include <QDBusReply>
 #include <QGuiApplication>
 #include <QLocalSocket>
-#include <QScopeGuard>
+#include <QRemoteObjectNode>
+#include <QRemoteObjectPendingCallWatcher>
+#include <QTimer>
 #include <QVariantMap>
 
 // Waylib
@@ -33,10 +29,13 @@
 
 // System
 #include <security/pam_appl.h>
-#include <systemd/sd-login.h>
 #include <pwd.h>
 
 using namespace DDM;
+
+namespace {
+constexpr auto ddmRemoteSocketName = "org.deepin.dde.ddm.qro";
+}
 
 /////////////////////
 // Local Functions //
@@ -95,30 +94,9 @@ GreeterProxy::GreeterProxy(QObject *parent)
     // connect signals
     connect(m_socket, &QLocalSocket::connected, this, &GreeterProxy::connected);
     connect(m_socket, &QLocalSocket::disconnected, this, &GreeterProxy::disconnected);
-    connect(m_socket, &QLocalSocket::readyRead, this, &GreeterProxy::readyRead);
     connect(m_socket, &QLocalSocket::errorOccurred, this, &GreeterProxy::error);
 
-    auto conn = QDBusConnection::systemBus();
-    conn.connect(Logind::serviceName(),
-                 Logind::managerPath(),
-                 Logind::managerIfaceName(),
-                 "SessionNew",
-                 this,
-                 SLOT(onSessionNew(QString, QDBusObjectPath)));
-    conn.connect(Logind::serviceName(),
-                 Logind::managerPath(),
-                 Logind::managerIfaceName(),
-                 "SessionRemoved",
-                 this,
-                 SLOT(onSessionRemoved(QString, QDBusObjectPath)));
-    conn.connect("org.deepin.DisplayManager",
-                 "/org/deepin/DisplayManager",
-                 "org.deepin.DisplayManager",
-                 "AuthInfoChanged",
-                 this,
-                 SLOT(updateAuthSocket()));
-
-    updateAuthSocket();
+    connectToDDM();
 }
 
 GreeterProxy::~GreeterProxy() { }
@@ -159,33 +137,49 @@ void GreeterProxy::setLock(bool isLocked)
 
 void GreeterProxy::powerOff()
 {
-    SocketWriter(m_socket) << quint32(GreeterMessages::PowerOff);
+    if (isConnected())
+        watchRemoteCall("powerOff", m_remoteReplica->powerOff());
 }
 
 void GreeterProxy::reboot()
 {
-    SocketWriter(m_socket) << quint32(GreeterMessages::Reboot);
+    if (isConnected())
+        watchRemoteCall("reboot", m_remoteReplica->reboot());
 }
 
 void GreeterProxy::suspend()
 {
-    SocketWriter(m_socket) << quint32(GreeterMessages::Suspend);
+    if (isConnected())
+        watchRemoteCall("suspend", m_remoteReplica->suspend());
 }
 
 void GreeterProxy::hibernate()
 {
-    SocketWriter(m_socket) << quint32(GreeterMessages::Hibernate);
+    if (isConnected())
+        watchRemoteCall("hibernate", m_remoteReplica->hibernate());
 }
 
 void GreeterProxy::hybridSleep()
 {
-    SocketWriter(m_socket) << quint32(GreeterMessages::HybridSleep);
+    if (isConnected())
+        watchRemoteCall("hybridSleep", m_remoteReplica->hybridSleep());
 }
 
 void GreeterProxy::login(const QString &user, const QString &password, const int sessionIndex)
 {
-    if (!m_socket->isValid()) {
-        qCDebug(treelandGreeter) << "Socket is not valid. Local password check.";
+    auto userInfo = userModel()->get(user);
+    if (!isConnected() || !userInfo.isValid()) {
+        qCDebug(treelandGreeter) << "Socket is not valid or user not found. Local password check.";
+        if (localValidation(user, password)) {
+            setLock(false);
+        } else {
+            Q_EMIT failedAttemptsChanged(++m_failedAttempts);
+        }
+        return;
+    }
+
+    if (userInfo.loggedIn) {
+        qCInfo(treelandGreeter) << "Unlocking user" << user;
         if (localValidation(user, password)) {
             setLock(false);
         } else {
@@ -202,34 +196,20 @@ void GreeterProxy::login(const QString &user, const QString &password, const int
         static_cast<DDM::Session::Type>(sessionModel()->data(index, SessionModel::TypeRole).toInt());
     QString name = sessionModel()->data(index, SessionModel::FileRole).toString();
     qCInfo(treelandGreeter) << "Logging user" << user << "in with" << type << "session" << name;
-    DDM::Session session(type, name);
-    SocketWriter(m_socket) << quint32(GreeterMessages::Login) << user << password << session;
-}
-
-void GreeterProxy::unlock(const QString &user, const QString &password)
-{
-    if (!m_socket->isValid()) {
-        qCDebug(treelandGreeter) << "Socket is not valid. Local password check.";
-        if (localValidation(user, password)) {
-            setLock(false);
-        } else {
-            Q_EMIT failedAttemptsChanged(++m_failedAttempts);
-        }
-        return;
-    }
-
-    auto userInfo = userModel()->get(user);
-    if (userInfo.isValid()) {
-        qCInfo(treelandGreeter) << "Unlocking user" << user;
-        SocketWriter(m_socket) << quint32(GreeterMessages::Unlock) << user << password;
-    }
+    watchRemoteCall("login", m_remoteReplica->login(user, password, type, name));
 }
 
 void GreeterProxy::logout()
 {
     auto session = Helper::instance()->sessionManager()->activeSession().lock();
+    if (!session) {
+        qCWarning(treelandGreeter) << "Trying to logout when no user session active.";
+        return;
+    }
+
     qCInfo(treelandGreeter) << "Logging user" << session->username() << "out with session id" << session->id();
-    SocketWriter(m_socket) << quint32(GreeterMessages::Logout) << session->id();
+    if (isConnected())
+        watchRemoteCall("logout", m_remoteReplica->logout(session->id()));
 }
 
 void GreeterProxy::lock()
@@ -241,91 +221,43 @@ void GreeterProxy::lock()
         return;
     }
     qCInfo(treelandGreeter) << "Locking user" << session->username() << "with session id" << session->id();
-    SocketWriter(m_socket) << quint32(GreeterMessages::Lock) << session->id();
+    setLock(true);
 }
 
-//////////////////////////////
-// Logind session listeners //
-//////////////////////////////
+////////////////////////////
+// DDM session listeners //
+////////////////////////////
 
-void GreeterProxy::onSessionNew(const QString &id, [[maybe_unused]] const QDBusObjectPath &path)
+void GreeterProxy::addUserSession(const QString &user, int sessionId)
 {
-    QByteArray sessionBa = id.toLocal8Bit();
-    const char *session = sessionBa.constData();
-    char *username = nullptr;
-    char *service = nullptr;
-    auto guard = qScopeGuard([&]() {
-        if (username)
-            free(username);
-        if (service)
-            free(service);
-    });
-    if (sd_session_get_username(session, &username) < 0) {
-        qCWarning(treelandGreeter) << "sd_session_get_username() failed for session id:" << id;
-        return;
-    }
-    if (sd_session_get_service(session, &service) < 0) {
-        qCWarning(treelandGreeter) << "sd_session_get_service() failed for session id:" << id;
+    qCInfo(treelandGreeter) << "User session added: id=" << sessionId << ", user=" << user;
+    auto userPtr = userModel()->getUser(user);
+    if (!userPtr) {
+        qCWarning(treelandGreeter) << "User" << user << "logged in but not found";
         return;
     }
 
-    if (strcmp(service, "ddm") == 0) {
-        QString user = QString::fromLocal8Bit(username);
-        qCInfo(treelandGreeter) << "New session added: id=" << id << ", user=" << user;
-        userModel()->updateUserLoginState(user, true);
-        // userLoggedIn signal is connected with Helper::updateActiveUserSession
-        Q_EMIT userModel()->userLoggedIn(user, id.toInt());
+    userModel()->updateUserLoginState(user, true);
+    Q_EMIT userModel()->userLoggedIn(user, sessionId);
 
-        // Connect to Lock/Unlock signals
-        auto conn = QDBusConnection::systemBus();
-        conn.connect(Logind::serviceName(),
-                     path.path(),
-                     Logind::sessionIfaceName(),
-                     "Lock",
-                     this,
-                     SLOT(onSessionLock()));
-        conn.connect(Logind::serviceName(),
-                     path.path(),
-                     Logind::sessionIfaceName(),
-                     "Unlock",
-                     this,
-                     SLOT(onSessionUnlock()));
-
-        if (userModel()->currentUserName() == user)
-            setLock(false);
-        if (!m_hasActiveSession) {
-            m_hasActiveSession = true;
-            Q_EMIT hasActiveSessionChanged(true);
-        }
+    if (userModel()->currentUserName() == user)
+        setLock(false);
+    if (!m_hasActiveSession) {
+        m_hasActiveSession = true;
+        Q_EMIT hasActiveSessionChanged(true);
     }
 }
 
-void GreeterProxy::onSessionRemoved(const QString &id, [[maybe_unused]] const QDBusObjectPath &path)
+void GreeterProxy::removeUserSession(const QString &user, int sessionId)
 {
-    // Disconnect from Lock/Unlock signals, if any
-    auto conn = QDBusConnection::systemBus();
-    conn.disconnect(Logind::serviceName(),
-                    path.path(),
-                    Logind::sessionIfaceName(),
-                    "Lock",
-                    this,
-                    SLOT(onSessionLock()));
-    conn.disconnect(Logind::serviceName(),
-                    path.path(),
-                    Logind::sessionIfaceName(),
-                    "Unlock",
-                    this,
-                    SLOT(onSessionUnlock()));
-
-    auto session = Helper::instance()->sessionManager()->sessionForId(id.toInt());
+    qCInfo(treelandGreeter) << "User session removed: id=" << sessionId << ", user=" << user;
+    auto session = Helper::instance()->sessionManager()->sessionForId(sessionId);
     if (session) {
-        QString username = session->username();
-        qCInfo(treelandGreeter) << "Session removed: id=" << id << ", user=" << username;
         if (Helper::instance()->sessionManager()->activeSession().lock() == session)
             setLock(true);
-        userModel()->updateUserLoginState(username, false);
         Helper::instance()->sessionManager()->removeSession(session);
     }
+    userModel()->updateUserLoginState(user, false);
 
     if (m_hasActiveSession && Helper::instance()->sessionManager()->sessions().isEmpty()) {
         m_hasActiveSession = false;
@@ -333,230 +265,123 @@ void GreeterProxy::onSessionRemoved(const QString &id, [[maybe_unused]] const QD
     }
 }
 
-void GreeterProxy::onSessionLock()
-{
-    const QString path = message().path();
-    QThreadPool::globalInstance()->start([this, path] {
-        OrgFreedesktopLogin1SessionInterface session("org.freedesktop.login1",
-                                                     path,
-                                                     QDBusConnection::systemBus());
-        int id = session.id().toInt();
-        qCInfo(treelandGreeter) << "Lock signal received for session id:" << id;
-        auto activeSession = Helper::instance()->sessionManager()->activeSession().lock();
-        if (!activeSession)
-            qCWarning(treelandGreeter)
-                << "Lock signal received for non-exist session id:" << id << ", ignore.";
-        else if (activeSession->id() != id)
-            qCWarning(treelandGreeter)
-                << "Lock signal received for non-active session id:" << id << ", ignore.";
-        else
-            QMetaObject::invokeMethod(this, [this] {
-                setLock(true);
-            });
-    });
-}
-
-void GreeterProxy::onSessionUnlock()
-{
-    const QString path = message().path();
-    QThreadPool::globalInstance()->start([this, path] {
-        OrgFreedesktopLogin1SessionInterface session("org.freedesktop.login1",
-                                                     path,
-                                                     QDBusConnection::systemBus());
-        int id = session.id().toInt();
-        const QString username = session.name();
-        qCInfo(treelandGreeter) << "Unlock signal received for session id:" << id;
-        auto activeSession = Helper::instance()->sessionManager()->activeSession().lock();
-        if (!activeSession) {
-            qCWarning(treelandGreeter)
-                << "Unlock signal received for non-exist session id:" << id << ", ignore.";
-        } else if (activeSession->id() != id) {
-            qCWarning(treelandGreeter)
-                << "Unlock signal received for non-active session id:" << id << ", lock it back.";
-            QMetaObject::invokeMethod(this, [this, id] {
-                SocketWriter(m_socket) << quint32(GreeterMessages::Lock) << QString::number(id);
-            });
-        } else {
-            QMetaObject::invokeMethod(this, [this] {
-                setLock(false);
-            });
-        }
-    });
-}
-
 ///////////////////////
 // DDM Communication //
 ///////////////////////
 
+QString GreeterProxy::hostName() const
+{
+    return m_remoteReplica ? m_remoteReplica->hostName() : QString();
+}
+
+bool GreeterProxy::canPowerOff() const
+{
+    return m_remoteReplica && m_remoteReplica->canPowerOff();
+}
+
+bool GreeterProxy::canReboot() const
+{
+    return m_remoteReplica && m_remoteReplica->canReboot();
+}
+
+bool GreeterProxy::canSuspend() const
+{
+    return m_remoteReplica && m_remoteReplica->canSuspend();
+}
+
+bool GreeterProxy::canHibernate() const
+{
+    return m_remoteReplica && m_remoteReplica->canHibernate();
+}
+
+bool GreeterProxy::canHybridSleep() const
+{
+    return m_remoteReplica && m_remoteReplica->canHybridSleep();
+}
+
 bool GreeterProxy::isConnected() const
 {
-    return m_socket->state() == QLocalSocket::ConnectedState;
+    return m_remoteReplica && m_remoteReplica->state() == QRemoteObjectReplica::Valid;
 }
 
 void GreeterProxy::connected()
 {
     qCInfo(treelandGreeter) << "Connected to the ddm";
+    Q_EMIT socketConnected();
 
-    SocketWriter(m_socket)
-        << quint32(GreeterMessages::Connect)
-        << Helper::instance()->sessionManager()->globalSession()->socket()->fullServerName();
+    resetRemote();
+    m_remoteNode.reset(new QRemoteObjectNode);
+    m_remoteNode->addClientSideConnection(m_socket);
+    m_remoteReplica.reset(m_remoteNode->acquire<DDMRemoteReplica>());
+
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::hostNameChanged, this, &GreeterProxy::hostNameChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::canPowerOffChanged, this, &GreeterProxy::canPowerOffChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::canRebootChanged, this, &GreeterProxy::canRebootChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::canSuspendChanged, this, &GreeterProxy::canSuspendChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::canHibernateChanged, this, &GreeterProxy::canHibernateChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::canHybridSleepChanged, this, &GreeterProxy::canHybridSleepChanged);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::informationMessage, this, &GreeterProxy::informationMessage);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::loginFailed, this, &GreeterProxy::onLoginFailed);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::userSessionAdded, this, &GreeterProxy::addUserSession);
+    connect(m_remoteReplica.get(), &DDMRemoteReplica::userSessionRemoved, this, &GreeterProxy::removeUserSession);
+    connect(m_remoteReplica.get(), &QRemoteObjectReplica::stateChanged, this, &GreeterProxy::remoteStateChanged);
 }
 
 void GreeterProxy::disconnected()
 {
     qCWarning(treelandGreeter) << "Disconnected from the ddm";
-
+    resetRemote();
     Q_EMIT socketDisconnected();
 }
 
 void GreeterProxy::error()
 {
     qCCritical(treelandGreeter) << "Socket error: " << m_socket->errorString();
+    if (m_socket->state() == QLocalSocket::UnconnectedState)
+        QTimer::singleShot(1000, this, &GreeterProxy::connectToDDM);
 }
 
-void GreeterProxy::readyRead()
+void GreeterProxy::connectToDDM()
 {
-    // input stream
-    QDataStream input(m_socket);
+    if (m_socket->state() != QLocalSocket::UnconnectedState)
+        m_socket->abort();
 
-    while (input.device()->bytesAvailable()) {
-        // read message
-        quint32 message;
-        input >> message;
-
-        switch (DaemonMessages(message)) {
-        case DaemonMessages::Capabilities: {
-            // log message
-            qCDebug(treelandGreeter) << "Message received from daemon: Capabilities";
-
-            // read capabilities
-            quint32 capabilities;
-            input >> capabilities;
-
-            // parse capabilities
-            m_canPowerOff = capabilities & Capability::PowerOff;
-            m_canReboot = capabilities & Capability::Reboot;
-            m_canSuspend = capabilities & Capability::Suspend;
-            m_canHibernate = capabilities & Capability::Hibernate;
-            m_canHybridSleep = capabilities & Capability::HybridSleep;
-
-            // Q_EMIT signals
-            Q_EMIT canPowerOffChanged(m_canPowerOff);
-            Q_EMIT canRebootChanged(m_canReboot);
-            Q_EMIT canSuspendChanged(m_canSuspend);
-            Q_EMIT canHibernateChanged(m_canHibernate);
-            Q_EMIT canHybridSleepChanged(m_canHybridSleep);
-        } break;
-        case DaemonMessages::HostName: {
-            qCDebug(treelandGreeter) << "Message received from daemon: HostName";
-
-            // read host name
-            input >> m_hostName;
-
-            // Q_EMIT signal
-            Q_EMIT hostNameChanged(m_hostName);
-        } break;
-        case DaemonMessages::LoginFailed: {
-            QString user;
-            input >> user;
-
-            qCDebug(treelandGreeter) << "Message received from daemon: LoginFailed" << user;
-
-            Q_EMIT failedAttemptsChanged(++m_failedAttempts);
-        } break;
-        case DaemonMessages::InformationMessage: {
-            QString message;
-            input >> message;
-
-            qCDebug(treelandGreeter) << "Information Message received from daemon: " << message;
-            Q_EMIT informationMessage(message);
-        } break;
-        case DaemonMessages::SwitchToGreeter: {
-            qCInfo(treelandGreeter) << "switch to greeter";
-            lock();
-        } break;
-        case DaemonMessages::UserActivateMessage: {
-            QString user;
-            int sessionId;
-            input >> user >> sessionId;
-
-            // NOTE: maybe DDM will active dde user.
-            if (!userModel()->getUser(user)) {
-                qCInfo(treelandGreeter) << "activate user, but switch to greeter";
-                lock();
-                break;
-            }
-
-            userModel()->setCurrentUserName(user);
-
-            qCInfo(treelandGreeter) << "activate successfully: " << user << ", XDG_SESSION_ID: " << sessionId;
-        } break;
-        case DaemonMessages::UserLoggedIn: {
-            QString user;
-            int sessionId;
-            input >> user >> sessionId;
-
-            // This will happen after a crash recovery of treeland
-            qCInfo(treelandGreeter) << "User " << user << " is already logged in";
-            auto userPtr = userModel()->getUser(user);
-            if (userPtr) {
-                userModel()->updateUserLoginState(user, true);
-                Q_EMIT userModel()->userLoggedIn(user, sessionId);
-                QThreadPool::globalInstance()->start([this, sessionId] {
-                    // Connect to Lock/Unlock signals
-                    auto conn = QDBusConnection::systemBus();
-                    OrgFreedesktopLogin1ManagerInterface manager("org.freedesktop.login1",
-                                                                 Logind::managerPath(),
-                                                                 conn);
-                    auto reply = manager.GetSession(QString::number(sessionId));
-                    reply.waitForFinished();
-                    if (!reply.isValid()) {
-                        qCWarning(treelandGreeter) << "Failed to get session path for session id:" << sessionId << ", error:" << reply.error().message();
-                        return;
-                    }
-                    auto path = reply.value();
-                    conn.connect(Logind::serviceName(),
-                                 path.path(),
-                                 Logind::sessionIfaceName(),
-                                 "Lock",
-                                 this,
-                                 SLOT(onSessionLock()));
-                    conn.connect(Logind::serviceName(),
-                                 path.path(),
-                                 Logind::sessionIfaceName(),
-                                 "Unlock",
-                                 this,
-                                 SLOT(onSessionUnlock()));
-                });
-            } else {
-                qCWarning(treelandGreeter) << "User " << user << " logged in but not found";
-            }
-        } break;
-        default: {
-            qCWarning(treelandGreeter) << "Unknown message received from daemon." << message;
-        }
-        }
-    }
+    m_socket->connectToServer(QString::fromLatin1(ddmRemoteSocketName));
 }
 
-void GreeterProxy::updateAuthSocket()
+void GreeterProxy::onLoginFailed(const QString &user)
 {
-    QThreadPool::globalInstance()->start([this]() {
-        QDBusInterface manager("org.deepin.DisplayManager",
-                               "/org/deepin/DisplayManager",
-                               "org.deepin.DisplayManager",
-                               QDBusConnection::systemBus());
-        QDBusReply<QString> reply = manager.call("AuthInfo");
-        if (!reply.isValid()) {
-            qCWarning(treelandGreeter) << "Failed to get auth info from display manager:" << reply.error().message();
-            return;
-        }
-        const QString &socket = reply.value();
-        QMetaObject::invokeMethod(this, [this, socket] {
-            if (m_socket->state() == QLocalSocket::ConnectedState)
-                m_socket->disconnectFromServer();
+    qCDebug(treelandGreeter) << "Message received from daemon: LoginFailed" << user;
+    Q_EMIT failedAttemptsChanged(++m_failedAttempts);
+}
 
-            m_socket->connectToServer(socket);
-        });
+void GreeterProxy::remoteStateChanged(QRemoteObjectReplica::State state, QRemoteObjectReplica::State oldState)
+{
+    qCInfo(treelandGreeter) << "Greeter remote state changed from" << oldState << "to" << state;
+    if (state != QRemoteObjectReplica::Valid)
+        return;
+
+    Q_EMIT hostNameChanged(hostName());
+    Q_EMIT canPowerOffChanged(canPowerOff());
+    Q_EMIT canRebootChanged(canReboot());
+    Q_EMIT canSuspendChanged(canSuspend());
+    Q_EMIT canHibernateChanged(canHibernate());
+    Q_EMIT canHybridSleepChanged(canHybridSleep());
+    watchRemoteCall("connectGreeter", m_remoteReplica->connectGreeter());
+}
+
+void GreeterProxy::watchRemoteCall(const char *operation, const QRemoteObjectPendingCall &call)
+{
+    auto *watcher = new QRemoteObjectPendingCallWatcher(call, this);
+    connect(watcher, &QRemoteObjectPendingCallWatcher::finished, this, [operation](QRemoteObjectPendingCallWatcher *watcher) {
+        if (watcher->error() != QRemoteObjectPendingCall::NoError)
+            qCWarning(treelandGreeter) << "DDM remote call failed:" << operation << watcher->error();
+        watcher->deleteLater();
     });
+}
+
+void GreeterProxy::resetRemote()
+{
+    m_remoteReplica.reset();
+    m_remoteNode.reset();
 }

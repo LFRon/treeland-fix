@@ -31,7 +31,7 @@
 #include "modules/capture/capture.h"
 #include "modules/dde-shell/ddeshellattached.h"
 #include "modules/dde-shell/ddeshellmanagerinterfacev1.h"
-#include "modules/ddm/ddminterfacev1.h"
+#include "modules/ddm/ddmremoteobjectv1.h"
 #include "modules/output-manager/outputmanagement.h"
 #include "modules/personalization/personalizationmanagerinterfacev1.h"
 #include "modules/screensaver/screensaverinterfacev1.h"
@@ -123,8 +123,6 @@
 
 #include <QAction>
 #include <QDBusConnection>
-#include <QDBusInterface>
-#include <QDBusObjectPath>
 #include <QKeySequence>
 #include <QLoggingCategory>
 #include <QMouseEvent>
@@ -283,16 +281,6 @@ Helper::Helper(QObject *parent)
     } else {
         qCInfo(treelandCore) << "Successfully connected to systemd-logind PrepareForSleep signal";
     }
-
-    // Also connect to SessionNew signal for logging purposes
-    QDBusConnection::systemBus().connect(
-        "org.freedesktop.login1",
-        "/org/freedesktop/login1",
-        "org.freedesktop.login1.Manager",
-        "SessionNew",
-        this,
-        SLOT(onSessionNew(QString,QDBusObjectPath))
-    );
 }
 
 Helper::~Helper()
@@ -339,7 +327,7 @@ void Helper::tryInitRemoteSource()
     if (m_treelandRemoteSource)
         return;
     if (m_globalConfig->debugSource()) {
-        m_treelandRemoteSource = new TreelandRemoteSource(this);
+        m_treelandRemoteSource = new TreelandWindowTreeSource(this);
     }
 }
 
@@ -1271,7 +1259,7 @@ void Helper::init(Treeland::Treeland *treeland)
     m_backend = m_server->attach<WBackend>();
     m_seatManager = new SeatsManager(m_server, this);
 
-    m_ddmInterfaceV1 = m_server->attach<DDMInterfaceV1>();
+    m_ddmRemoteObjectV1 = m_server->attach<DDMRemoteObjectV1>();
 
     m_outputManager = m_server->attach<WOutputManagerV1>();
     connect(m_backend, &WBackend::outputAdded, this, &Helper::onOutputAdded);
@@ -2262,26 +2250,6 @@ void Helper::handleLockScreen(LockScreenInterface *lockScreen)
 }
 
 
-void Helper::onSessionNew(const QString &sessionId, const QDBusObjectPath &sessionPath)
-{
-    const auto path = sessionPath.path();
-    qCDebug(treelandCore) << "Session new, sessionId:" << sessionId << ", sessionPath:" << path;
-    QDBusConnection::systemBus().connect("org.freedesktop.login1", path, "org.freedesktop.login1.Session", "Lock", this, SLOT(onSessionLock()));
-    QDBusConnection::systemBus().connect("org.freedesktop.login1", path, "org.freedesktop.login1.Session", "Unlock", this, SLOT(onSessionUnlock()));
-}
-
-void Helper::onSessionLock()
-{
-    showLockScreen();
-}
-
-void Helper::onSessionUnlock()
-{
-    if (m_lockScreen) {
-        m_lockScreen->unlock();
-    }
-}
-
 void Helper::onExtSessionLock(WSessionLock *lock)
 {
 #ifdef EXT_SESSION_LOCK_V1
@@ -2587,18 +2555,10 @@ void Helper::showLockScreen(bool switchToGreeter)
     setWorkspaceVisible(false);
 
     setCurrentMode(CurrentMode::LockScreen);
-    m_lockScreen->lock();
-
-    // send DDM switch to greeter mode
-    if (switchToGreeter) {
-        QThreadPool::globalInstance()->start([]() {
-            QDBusInterface interface("org.freedesktop.DisplayManager",
-                                     "/org/freedesktop/DisplayManager/Seat0",
-                                     "org.freedesktop.DisplayManager.Seat",
-                                     QDBusConnection::systemBus());
-            interface.call("SwitchToGreeter");
-        });
-    }
+    if (switchToGreeter)
+        m_lockScreen->lock();
+    else
+        m_greeterProxy->setLock(true);
 }
 
 WSeat *Helper::seat() const
@@ -2727,10 +2687,6 @@ void Helper::onPrepareForSleep(bool sleep)
         qCInfo(treelandCore) << "Re-enabled rendering after hibernate";
         enableRender();
     }
-}
-
-DDMInterfaceV1 *Helper::ddmInterfaceV1() const {
-    return m_ddmInterfaceV1;
 }
 
 void Helper::activateSession() {

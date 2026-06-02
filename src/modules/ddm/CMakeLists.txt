@@ -1,17 +1,20 @@
-find_package(TreelandProtocols REQUIRED)
-
-local_qtwayland_server_protocol_treeland(libtreeland
-    PROTOCOL ${TREELAND_PROTOCOLS_DATA_DIR}/treeland-ddm-v1.xml
-    BASENAME treeland-ddm-v1
+add_library(treelandremote_qro OBJECT)
+set_target_properties(treelandremote_qro PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(treelandremote_qro PRIVATE Qt6::RemoteObjects)
+qt_add_repc_sources(treelandremote_qro
+    ${CMAKE_CURRENT_SOURCE_DIR}/treelandremote.rep
 )
+
+target_link_libraries(libtreeland PRIVATE treelandremote_qro)
+target_include_directories(libtreeland PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+set_source_files_properties(${CMAKE_SOURCE_DIR}/src/modules/ddm/ddmremoteobjectv1.cpp PROPERTIES SKIP_AUTOMOC ON)
 
 impl_treeland(
     NAME
         module_ddm
     SOURCE
-        ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddminterfacev1.h
-        ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddminterfacev1.cpp
-        ${CMAKE_BINARY_DIR}/src/modules/ddm/wayland-treeland-ddm-v1-server-protocol.c
+        ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddmremoteobjectv1.cpp
+        ${CMAKE_SOURCE_DIR}/src/modules/ddm/ddmremoteobjectv1.h
     INCLUDE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
 )

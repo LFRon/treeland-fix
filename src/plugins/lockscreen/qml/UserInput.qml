@@ -349,10 +349,7 @@ Item {
 
     function userLogin() {
         let user = UserModel.get(UserModel.currentUserName)
-        if (user.loggedIn)
-            GreeterProxy.unlock(user.name, passwordField.text)
-        else
-            GreeterProxy.login(user.name, passwordField.text, SessionModel.currentIndex)
+        GreeterProxy.login(user.name, passwordField.text, SessionModel.currentIndex)
     }
 
     Connections {

@@ -11,13 +11,13 @@ class SurfaceWrapper;
 class SurfaceContainer;
 class WorkspaceModel;
 
-class TreelandRemoteSource : public WindowTreeRemoteSource
+class TreelandWindowTreeSource : public WindowTreeRemoteSource
 {
     Q_OBJECT
 
 public:
-    explicit TreelandRemoteSource(QObject *parent = nullptr);
-    ~TreelandRemoteSource() override;
+    explicit TreelandWindowTreeSource(QObject *parent = nullptr);
+    ~TreelandWindowTreeSource() override;
 
     QPointF cursorPosition() const override;
     TreelandInfo getTreelandInfo() override;

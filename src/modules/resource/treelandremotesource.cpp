@@ -23,7 +23,7 @@
 
 WAYLIB_SERVER_USE_NAMESPACE
 
-TreelandRemoteSource::TreelandRemoteSource(QObject *parent)
+TreelandWindowTreeSource::TreelandWindowTreeSource(QObject *parent)
     : WindowTreeRemoteSource(parent)
 {
     auto *host = new QRemoteObjectHost(this);
@@ -36,11 +36,11 @@ TreelandRemoteSource::TreelandRemoteSource(QObject *parent)
     }
 }
 
-TreelandRemoteSource::~TreelandRemoteSource() = default;
+TreelandWindowTreeSource::~TreelandWindowTreeSource() = default;
 
-QPointF TreelandRemoteSource::cursorPosition() const
+QPointF TreelandWindowTreeSource::cursorPosition() const
 {
-    auto *self = const_cast<TreelandRemoteSource *>(this);
+    auto *self = const_cast<TreelandWindowTreeSource *>(this);
     if (!self->m_cursorTracking) {
         if (auto *root = Helper::instance()->rootSurfaceContainer(); root && root->cursor()) {
             self->m_cursorTracking = true;
@@ -54,7 +54,7 @@ QPointF TreelandRemoteSource::cursorPosition() const
     return m_cursorPosition;
 }
 
-TreelandInfo TreelandRemoteSource::getTreelandInfo()
+TreelandInfo TreelandWindowTreeSource::getTreelandInfo()
 {
     TreelandInfo info;
 
@@ -74,7 +74,7 @@ TreelandInfo TreelandRemoteSource::getTreelandInfo()
     return info;
 }
 
-WindowInfo TreelandRemoteSource::buildWindowInfo(SurfaceWrapper *surface,
+WindowInfo TreelandWindowTreeSource::buildWindowInfo(SurfaceWrapper *surface,
                                                  int layer,
                                                  const QString &containerName,
                                                  int z) const
@@ -109,7 +109,7 @@ WindowInfo TreelandRemoteSource::buildWindowInfo(SurfaceWrapper *surface,
     return info;
 }
 
-void TreelandRemoteSource::collectSurfaceInfos(QList<WindowInfo> &infos,
+void TreelandWindowTreeSource::collectSurfaceInfos(QList<WindowInfo> &infos,
                                                SurfaceWrapper *surface,
                                                int layer,
                                                const QString &containerName,
@@ -124,7 +124,7 @@ void TreelandRemoteSource::collectSurfaceInfos(QList<WindowInfo> &infos,
     }
 }
 
-void TreelandRemoteSource::collectWorkspaceModelWindows(QList<WindowInfo> &infos,
+void TreelandWindowTreeSource::collectWorkspaceModelWindows(QList<WindowInfo> &infos,
                                                         WorkspaceModel *workspaceModel,
                                                         int layer,
                                                         const QString &containerName) const
@@ -141,7 +141,7 @@ void TreelandRemoteSource::collectWorkspaceModelWindows(QList<WindowInfo> &infos
     }
 }
 
-void TreelandRemoteSource::collectCurrentWorkspaceModelWindows(QList<WindowInfo> &infos,
+void TreelandWindowTreeSource::collectCurrentWorkspaceModelWindows(QList<WindowInfo> &infos,
                                                         WorkspaceModel *workspaceModel,
                                                         int layer,
                                                         const QString &containerName) const
@@ -171,7 +171,7 @@ void TreelandRemoteSource::collectCurrentWorkspaceModelWindows(QList<WindowInfo>
     }
 }
 
-LayerInfo TreelandRemoteSource::buildLayerInfo(SurfaceContainer *container) const
+LayerInfo TreelandWindowTreeSource::buildLayerInfo(SurfaceContainer *container) const
 {
     LayerInfo layerInfo;
     const int layer = static_cast<int>(container->z());
@@ -211,7 +211,7 @@ LayerInfo TreelandRemoteSource::buildLayerInfo(SurfaceContainer *container) cons
     return layerInfo;
 }
 
-void TreelandRemoteSource::updateCursor(const QPointF &newPosition)
+void TreelandWindowTreeSource::updateCursor(const QPointF &newPosition)
 {
     if (newPosition != m_cursorPosition) {
         m_cursorPosition = newPosition;

@@ -148,6 +148,7 @@ qt_add_qml_module(libtreeland
         effects/tsgradiusimagenode.h
         $<$<OR:$<NOT:$<BOOL:${DISABLE_DDM}>>,$<BOOL:${EXT_SESSION_LOCK_V1}>>:core/lockscreen.h>
         $<$<OR:$<NOT:$<BOOL:${DISABLE_DDM}>>,$<BOOL:${EXT_SESSION_LOCK_V1}>>:core/lockscreen.cpp>
+        $<$<NOT:$<BOOL:${DISABLE_DDM}>>:greeter/ddmremote.rep>
         $<$<NOT:$<BOOL:${DISABLE_DDM}>>:greeter/greeterproxy.cpp>
         $<$<NOT:$<BOOL:${DISABLE_DDM}>>:greeter/greeterproxy.h>
         $<$<NOT:$<BOOL:${DISABLE_DDM}>>:greeter/sessionmodel.cpp>
@@ -265,6 +266,12 @@ qt_add_qml_module(libtreeland
     OUTPUT_DIRECTORY
         ${PROJECT_BINARY_DIR}/qt/qml/Treeland
 )
+
+if (NOT DISABLE_DDM)
+    qt_add_repc_replicas(libtreeland
+        ${CMAKE_CURRENT_SOURCE_DIR}/greeter/ddmremote.rep
+    )
+endif()
 
 qt_add_repc_sources(libtreeland
     modules/resource/treelandwindowtree.rep
