@@ -1006,10 +1006,15 @@ void WSurfaceItem::releaseResources()
     if (!d->surfaceFlags.testFlag(DontCacheLastBuffer)) {
         for (auto item : std::as_const(d->subsurfaces)) {
             item->releaseResources();
-            // subsurface's contents at the last frame buffer.
-            // AutoDestroy: disconnects (subsurfaceItem.surface, destroyed, this, lambda{deleteLater})
-            bool disconnAutoDestroy = QObject::disconnect(item->surface(), &WSurface::destroyed, this, nullptr);
-            Q_ASSERT( disconnAutoDestroy || item->property("_autoDestroyReleased").toBool() );
+            // Disconnect the auto-destroy lambda (connected in ensureSubsurfaceItem).
+            // When subsurface WSurface is already destroyed (surface is null), the
+            // QueuedConnection lambda is still pending in the event queue. Set
+            // _autoDestroyReleased to true so the lambda becomes a no-op when it fires.
+            auto surface = item->surface();
+            if (surface) {
+                QObject::disconnect(surface, &WSurface::destroyed, this, nullptr);
+                Q_ASSERT(!item->property("_autoDestroyReleased").toBool());
+            }
             item->setProperty("_autoDestroyReleased", true);
         }
     } else {
@@ -1338,6 +1343,7 @@ WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurf
                 return surfaceItem;
             } else {
                 subsurfaces.removeOne(surfaceItem);
+                surfaceItem->deleteLater();
                 break;
             }
         }
@@ -1354,6 +1360,8 @@ WSurfaceItem *WSurfaceItemPrivate::ensureSubsurfaceItem(WSurface *subsurfaceSurf
     // AutoDestroy: Connect to this(parent)'s lambda since the autodestroy is managed by parent,
     // avoids disconnected with all slots on subsurfaceItem in subsurface's releaseResources
     QObject::connect(subsurfaceSurface, &WSurface::destroyed, q, [this,surfaceItem] {
+        if (surfaceItem->property("_autoDestroyReleased").toBool())
+            return;
         subsurfaces.removeOne(surfaceItem);
         surfaceItem->deleteLater();
     }, Qt::QueuedConnection);
@@ -1377,6 +1385,15 @@ void WSurfaceItemPrivate::updateSubsurfaceContainers()
     Q_Q(WSurfaceItem);
     if (wl_list_empty(&surface->handle()->handle()->current.subsurfaces_below) && belowSubsurfaceContainer) {
         if (belowSubsurfaceContainer->isEmpty()) {
+            // Remove items belonging to this container from subsurfaces
+            // before deleting it, to avoid dangling pointers since the
+            // auto-destroy lambda (QueuedConnection) may not have fired yet.
+            for (int i = subsurfaces.count() - 1; i >= 0; --i) {
+                auto item = subsurfaces.at(i);
+                if (item->parentItem() == belowSubsurfaceContainer) {
+                    subsurfaces.removeAt(i);
+                }
+            }
             delete belowSubsurfaceContainer;
         } else {
             belowSubsurfaceContainer->deleteAfterEmpty();
@@ -1393,6 +1410,12 @@ void WSurfaceItemPrivate::updateSubsurfaceContainers()
     }
     if (wl_list_empty(&surface->handle()->handle()->current.subsurfaces_above) && aboveSubsurfaceContainer) {
         if (aboveSubsurfaceContainer->isEmpty()) {
+            for (int i = subsurfaces.count() - 1; i >= 0; --i) {
+                auto item = subsurfaces.at(i);
+                if (item->parentItem() == aboveSubsurfaceContainer) {
+                    subsurfaces.removeAt(i);
+                }
+            }
             delete aboveSubsurfaceContainer;
         } else {
             aboveSubsurfaceContainer->deleteAfterEmpty();
