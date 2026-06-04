@@ -1,4 +1,4 @@
-// Copyright (C) 2023 - 2026 UnionTech Software Technology Co., Ltd.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "qwlrootsintegration.h"
@@ -6,11 +6,14 @@
 #include "qwlrootswindow.h"
 #include "woutput.h"
 #include "winputdevice.h"
+#include "wkeyboardgroup.h"
+#include "qwkeyboardgroup.h"
 #include "types.h"
 
 #include <qwoutput.h>
 #include <qwrenderer.h>
 #include <qwinputdevice.h>
+#include <qwkeyboard.h>
 
 #include <QOffscreenSurface>
 #include <QGuiApplication>
@@ -126,6 +129,28 @@ QWlrootsScreen *QWlrootsIntegration::getScreenFrom(const WOutput *output)
     return output->screen();
 }
 
+QPointer<QInputDevice> QWlrootsIntegration::addKeyboardInputDevice(WKeyboardGroup *keyboardGroup,
+                                                                   WInputDevice *device,
+                                                                   const QString &seatName)
+{
+    QPointer<QInputDevice> qtdev;
+    wlr_keyboard_group *group = keyboardGroup->nativeHandle();
+    const QString name = QString::fromUtf8(group->keyboard.base.name);
+    qint64 systemId = reinterpret_cast<qint64>(device);
+    qtdev = new QInputDevice(name, systemId, QInputDevice::DeviceType::Keyboard, seatName);
+
+    auto primaryQtDevice = QInputDevice::primaryKeyboard();
+    if (!WInputDevice::from(primaryQtDevice)) {
+        // Ensure the primary keyboard device is the WInputDevice
+        auto pd = const_cast<QInputDevice*>(primaryQtDevice);
+        pd->setParent(nullptr);
+        delete pd;
+    }
+    Q_ASSERT(WInputDevice::from(QInputDevice::primaryKeyboard()));
+
+    return qtdev;
+}
+
 QPointer<QInputDevice> QWlrootsIntegration::addInputDevice(WInputDevice *device, const QString &seatName)
 {
     QPointer<QInputDevice> qtdev;
@@ -134,10 +159,6 @@ QPointer<QInputDevice> QWlrootsIntegration::addInputDevice(WInputDevice *device,
     qint64 systemId = reinterpret_cast<qint64>(device);
 
     switch (qwDevice->handle()->type) {
-    case WLR_INPUT_DEVICE_KEYBOARD: {
-        qtdev = new QInputDevice(name, systemId, QInputDevice::DeviceType::Keyboard, seatName);
-        break;
-    }
     case WLR_INPUT_DEVICE_POINTER: {
         qtdev = new QPointingDevice(name, systemId, QInputDevice::DeviceType::TouchPad, QPointingDevice::PointerType::Generic,
                                     QInputDevice::Capability::Position | QInputDevice::Capability::Hover
@@ -168,6 +189,8 @@ QPointer<QInputDevice> QWlrootsIntegration::addInputDevice(WInputDevice *device,
         qtdev = new QInputDevice(name, systemId, QInputDevice::DeviceType::Keyboard, seatName);
         break;
     }
+    default:
+        break;
     }
 
     if (qtdev) {
@@ -183,15 +206,6 @@ QPointer<QInputDevice> QWlrootsIntegration::addInputDevice(WInputDevice *device,
                 delete pd;
             }
             Q_ASSERT(WInputDevice::from(QPointingDevice::primaryPointingDevice()));
-        } else if (qtdev->type() == QInputDevice::DeviceType::Keyboard) {
-            auto primaryQtDevice = QInputDevice::primaryKeyboard();
-            if (!WInputDevice::from(primaryQtDevice)) {
-                // Ensure the primary keyboard device is the WInputDevice
-                auto pd = const_cast<QInputDevice*>(primaryQtDevice);
-                pd->setParent(nullptr);
-                delete pd;
-            }
-            Q_ASSERT(WInputDevice::from(QInputDevice::primaryKeyboard()));
         }
     }
 

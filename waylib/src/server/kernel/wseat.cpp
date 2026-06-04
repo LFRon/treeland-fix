@@ -9,9 +9,11 @@
 #include "wxdgsurface.h"
 #include "platformplugin/qwlrootsintegration.h"
 #include "private/wglobal_p.h"
+#include "wkeyboardgroup.h"
 
 #include <qwseat.h>
 #include <qwkeyboard.h>
+#include <qwkeyboardgroup.h>
 #include <qwcursor.h>
 #include <qwcompositor.h>
 #include <qwdatadevice.h>
@@ -209,13 +211,7 @@ public:
     inline void doSetKeyboardFocus(qw_surface *surface) {
         if (surface) {
             const wlr_keyboard_modifiers *modifiers = nullptr;
-            auto keyboard = q_func()->keyboard();
-            if (keyboard) {
-                auto *wlr_keyboard = wlr_keyboard_from_input_device(*keyboard->handle());
-                if (wlr_keyboard) {
-                    modifiers = &wlr_keyboard->modifiers;
-                }
-            }
+            modifiers = &keyboardGroup->nativeHandle()->keyboard.modifiers;
 
             // Send keyboard enter with current modifiers.
             // This ensures the newly focused client receives the current modifier state
@@ -294,9 +290,7 @@ public:
     }
 
     // for keyboard event
-    inline bool doNotifyKey(WInputDevice *device, uint32_t keycode, uint32_t state, uint32_t timestamp) {
-        q_func()->setKeyboard(device);
-
+    inline bool doNotifyKey(uint32_t keycode, uint32_t state, uint32_t timestamp) {
         if (!keyboardFocusSurface())
             return false;
 
@@ -304,15 +298,12 @@ public:
         this->handle()->keyboard_notify_key(timestamp, keycode, state);
         return true;
     }
-    inline bool doNotifyModifiers(WInputDevice *device) {
-        auto keyboard = qobject_cast<qw_keyboard*>(device->handle());
-        q_func()->setKeyboard(device);
-
+    inline bool doNotifyModifiers(wlr_keyboard *kb) {
         if (!keyboardFocusSurface())
             return false;
 
         /* Send modifiers to the client. */
-        this->handle()->keyboard_notify_modifiers(&keyboard->handle()->modifiers);
+        wlr_seat_keyboard_notify_modifiers(nativeHandle(), &kb->modifiers);
         return true;
     }
     inline void doMouseMove(WCursor *cursor, const QPointingDevice *device, uint32_t timestamp) {
@@ -337,9 +328,6 @@ public:
     void on_request_set_primary_selection(wlr_seat_request_set_primary_selection_event *event);
     void on_request_start_drag(wlr_seat_request_start_drag_event *event);
     void on_start_drag(wlr_drag *drag);
-
-    void on_keyboard_key(wlr_keyboard_key_event *event, WInputDevice *device);
-    void on_keyboard_modifiers(WInputDevice *device);
     // end slot function
 
     void connect();
@@ -422,6 +410,8 @@ public:
     // for keyboard event
     QTimer m_repeatTimer;
     std::unique_ptr<QKeyEvent> m_repeatKey;
+
+    WKeyboardGroup *keyboardGroup = nullptr;
 
     // for cursor data
     // TODO: make to QWSeatClient in wlroots
@@ -528,70 +518,6 @@ void WSeatPrivate::handleKeyEvent(QKeyEvent &e)
     }
     QCoreApplication::sendEvent(focusWindow, &e);
 }
-void WSeatPrivate::on_keyboard_key(wlr_keyboard_key_event *event, WInputDevice *device)
-{
-    auto keyboard = qobject_cast<qw_keyboard*>(device->handle());
-
-    auto code = event->keycode + 8; // map to wl_keyboard::keymap_format::keymap_format_xkb_v1
-    auto et = event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? QEvent::KeyPress : QEvent::KeyRelease;
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(keyboard->handle()->xkb_state, code);
-
-    // Qt doesn't support XF86Switch_VT_1 to XF86Switch_VT_12, so convert them to
-    // Ctrl+Alt+F1 to Ctrl+Alt+F12
-    //
-    // Assumption: XKB_KEY_XF86Switch_VT_1 and XKB_KEY_F1 are contiguous and ordered such that
-    // (XKB_KEY_F1 + (sym - XKB_KEY_XF86Switch_VT_1)) yields the correct F-key.
-    // If this is not true, the calculation below may be unsafe.
-    static_assert(
-        (XKB_KEY_XF86Switch_VT_12 - XKB_KEY_XF86Switch_VT_1) == (XKB_KEY_F12 - XKB_KEY_F1),
-        "XKB_KEY_XF86Switch_VT_1..12 and XKB_KEY_F1..F12 must be contiguous and ordered for keysym calculation"
-    );
-    if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_12) {
-        constexpr auto ctrlAlt = Qt::ControlModifier | Qt::AltModifier;
-        if ((keyModifiers & ctrlAlt) == ctrlAlt) {
-            sym = XKB_KEY_F1 + (sym - XKB_KEY_XF86Switch_VT_1);
-        }
-    }
-
-    int qtkey = QXkbCommon::keysymToQtKey(sym, keyModifiers, keyboard->handle()->xkb_state, code);
-    const QString &text = QXkbCommon::lookupString(keyboard->handle()->xkb_state, code);
-
-    QKeyEvent e(et, qtkey, keyModifiers, code, event->keycode, keyboard->get_modifiers(),
-                text, false, 1, device->qtDevice());
-    e.setTimestamp(event->time_msec);
-
-    if (focusWindow) {
-        handleKeyEvent(e);
-        if (et == QEvent::KeyPress && xkb_keymap_key_repeats(keyboard->handle()->keymap, code)) {
-            if (m_repeatKey) {
-                m_repeatTimer.stop();
-            }
-            m_repeatKey = std::make_unique<QKeyEvent>(et, qtkey, keyModifiers, code, event->keycode, keyboard->get_modifiers(),
-                text, false, 1, device->qtDevice());
-            m_repeatKey->setTimestamp(event->time_msec);
-            m_repeatTimer.setInterval(keyboard->handle()->repeat_info.delay);
-            m_repeatTimer.start();
-        } else if (et == QEvent::KeyRelease && m_repeatKey && m_repeatKey->nativeScanCode() == code) {
-            m_repeatTimer.stop();
-            m_repeatKey.reset();
-        }
-    } else {
-        if (et == QEvent::KeyPress && qt_sendShortcutOverrideEvent((QObject*)qGuiApp,
-                                        e.timestamp(), e.key(), e.modifiers(),
-                                        e.text(), e.isAutoRepeat(), e.count())) {
-            return;
-        }
-        doNotifyKey(device, event->keycode, event->state, event->time_msec);
-    }
-}
-
-void WSeatPrivate::on_keyboard_modifiers(WInputDevice *device)
-{
-    auto keyboard = qobject_cast<qw_keyboard*>(device->handle());
-    keyModifiers = QXkbCommon::modifiers(keyboard->handle()->xkb_state);
-    doNotifyModifiers(device);
-}
-
 void WSeatPrivate::connect()
 {
     W_Q(WSeat);
@@ -636,8 +562,6 @@ void WSeatPrivate::attachInputDevice(WInputDevice *device)
 {
     W_Q(WSeat);
     device->setSeat(q);
-    auto qtDevice = QWlrootsIntegration::instance()->addInputDevice(device, name);
-    Q_ASSERT(qtDevice);
 
     if (device->type() == WInputDevice::Type::Keyboard) {
         auto keyboard = qobject_cast<qw_keyboard*>(device->handle());
@@ -650,22 +574,26 @@ void WSeatPrivate::attachInputDevice(WInputDevice *device)
                                                            XKB_KEYMAP_COMPILE_NO_FLAGS);
 
         keyboard->set_keymap(keymap);
+        wlr_keyboard_set_keymap(&keyboardGroup->nativeHandle()->keyboard, keymap);
+
         xkb_keymap_unref(keymap);
         xkb_context_unref(context);
-        keyboard->set_repeat_info(25, 600);
+        keyboardGroup->addKeyboard(device);
+        keyboardGroup->ensureKeyboarQtDevice(device, q->name());
 
-        device->safeConnect(&qw_keyboard::notify_key, q, [this, device] (wlr_keyboard_key_event *event) {
-            on_keyboard_key(event, device);
-        });
-        device->safeConnect(&qw_keyboard::notify_modifiers, q, [this, device] () {
-            on_keyboard_modifiers(device);
-        });
-        handle()->set_keyboard(*keyboard);
+        return;
     }
+
+    auto qtDevice = QWlrootsIntegration::instance()->addInputDevice(device, name);
+    Q_ASSERT(qtDevice);
 }
 
 void WSeatPrivate::detachInputDevice(WInputDevice *device)
 {
+    if (device->type() == WInputDevice::Type::Keyboard) {
+        keyboardGroup->removeKeyboard(device);
+    }
+
     if (cursor && device->type() == WInputDevice::Type::Pointer)
         cursor->detachInputDevice(device);
 
@@ -677,8 +605,10 @@ void WSeatPrivate::detachInputDevice(WInputDevice *device)
         touchDeviceList.removeOne(device);
     }
 
-    [[maybe_unused]] bool ok = QWlrootsIntegration::instance()->removeInputDevice(device);
-    Q_ASSERT(ok);
+    if (device->type() != WInputDevice::Type::Keyboard) {
+        [[maybe_unused]] bool ok = QWlrootsIntegration::instance()->removeInputDevice(device);
+        Q_ASSERT(ok);
+    }
 }
 
 WSeat::WSeat(const QString &name)
@@ -934,13 +864,13 @@ bool WSeat::sendEvent(WSurface *target, QObject *shellObject, QObject *eventObje
     case QEvent::KeyPress: {
         auto e = static_cast<QKeyEvent*>(event);
         if (!e->isAutoRepeat())
-            d->doNotifyKey(inputDevice, e->nativeVirtualKey(), WL_KEYBOARD_KEY_STATE_PRESSED, e->timestamp());
+            d->doNotifyKey(e->nativeVirtualKey(), WL_KEYBOARD_KEY_STATE_PRESSED, e->timestamp());
         break;
     }
     case QEvent::KeyRelease: {
         auto e = static_cast<QKeyEvent*>(event);
         if (!e->isAutoRepeat())
-            d->doNotifyKey(inputDevice, e->nativeVirtualKey(), WL_KEYBOARD_KEY_STATE_RELEASED, e->timestamp());
+            d->doNotifyKey(e->nativeVirtualKey(), WL_KEYBOARD_KEY_STATE_RELEASED, e->timestamp());
         break;
     }
     case QEvent::TouchBegin: Q_FALLTHROUGH();
@@ -1087,27 +1017,18 @@ void WSeat::clearKeyboardFocusWindow()
     d->focusWindow = nullptr;
 }
 
-WInputDevice *WSeat::keyboard() const
+WKeyboardGroup *WSeat::keyboardGroup() const
 {
     W_DC(WSeat);
-    auto w_keyboard = d->handle()->get_keyboard();
-    if (w_keyboard) {
-        auto q_keyboard = qw_keyboard::from(w_keyboard);
-        auto device = WInputDevice::fromHandle(q_keyboard);
-        Q_ASSERT(device);
-        return device;
-    } else {
-        return nullptr;
-    }
+
+    return d->keyboardGroup;
 }
 
-void WSeat::setKeyboard(WInputDevice *newKeyboard)
+void WSeat::setKeyboardRepeatInfo(int32_t rate_hz, int32_t delay_ms)
 {
     W_D(WSeat);
-    if (newKeyboard == keyboard())
-        return;
-    d->handle()->set_keyboard(*qobject_cast<qw_keyboard *>(newKeyboard->handle()));
-    Q_EMIT this->keyboardChanged();
+
+    wlr_keyboard_set_repeat_info(&d->keyboardGroup->nativeHandle()->keyboard, rate_hz, delay_ms);
 }
 
 bool WSeat::alwaysUpdateHoverTarget() const
@@ -1487,6 +1408,16 @@ void WSeat::create(WServer *server)
     d->handle()->set_data(this, this);
     d->connect();
 
+    d->keyboardGroup = new WKeyboardGroup(this);
+    connect(d->keyboardGroup,
+            &WKeyboardGroup::key,
+            this,
+            &WSeat::on_keyboard_key);
+    connect(d->keyboardGroup,
+            &WKeyboardGroup::modifiers,
+            this,
+            &WSeat::on_keyboard_modifiers);
+
     for (auto i : std::as_const(d->deviceList)) {
         d->attachInputDevice(i);
 
@@ -1537,6 +1468,73 @@ wl_global *WSeat::global() const
 QByteArrayView WSeat::interfaceName() const
 {
     return wl_seat_interface.name;
+}
+
+void WSeat::on_keyboard_key(struct wlr_keyboard_key_event *event)
+{
+    W_D(WSeat);
+
+    wlr_keyboard *kb = d->keyboardGroup->keyboard();
+    QInputDevice *device = d->keyboardGroup->keyboarQtDevice();
+    auto code = event->keycode + 8; // map to wl_keyboard::keymap_format::keymap_format_xkb_v1
+    auto et = event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? QEvent::KeyPress : QEvent::KeyRelease;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(kb->xkb_state, code);
+
+    // Qt doesn't support XF86Switch_VT_1 to XF86Switch_VT_12, so convert them to
+    // Ctrl+Alt+F1 to Ctrl+Alt+F12
+    //
+    // Assumption: XKB_KEY_XF86Switch_VT_1 and XKB_KEY_F1 are contiguous and ordered such that
+    // (XKB_KEY_F1 + (sym - XKB_KEY_XF86Switch_VT_1)) yields the correct F-key.
+    // If this is not true, the calculation below may be unsafe.
+    static_assert(
+        (XKB_KEY_XF86Switch_VT_12 - XKB_KEY_XF86Switch_VT_1) == (XKB_KEY_F12 - XKB_KEY_F1),
+        "XKB_KEY_XF86Switch_VT_1..12 and XKB_KEY_F1..F12 must be contiguous and ordered for keysym calculation"
+        );
+    if (sym >= XKB_KEY_XF86Switch_VT_1 && sym <= XKB_KEY_XF86Switch_VT_12) {
+        if (d->keyModifiers == (Qt::ControlModifier | Qt::AltModifier)) {
+            sym = XKB_KEY_F1 + (sym - XKB_KEY_XF86Switch_VT_1);
+        }
+    }
+
+    int qtkey = QXkbCommon::keysymToQtKey(sym, d->keyModifiers, kb->xkb_state, code);
+    const QString &text = QXkbCommon::lookupString(kb->xkb_state, code);
+
+    QKeyEvent e(et, qtkey, d->keyModifiers, code, event->keycode, wlr_keyboard_get_modifiers(kb),
+                text, false, 1, device);
+    e.setTimestamp(event->time_msec);
+
+    if (d->focusWindow) {
+        d->handleKeyEvent(e);
+        if (et == QEvent::KeyPress && xkb_keymap_key_repeats(kb->keymap, code)) {
+            if (d->m_repeatKey) {
+                d->m_repeatTimer.stop();
+            }
+            d->m_repeatKey = std::make_unique<QKeyEvent>(et, qtkey, d->keyModifiers, code, event->keycode, wlr_keyboard_get_modifiers(kb),
+                                                      text, false, 1, device);
+            d->m_repeatKey->setTimestamp(event->time_msec);
+            d->m_repeatTimer.setInterval(kb->repeat_info.delay);
+            d->m_repeatTimer.start();
+        } else if (et == QEvent::KeyRelease && d->m_repeatKey && d->m_repeatKey->nativeScanCode() == code) {
+            d->m_repeatTimer.stop();
+            d->m_repeatKey.reset();
+        }
+    } else {
+        if (et == QEvent::KeyPress && qt_sendShortcutOverrideEvent((QObject*)qGuiApp,
+                                                                   e.timestamp(), e.key(), e.modifiers(),
+                                                                   e.text(), e.isAutoRepeat(), e.count())) {
+            return;
+        }
+        d->doNotifyKey(event->keycode, event->state, event->time_msec);
+    }
+}
+
+void WSeat::on_keyboard_modifiers()
+{
+    W_D(WSeat);
+
+    wlr_keyboard *kb = d->keyboardGroup->keyboard();
+    d->keyModifiers = QXkbCommon::modifiers(kb->xkb_state);
+    d->doNotifyModifiers(kb);
 }
 
 bool WSeat::filterEventBeforeDisposeStage(QWindow *targetWindow, QInputEvent *event)

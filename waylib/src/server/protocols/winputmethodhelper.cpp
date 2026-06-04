@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 Yixue Wang <wangyixue@deepin.org>.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "winputmethodhelper.h"
@@ -11,6 +11,7 @@
 #include "winputpopupsurface.h"
 #include "wseat.h"
 #include "wsurface.h"
+#include "wkeyboardgroup.h"
 #include "private/wglobal_p.h"
 
 #include <qwcompositor.h>
@@ -115,32 +116,6 @@ public:
         seat->handle()->keyboard_end_grab();
     }
 
-    void setKeyboard(qw_input_method_keyboard_grab_v2 *kgv2, WInputDevice *keyboard)
-    {
-        auto *kgHandle = kgv2 ? kgv2->handle() : nullptr;
-        if (!kgHandle) {
-            qCCritical(qLcInputMethod) << "Failed to set keyboard for input method grab - grab handle is invalid"
-                                      << kgv2 << "keyboard" << keyboard;
-            return;
-        }
-
-        if (keyboard) {
-            auto *virtualKeyboard = wlr_input_device_get_virtual_keyboard(*keyboard->handle());
-            // refer to:
-            // https://github.com/swaywm/sway/blob/master/sway/input/keyboard.c#L391
-            if (virtualKeyboard
-                && virtualKeyboard->resource
-                && kgHandle->resource
-                && wl_resource_get_client(virtualKeyboard->resource)
-                    == wl_resource_get_client(kgHandle->resource)) {
-                return;
-            }
-            kgv2->set_keyboard(wlr_keyboard_from_input_device(*keyboard->handle()));
-        } else {
-            kgv2->set_keyboard(nullptr);
-        }
-    }
-
     const QPointer<WServer> server;
     const QPointer<WSeat> seat;
     const QPointer<WInputMethodManagerV2> inputMethodManagerV2;
@@ -168,10 +143,6 @@ WInputMethodHelper::WInputMethodHelper(WServer *server, WSeat *seat)
 {
     W_D(WInputMethodHelper);
     d->seat->safeConnect(&WSeat::keyboardFocusSurfaceChanged, this, &WInputMethodHelper::resendKeyboardFocus);
-    d->seat->safeConnect(&WSeat::keyboardChanged, this, [d] {
-        if (auto *activeKG = d->activeKeyboardGrab)
-            d->setKeyboard(activeKG, d->seat->keyboard());
-    });
     connect(d->inputMethodManagerV2, &WInputMethodManagerV2::newInputMethod, this, &WInputMethodHelper::handleNewIMV2);
     connect(d->textInputManagerV3, &WTextInputManagerV3::newTextInput, this, &WInputMethodHelper::handleNewTI);
     connect(d->virtualKeyboardManagerV1, &WVirtualKeyboardManagerV1::newVirtualKeyboard, this, &WInputMethodHelper::handleNewVKV1);
@@ -280,7 +251,8 @@ void WInputMethodHelper::handleNewKGV2(qw_input_method_keyboard_grab_v2 *kgv2)
         d->endGrab(activeKG);
     }
     d->activeKeyboardGrab = kgv2;
-    d->setKeyboard(kgv2, d->seat->keyboard());
+    struct wlr_keyboard *active_keyboard = wlr_seat_get_keyboard(d->seat->nativeHandle());
+    kgv2->set_keyboard(active_keyboard);
     d->grabInterface = *d->seat->nativeHandle()->keyboard_state.grab->interface;
     d->grabInterface.key = handleKey;
     d->grabInterface.modifiers = handleModifiers;

@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #pragma once
@@ -29,11 +29,16 @@ typedef uint wl_pointer_axis_relative_direction_t;
 typedef uint wl_pointer_button_state_t;
 struct wlr_seat;
 struct wlr_seat_client;
+struct xkb_rule_names;
+struct xkb_keymap;
+struct wlr_keyboard_key_event;
+struct wlr_keyboard;
 
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
 class WSurface;
 class WSeat;
+class WKeyboardGroup;
 class WAYLIB_SERVER_EXPORT WSeatEventFilter : public QObject
 {
     friend class WSeat;
@@ -57,7 +62,6 @@ class WAYLIB_SERVER_EXPORT WSeat : public WWrapObject, public WServerInterface
 {
     Q_OBJECT
     W_DECLARE_PRIVATE(WSeat)
-    Q_PROPERTY(WInputDevice* keyboard READ keyboard WRITE setKeyboard NOTIFY keyboardChanged FINAL)
     Q_PROPERTY(WSurface* keyboardFocus READ keyboardFocusSurface WRITE setKeyboardFocusSurface NOTIFY keyboardFocusSurfaceChanged FINAL)
     Q_PROPERTY(bool alwaysUpdateHoverTarget READ alwaysUpdateHoverTarget WRITE setAlwaysUpdateHoverTarget NOTIFY alwaysUpdateHoverTargetChanged FINAL)
 
@@ -100,8 +104,9 @@ public:
     QWindow *keyboardFocusWindow() const;
     void clearKeyboardFocusWindow();
 
-    WInputDevice *keyboard() const;
-    void setKeyboard(WInputDevice *newKeyboard);
+    WKeyboardGroup *keyboardGroup() const;
+
+    void setKeyboardRepeatInfo(int32_t rate_hz, int32_t delay_ms);
 
     bool alwaysUpdateHoverTarget() const;
     void setAlwaysUpdateHoverTarget(bool newIgnoreSurfacePointerEventExclusiveGrabber);
@@ -111,12 +116,15 @@ public:
     QByteArrayView interfaceName() const override;
 
 Q_SIGNALS:
-    void keyboardChanged();
     void keyboardFocusSurfaceChanged();
     void requestCursorShape(WAYLIB_SERVER_NAMESPACE::WGlobal::CursorShape shape);
     void requestCursorSurface(WAYLIB_SERVER_NAMESPACE::WSurface *surface, const QPoint &hotspot);
     void requestDrag(WAYLIB_SERVER_NAMESPACE::WSurface *surface);
     void alwaysUpdateHoverTargetChanged();
+
+private Q_SLOTS:
+    void on_keyboard_key(struct wlr_keyboard_key_event *event);
+    void on_keyboard_modifiers();
 
 protected:
     using QObject::eventFilter;
