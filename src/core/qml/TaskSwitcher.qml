@@ -418,7 +418,7 @@ Item {
         }
     }
 
-    function previous() {
+    function prejudgment() {
         if (switchView.count <= 1) {
             if (switchView.count === 1) {
                 previewContext.sourceSurface = switchView.currentItem.surface
@@ -426,8 +426,14 @@ Item {
                     previewContext.sourceComponent = previewContext.previewComponent
                 showTask(true);
             }
-            return;
+            return false;
         }
+        return true;
+    }
+
+    function previous() {
+        if (!prejudgment())
+            return;
 
         var nextIndex = (switchView.currentIndex - 1 + switchView.count) % switchView.count
 
@@ -440,15 +446,8 @@ Item {
     }
 
     function next() {
-        if (switchView.count <= 1) {
-            if (switchView.count === 1) {
-                previewContext.sourceSurface = switchView.currentItem.surface
-                if (!previewContext.sourceComponent && root.enableAnimation)
-                    previewContext.sourceComponent = previewContext.previewComponent
-                showTask(true);
-            }
+        if (!prejudgment())
             return;
-        }
 
         var nextIndex = (switchView.currentIndex + 1) % switchView.count
 
@@ -457,6 +456,17 @@ Item {
             switchView.contentX += switchView.delegateMinWidth / 2
 
         focusReason = Qt.TabFocusReason
+        switchIndex(nextIndex)
+    }
+
+    function show() {
+        if (!prejudgment())
+            return;
+
+        var nextIndex = switchView.currentIndex;
+        switchView.positionViewAtIndex(nextIndex, ListView.End)
+
+        focusReason = Qt.ActiveWindowFocusReason
         switchIndex(nextIndex)
     }
 
