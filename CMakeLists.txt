@@ -17,6 +17,22 @@ include(FeatureSummary)
 
 include(cmake/DefineTarget.cmake)
 
+# Git pre-commit hook installation
+# Automatically link pre-commit.sh to .git/hooks/pre-commit at configure time
+if(EXISTS "${PROJECT_SOURCE_DIR}/.git")
+  set(_precommit_hook_source "${PROJECT_SOURCE_DIR}/scripts/pre-commit.sh")
+  set(_precommit_hook_target "${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit")
+  if(EXISTS "${_precommit_hook_source}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E rm -f "${_precommit_hook_target}"
+                    ERROR_QUIET OUTPUT_QUIET)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink "${_precommit_hook_source}" "${_precommit_hook_target}"
+                    ERROR_QUIET)
+    message(STATUS "Git pre-commit hook installed")
+  endif()
+  unset(_precommit_hook_source)
+  unset(_precommit_hook_target)
+endif()
+
 option(WITH_SUBMODULE_WAYLIB "Use the waylib from git submodule" ON)
 add_feature_info(submodule_waylib WITH_SUBMODULE_WAYLIB "Use waylib from submodule")
 
