@@ -22,7 +22,7 @@ public:
     explicit InputManager(QObject *parent = nullptr);
     ~InputManager() override;
 
-    static void setNumLockForDevice(WInputDevice *device, bool enabled);
+    static void setNumLockForDevice(wlr_keyboard *wlrKeyboard, bool enabled);
 
     void setupSeatUserConfig(const QString &userName);
 

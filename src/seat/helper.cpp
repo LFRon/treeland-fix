@@ -1998,7 +1998,7 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
                         return false;
                     }
 
-                    auto keyboard = eventSeat->keyboard();
+                    auto keyboard = eventSeat->keyboardGroup();
                     if (!keyboard) {
                         return false;
                     }

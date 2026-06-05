@@ -1,4 +1,4 @@
-// Copyright (C) 2023 - 2026 UnionTech Software Technology Co., Ltd.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include <QDebug>
@@ -630,8 +630,7 @@ void WCursor::detachInputDevice(WInputDevice *device)
     W_D(WCursor);
 
     if (!d->deviceList.removeOne(device)) {
-        qCDebug(waylibCursor) << "Cannot detach device" << device->qtDevice()->name()
-                             << "- not attached to this cursor";
+        qCDebug(waylibCursor) << "Cannot detach device, not attached to this cursor";
         return;
     }
 

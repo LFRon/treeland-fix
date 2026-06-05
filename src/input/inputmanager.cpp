@@ -13,11 +13,12 @@
 #include <libinput.h>
 
 #include <qwseat.h>
+#include <qwkeyboardgroup.h>
 
 #include <wbackend.h>
 #include <wcursor.h>
 #include <winputdevice.h>
-
+#include <wkeyboardgroup.h>
 
 InputManager::InputManager(QObject *parent)
     : QObject(parent)
@@ -61,8 +62,25 @@ void InputManager::onConfigInitializeSucceed()
     auto seatMgr = Helper::instance()->seatManager();
     if (seatMgr) {
         for (auto *seat : seatMgr->seats()) {
-            if (auto *cursor = seat->cursor())
+            if (auto *cursor = seat->cursor()) {
                 cursor->setScrollFactor(m_seatDConfig->pointerScrollFactor());
+            }
+
+            seat->setKeyboardRepeatInfo(m_seatDConfig->keyboardRate(), m_seatDConfig->keyboardDelay());
+            for (auto device : seat->deviceList()) {
+                if (!device || device->type() != WInputDevice::Type::Keyboard)
+                    continue;
+
+                auto *keyboard = qobject_cast<qw_keyboard *>(device->handle());
+                if (!keyboard)
+                    continue;
+                auto *wlrKeyboard = keyboard->handle();
+                if (!wlrKeyboard || !wlrKeyboard->keymap || !wlrKeyboard->xkb_state)
+                    continue;
+
+                setNumLockForDevice(wlrKeyboard, m_seatDConfig->keyboardNumLock());
+                break;
+            }
         }
     }
 
@@ -478,41 +496,30 @@ void InputManager::handleKeyboardSettingsApplied(KeyboardSettingsInterfaceV1::Ch
     if (changes.testFlag(KeyboardSettingsInterfaceV1::RepeatChanged)) {
         m_seatDConfig->setKeyboardDelay(interface->repeatDelay());
         m_seatDConfig->setKeyboardRate(interface->repeatRate());
-    }
-
-    auto *keyboardDevice = interface->wSeat()->keyboard();
-    if (keyboardDevice) {
-        auto *keyboard = qobject_cast<qw_keyboard *>(keyboardDevice->handle());
-        if (keyboard) {
-            if (changes.testFlag(KeyboardSettingsInterfaceV1::RepeatChanged)) {
-                keyboard->set_repeat_info(interface->repeatRate(), interface->repeatDelay());
-            }
-        }
+        interface->wSeat()->setKeyboardRepeatInfo(interface->repeatRate(), interface->repeatDelay());
     }
 
     const auto devices = interface->wSeat()->deviceList();
     for (WInputDevice *device : devices) {
-        if (device->type() != WInputDevice::Type::Keyboard)
+        if (!device || device->type() != WInputDevice::Type::Keyboard)
+            continue;
+
+        auto *keyboard = qobject_cast<qw_keyboard *>(device->handle());
+        if (!keyboard)
+            continue;
+        auto *wlrKeyboard = keyboard->handle();
+        if (!wlrKeyboard || !wlrKeyboard->keymap || !wlrKeyboard->xkb_state)
             continue;
 
         if (changes.testFlag(KeyboardSettingsInterfaceV1::NumLockChanged)) {
-            setNumLockForDevice(device, interface->numLock());
+            setNumLockForDevice(wlrKeyboard, interface->numLock());
+            return;
         }
     }
 }
 
-void InputManager::setNumLockForDevice(WInputDevice *device, bool enabled)
+void InputManager::setNumLockForDevice(wlr_keyboard *wlrKeyboard, bool enabled)
 {
-    if (!device || device->type() != WInputDevice::Type::Keyboard)
-        return;
-
-    auto *keyboard = qobject_cast<qw_keyboard *>(device->handle());
-    if (!keyboard)
-        return;
-    auto *wlrKeyboard = keyboard->handle();
-    if (!wlrKeyboard || !wlrKeyboard->keymap || !wlrKeyboard->xkb_state)
-        return;
-
     xkb_mod_index_t numlock = xkb_keymap_mod_get_index(wlrKeyboard->keymap, XKB_MOD_NAME_NUM);
     if (numlock == XKB_MOD_INVALID)
         return;
@@ -557,13 +564,6 @@ void InputManager::onInputAdded(WInputDevice *input)
     struct libinput_device *inputDevice = wlr_libinput_get_device_handle(input->handle()->handle());
     struct udev_device *udevDevice = libinput_device_get_udev_device(inputDevice);
     bool leftHanded = (m_seatDConfig->pointerHandMode() == "Left");
-
-    if (input->type() == WInputDevice::Type::Keyboard) {
-        if (auto *keyboard = qobject_cast<qw_keyboard *>(input->handle())) {
-            keyboard->set_repeat_info(m_seatDConfig->keyboardRate(), m_seatDConfig->keyboardDelay());
-        }
-        setNumLockForDevice(input, m_seatDConfig->keyboardNumLock());
-    }
 
     if (udev_device_get_property_value(udevDevice, "ID_INPUT_MOUSE")) {
         configLeftHanded(inputDevice, leftHanded);

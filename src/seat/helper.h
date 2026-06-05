@@ -264,6 +264,7 @@ public:
 
     RootSurfaceContainer *rootContainer() const { return m_rootSurfaceContainer; }
     inline WBackend *backend() const { return m_backend; }
+    inline TreelandKeyboardStateNotifyManagerInterfaceV1 *KeyboardStateNotifyManager() { return m_keyboardStateNotifyManagerInterfaceV1; }
 public Q_SLOTS:
     void activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason = Qt::OtherFocusReason);
     void forceActivateSurface(SurfaceWrapper *wrapper,

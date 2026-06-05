@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 JiDe Zhang <zccrs@live.com>.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #pragma once
@@ -22,10 +22,13 @@ QT_BEGIN_NAMESPACE
 class QInputDevice;
 QT_END_NAMESPACE
 
+struct wlr_keyboard;
+
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
 class WOutput;
 class WInputDevice;
+class WKeyboardGroup;
 class QWlrootsScreen;
 class Q_DECL_HIDDEN QWlrootsIntegration : public QPlatformIntegration, public QPlatformNativeInterface
 {
@@ -42,6 +45,7 @@ public:
         return m_screens;
     }
 
+    QPointer<QInputDevice> addKeyboardInputDevice(WKeyboardGroup *keyboardGroup, WInputDevice *device, const QString &seatName);
     QPointer<QInputDevice> addInputDevice(WInputDevice *device, const QString &seatName);
     bool removeInputDevice(WInputDevice *device);
     QInputDevice *getInputDeviceFrom(WInputDevice *device);
