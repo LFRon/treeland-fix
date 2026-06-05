@@ -13,6 +13,16 @@ WorkspaceModel::WorkspaceModel(QObject *parent,
     , m_id(id)
     , m_activedSurfaceHistory(activedSurfaceHistory)
 {
+    // forward_list is most-recent-first. Due to push_front, the most
+    // recently activated surface sits at the head. We need to assign the
+    // *highest* sequence number to the most recent element, matching the
+    // semantics of pushActivedSurface. Collect and reverse-iterate:
+    // least-recent gets the smallest seq, most-recent gets the largest.
+    QVector<SurfaceWrapper *> surfaces;
+    for (auto *surface : m_activedSurfaceHistory)
+        surfaces.append(surface);
+    for (int i = surfaces.size() - 1; i >= 0; --i)
+        m_activeSeqMap[surfaces[i]] = ++m_activeSeqCounter;
 }
 
 QString WorkspaceModel::name() const
@@ -121,16 +131,22 @@ void WorkspaceModel::pushActivedSurface(SurfaceWrapper *surface)
 {
     m_activedSurfaceHistory.remove(surface);
     m_activedSurfaceHistory.push_front(surface);
+    // Assign a new monotonically increasing sequence number.
+    // Higher seq = more recently activated → should appear earlier in sort.
+    m_activeSeqMap[surface] = ++m_activeSeqCounter;
 }
 
 void WorkspaceModel::removeActivedSurface(SurfaceWrapper *surface)
 {
     m_activedSurfaceHistory.remove(surface);
+    m_activeSeqMap.remove(surface);
 }
 
 void WorkspaceModel::clearActivedSurface()
 {
     m_activedSurfaceHistory.clear();
+    m_activeSeqMap.clear();
+    m_activeSeqCounter = 0;
 }
 
 int WorkspaceModel::findActivedSurfaceHistoryIndex(SurfaceWrapper *surface) const
@@ -143,4 +159,9 @@ int WorkspaceModel::findActivedSurfaceHistoryIndex(SurfaceWrapper *surface) cons
         }
     }
     return index;
+}
+
+uint64_t WorkspaceModel::activeSurfaceSeq(SurfaceWrapper *surface) const
+{
+    return m_activeSeqMap.value(surface, 0);
 }

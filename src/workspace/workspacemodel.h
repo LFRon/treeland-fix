@@ -5,6 +5,7 @@
 
 #include "surface/surfacecontainer.h"
 
+#include <QHash>
 #include <forward_list>
 
 class SurfaceWrapper;
@@ -49,6 +50,7 @@ public:
     void removeActivedSurface(SurfaceWrapper *surface);
     void clearActivedSurface();
     int findActivedSurfaceHistoryIndex(SurfaceWrapper *surface) const;
+    uint64_t activeSurfaceSeq(SurfaceWrapper *surface) const;
 
 Q_SIGNALS:
     void nameChanged();
@@ -62,4 +64,6 @@ private:
     bool m_visible = false;
     bool m_opaque = true;
     std::forward_list<SurfaceWrapper *> m_activedSurfaceHistory;
+    uint64_t m_activeSeqCounter = 0;
+    QHash<SurfaceWrapper *, uint64_t> m_activeSeqMap;
 };

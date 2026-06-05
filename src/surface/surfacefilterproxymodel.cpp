@@ -60,10 +60,11 @@ bool SurfaceFilterProxyModel::lessThan(const QModelIndex &source_left,
     SurfaceWrapper *right_surface = sourceModel()->data(source_right).value<SurfaceWrapper *>();
 
     if (model && left_surface && right_surface) {
-        int left_index = model->findActivedSurfaceHistoryIndex(left_surface);
-        int right_index = model->findActivedSurfaceHistoryIndex(right_surface);
+        uint64_t left_seq = model->activeSurfaceSeq(left_surface);
+        uint64_t right_seq = model->activeSurfaceSeq(right_surface);
 
-        if (left_index > right_index)
+        // Higher sequence number = more recently activated = should appear first
+        if (left_seq > right_seq)
             return true;
         else
             return false;
