@@ -23,6 +23,12 @@ Control {
     readonly property color inactiveTitlebarColor: darkTheme ? "#262626" : "#FCFCFC"
     readonly property color activeTextColor: darkTheme ? "#8c8c8c" : "#303030"
     readonly property color inactiveTextColor: darkTheme ? "#656565" : "#969696"
+    property D.Palette __inactiveText: D.Palette {
+       normal     { common: D.DTK.inactivePalette.windowText; crystal: D.DTK.inactivePalette.windowText }
+       normalDark { common: D.DTK.inactivePalette.windowText; crystal: D.DTK.inactivePalette.windowText }
+       pressed    { common: D.DTK.makeColor(D.Color.Highlight); crystal: D.DTK.makeColor(D.Color.Highlight) }
+    }
+    palette.window: surface.isActivated ? root.activeTitlebarColor : root.inactiveTitlebarColor
 
     height: Helper.config.windowTitlebarHeight
     width: surfaceItem.width
@@ -97,18 +103,11 @@ Control {
                 right: parent.right
             }
 
-            Item {
-                id: control
-
-                property D.Palette textColor: DS.Style.button.text
-                property D.Palette backgroundColor: DS.Style.windowButton.background
-            }
-
             Loader {
                 objectName: "minimizeBtn"
                 sourceComponent: D.WindowButton {
                     icon.name: "window_minimize"
-                    textColor: control.textColor
+                    textColor: surface.isActivated ? DS.Style.button.text : root.__inactiveText
                     height: root.height
                     focusPolicy: Qt.NoFocus
 
@@ -124,7 +123,7 @@ Control {
                 objectName: "maxOrWindedBtn"
                 sourceComponent: D.WindowButton {
                     icon.name: surface.shellSurface.isMaximized ? "window_restore" : "window_maximize"
-                    textColor: control.textColor
+                    textColor: surface.isActivated ? DS.Style.button.text : root.__inactiveText
                     height: root.height
                     focusPolicy: Qt.NoFocus
 
@@ -147,7 +146,7 @@ Control {
                     D.WindowButton {
                         id: closeBtn
                         icon.name: "window_close"
-                        textColor: control.textColor
+                        textColor: surface.isActivated ? DS.Style.button.text : root.__inactiveText
                         height: parent.height
                         focusPolicy: Qt.NoFocus
 
