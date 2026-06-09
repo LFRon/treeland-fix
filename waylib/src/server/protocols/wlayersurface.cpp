@@ -257,17 +257,18 @@ bool WLayerSurface::hasCapability(Capability cap) const
     case Focus:
         return d->keyboardInteractivity != WLayerSurface::KeyboardInteractivity::None;
     case Activate:
-    case Maximized:
     case FullScreen:
         return false;
-    case Resize:
-        return true;
     default:
         break;
     }
     Q_UNREACHABLE();
 }
 
+bool WLayerSurface::isResizable() const
+{
+    return true;
+}
 
 WSurface *WLayerSurface::surface() const
 {

@@ -25,6 +25,7 @@ public:
     QW_NAMESPACE::qw_input_popup_surface_v2 *handle() const;
     QRect getContentGeometry() const override;
     bool hasCapability(Capability cap) const override;
+    bool isResizable() const override;
     bool isActivated() const override;
     WSurface *parentSurface() const override;
 

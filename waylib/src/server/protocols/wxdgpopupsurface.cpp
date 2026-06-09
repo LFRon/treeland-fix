@@ -1,4 +1,4 @@
-// Copyright (C) 2024 UnionTech Software Technology Co., Ltd.
+// Copyright (C) 2024-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "wxdgpopupsurface.h"
@@ -89,17 +89,19 @@ bool WXdgPopupSurface::hasCapability(Capability cap) const
 {
     switch (cap) {
         using enum Capability;
-    case Resize:
-        return true;
     case Focus:
     case Activate:
-    case Maximized:
     case FullScreen:
         return false;
     default:
         break;
     }
     Q_UNREACHABLE();
+}
+
+bool WXdgPopupSurface::isResizable() const
+{
+    return true;
 }
 
 WSurface *WXdgPopupSurface::surface() const
@@ -185,6 +187,4 @@ QPointF WXdgPopupSurface::getPopupPosition() const
             static_cast<qreal>(wpopup->current.geometry.y)};
 }
 
-
 WAYLIB_SERVER_END_NAMESPACE
-

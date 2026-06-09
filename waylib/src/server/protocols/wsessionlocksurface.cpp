@@ -90,9 +90,7 @@ bool WSessionLockSurface::hasCapability(Capability cap) const
     case Focus:
         return true;
     case Activate:
-    case Maximized:
     case FullScreen:
-    case Resize:
         return false;
     default:
         break;

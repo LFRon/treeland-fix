@@ -50,9 +50,7 @@ bool WInputPopupSurface::hasCapability(Capability cap) const
         using enum Capability;
     case Focus:
     case Activate:
-    case Maximized:
     case FullScreen:
-    case Resize:
         return false;
     default:
         break;
@@ -76,6 +74,11 @@ qw_input_popup_surface_v2 *WInputPopupSurface::handle() const
 }
 
 bool WInputPopupSurface::isActivated() const
+{
+    return true;
+}
+
+bool WInputPopupSurface::isResizable() const
 {
     return true;
 }

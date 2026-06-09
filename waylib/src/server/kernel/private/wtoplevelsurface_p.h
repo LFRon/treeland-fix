@@ -11,7 +11,9 @@ class WAYLIB_SERVER_EXPORT WToplevelSurfacePrivate : public WWrapObjectPrivate
 {
 public:
     inline WToplevelSurfacePrivate(WToplevelSurface *q)
-        : WWrapObjectPrivate(q) {}
+        : WWrapObjectPrivate(q)
+    {
+    }
 };
 
 WAYLIB_SERVER_END_NAMESPACE

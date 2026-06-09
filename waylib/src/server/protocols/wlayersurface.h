@@ -71,6 +71,7 @@ public:
     Q_ENUM(KeyboardInteractivity)
 
     bool hasCapability(Capability cap) const override;
+    bool isResizable() const override;
     WSurface *surface() const override;
     QW_NAMESPACE::qw_layer_surface_v1 *handle() const;
     wlr_layer_surface_v1 *nativeHandle() const;

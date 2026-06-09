@@ -17,6 +17,7 @@ class WXdgToplevelSurfacePrivate;
 class WAYLIB_SERVER_EXPORT WXdgToplevelSurface : public WXdgSurface
 {
     Q_OBJECT
+    friend class WXdgToplevelSurfacePrivate;
     W_DECLARE_PRIVATE(WXdgToplevelSurface)
     Q_PROPERTY(bool isResizeing READ isResizeing NOTIFY resizeingChanged FINAL)
     Q_PROPERTY(WXdgSurface* parentXdgSurface READ parentXdgSurface NOTIFY parentXdgSurfaceChanged FINAL)
@@ -44,8 +45,10 @@ public:
     bool isResizeing() const;
     bool isActivated() const override;
     bool isMaximized() const override;
+    bool isMaximizable() const override;
     bool isMinimized() const override;
     bool isFullScreen() const override;
+    bool isResizable() const override;
 
     QRect getContentGeometry() const override;
 
