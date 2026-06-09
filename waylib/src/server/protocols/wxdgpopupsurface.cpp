@@ -89,17 +89,19 @@ bool WXdgPopupSurface::hasCapability(Capability cap) const
 {
     switch (cap) {
         using enum Capability;
-    case Resize:
-        return true;
     case Focus:
     case Activate:
-    case Maximized:
     case FullScreen:
         return false;
     default:
         break;
     }
     Q_UNREACHABLE();
+}
+
+bool WXdgPopupSurface::isResizable() const
+{
+    return true;
 }
 
 WSurface *WXdgPopupSurface::surface() const
@@ -185,6 +187,4 @@ QPointF WXdgPopupSurface::getPopupPosition() const
             static_cast<qreal>(wpopup->current.geometry.y)};
 }
 
-
 WAYLIB_SERVER_END_NAMESPACE
-

@@ -25,6 +25,7 @@ public:
     ~WXdgPopupSurface();
 
     bool hasCapability(Capability cap) const override;
+    bool isResizable() const override;
 
     WSurface *surface() const override;
     QW_NAMESPACE::qw_xdg_popup *handle() const;

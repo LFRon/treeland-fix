@@ -26,12 +26,11 @@ class WAYLIB_SERVER_EXPORT WToplevelSurface : public WWrapObject
     QML_UNCREATABLE("Only create in C++")
 
 public:
-    enum class Capability {
+    enum class Capability
+    {
         Focus,
         Activate,
-        Maximized,
         FullScreen,
-        Resize,
     };
 
     virtual bool hasCapability([[maybe_unused]] Capability cap) const {
@@ -50,6 +49,16 @@ public:
         return false;
     }
     virtual bool isMaximized() const {
+        return false;
+    }
+
+    virtual bool isMaximizable() const
+    {
+        return false;
+    }
+
+    virtual bool isResizable() const
+    {
         return false;
     }
     virtual bool isMinimized() const {
@@ -112,6 +121,8 @@ Q_SIGNALS:
     void fullscreenChanged();
     void titleChanged();
     void appIdChanged();
+    void minimumSizeChanged(const QSize &size);
+    void maximumSizeChanged(const QSize &size);
 
     void requestMove(WSeat *seat, quint32 serial);
     void requestResize(WSeat *seat, Qt::Edges edge, quint32 serial);

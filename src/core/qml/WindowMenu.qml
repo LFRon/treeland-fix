@@ -10,6 +10,9 @@ D.Menu {
     modal: true
 
     property SurfaceWrapper surface: null
+    readonly property bool canToggleMaximize: surface
+        ? surface.surfaceState === SurfaceWrapper.State.Maximized || surface.isMaximizable
+        : false
 
     onActiveFocusChanged: {
         if (!activeFocus)
@@ -33,6 +36,7 @@ D.Menu {
 
     D.MenuItem {
         text: surface?.surfaceState === SurfaceWrapper.State.Maximized ? qsTr("Unmaximize") : qsTr("Maximize")
+        enabled: menu.canToggleMaximize
         onTriggered: surface.requestToggleMaximize()
     }
 
