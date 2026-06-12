@@ -401,50 +401,6 @@ void RootSurfaceContainer::updateSurfaceOutputs(SurfaceWrapper *surface)
         ws->updateSurfaceOwnsOutput(surface);
 }
 
-static qreal pointToRectMinDistance(const QPointF &pos, const QRectF &rect)
-{
-    if (rect.contains(pos))
-        return 0;
-    return std::min({ std::abs(rect.x() - pos.x()),
-                      std::abs(rect.y() - pos.y()),
-                      std::abs(rect.right() - pos.x()),
-                      std::abs(rect.bottom() - pos.y()) });
-}
-
-static QRectF adjustRectToMakePointVisible(const QRectF &inputRect,
-                                           const QPointF &absolutePoint,
-                                           const QList<QRectF> &visibleAreas)
-{
-    Q_ASSERT(inputRect.contains(absolutePoint));
-    QRectF adjustedRect = inputRect;
-
-    QRectF targetRect;
-    qreal distanceToTargetRect = std::numeric_limits<qreal>::max();
-    for (const QRectF &area : visibleAreas) {
-        Q_ASSERT(!area.isEmpty());
-        if (area.contains(absolutePoint))
-            return adjustedRect;
-        const auto distance = pointToRectMinDistance(absolutePoint, area);
-        if (distance < distanceToTargetRect) {
-            distanceToTargetRect = distance;
-            targetRect = area;
-        }
-    }
-    Q_ASSERT(!targetRect.isEmpty());
-
-    if (absolutePoint.x() < targetRect.x())
-        adjustedRect.moveLeft(adjustedRect.x() + targetRect.x() - absolutePoint.x());
-    else if (absolutePoint.x() > targetRect.right())
-        adjustedRect.moveRight(adjustedRect.right() + targetRect.right() - absolutePoint.x());
-
-    if (absolutePoint.y() < targetRect.y())
-        adjustedRect.moveTop(adjustedRect.y() + targetRect.y() - absolutePoint.y());
-    else if (absolutePoint.y() > targetRect.bottom())
-        adjustedRect.moveBottom(adjustedRect.bottom() + targetRect.bottom() - absolutePoint.y());
-
-    return adjustedRect;
-}
-
 void RootSurfaceContainer::ensureSurfaceNormalPositionValid(SurfaceWrapper *surface)
 {
     if (surface->type() == SurfaceWrapper::Type::Layer)
@@ -460,30 +416,78 @@ void RootSurfaceContainer::ensureSurfaceNormalPositionValid(SurfaceWrapper *surf
 
     QList<QRectF> outputRects;
     outputRects.reserve(outputs().size());
-    for (auto o : outputs())
+    QRectF totalBounds;
+    for (auto o : outputs()) {
         outputRects << o->validGeometry();
+        totalBounds = totalBounds.united(o->validGeometry());
+    }
 
-    // Ensure window is not outside the screen
-    const QPointF mustVisiblePosOfSurface(qMin(normalGeo.right(), normalGeo.x() + 20),
-                                          qMin(normalGeo.bottom(), normalGeo.y() + 20));
-    normalGeo = adjustRectToMakePointVisible(normalGeo, mustVisiblePosOfSurface, outputRects);
+    if (totalBounds.isEmpty())
+        return;
+
+    // Ensure at least 20px of the window is visible within the total output bounds
+    const qreal marginX = qMin(20.0, normalGeo.width());
+    const qreal marginY = qMin(20.0, normalGeo.height());
+
+    // Too far right, only 20px of the left edge is visible, bounce back
+    if (normalGeo.left() > totalBounds.right() - marginX) {
+        normalGeo.moveLeft(totalBounds.right() - marginX);
+    }
+    // Too far left, only 20px of the right edge is visible, bounce back
+    else if (normalGeo.right() < totalBounds.left() + marginX) {
+        normalGeo.moveRight(totalBounds.left() + marginX);
+    }
+
+    // Too far down, only 20px of the top edge is visible, bounce back
+    if (normalGeo.top() > totalBounds.bottom() - marginY) {
+        normalGeo.moveTop(totalBounds.bottom() - marginY);
+    }
+    // Too far up, only 20px of the bottom edge is visible, bounce back
+    else if (normalGeo.bottom() < totalBounds.top() + marginY) {
+        normalGeo.moveBottom(totalBounds.top() + marginY);
+    }
 
     // Ensure titlebar is not outside the screen
-    const auto titlebarGeometry = surface->titlebarGeometry().translated(normalGeo.topLeft());
-    if (titlebarGeometry.isValid()) {
-        bool titlebarGeometryAdjusted = false;
-        for (auto r : std::as_const(outputRects)) {
-            if ((r & titlebarGeometry).isEmpty())
-                continue;
-            if (titlebarGeometry.top() < r.top()) {
-                normalGeo.moveTop(normalGeo.top() + r.top() - titlebarGeometry.top());
-                titlebarGeometryAdjusted = true;
-            }
+    QRectF titlebarGeo = surface->titlebarGeometry();
+    if (!titlebarGeo.isValid()) {
+        // Fallback for CSD or windows without a titlebar: assume a 30px titlebar at the top.
+        titlebarGeo = QRectF(0, 0, normalGeo.width(), 30);
+    }
+    titlebarGeo.translate(normalGeo.topLeft());
+
+    bool titlebarGeometryAdjusted = false;
+    const auto &outputList = outputs();
+    for (int i = 0; i < outputList.size(); ++i) {
+        auto *o = outputList[i];
+        QRectF r = o->validGeometry();
+        QRectF screenRect = o->geometry();
+
+        if (!screenRect.intersects(titlebarGeo))
+            continue;
+
+        // Top and Bottom are strict: titlebar should stay in valid area
+        if (titlebarGeo.top() < r.top()) {
+            normalGeo.moveTop(normalGeo.top() + r.top() - titlebarGeo.top());
+        } else if (titlebarGeo.bottom() > r.bottom()) {
+            normalGeo.moveBottom(normalGeo.bottom() - (titlebarGeo.bottom() - r.bottom()));
         }
 
-        if (!titlebarGeometryAdjusted) {
-            normalGeo =
-                adjustRectToMakePointVisible(normalGeo, titlebarGeometry.topLeft(), outputRects);
+        // Left and Right are soft: allow off-screen but push out of dock if on-screen
+        if (titlebarGeo.left() < r.left() && titlebarGeo.left() >= screenRect.left()) {
+            normalGeo.moveLeft(normalGeo.left() + r.left() - titlebarGeo.left());
+        } else if (titlebarGeo.right() > r.right() && titlebarGeo.right() <= screenRect.right()) {
+            normalGeo.moveRight(normalGeo.right() - (titlebarGeo.right() - r.right()));
+        }
+
+        titlebarGeometryAdjusted = true;
+        break;
+    }
+
+    if (!titlebarGeometryAdjusted) {
+        if (titlebarGeo.top() < totalBounds.top()) {
+            normalGeo.moveTop(normalGeo.top() + totalBounds.top() - titlebarGeo.top());
+        } else if (titlebarGeo.bottom() > totalBounds.bottom()) {
+            normalGeo.moveBottom(normalGeo.bottom() - (titlebarGeo.bottom() - totalBounds.bottom()));
         }
     }
 
