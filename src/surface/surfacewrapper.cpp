@@ -19,12 +19,14 @@
 #include <woutputrenderwindow.h>
 #include <wsocket.h>
 #include <wxdgpopupsurfaceitem.h>
+#include <wxdgtoplevelsurface.h>
 #include <wxdgtoplevelsurfaceitem.h>
 #include <wxwaylandsurface.h>
 #include <wxwaylandsurfaceitem.h>
 
 #include <qwbuffer.h>
 #include <qwlayershellv1.h>
+#include <qwxdgshell.h>
 
 #include <QColor>
 #include <QVariant>
@@ -294,6 +296,11 @@ void SurfaceWrapper::setup()
     m_surfaceItem->setShellSurface(m_shellSurface);
 
     if (!m_isProxy) {
+        connect(m_shellSurface->surface(),
+                &WSurface::initialCommit,
+                this,
+                &SurfaceWrapper::onInitialSurfaceCommit,
+                Qt::SingleShotConnection);
         m_shellSurface->safeConnect(&WToplevelSurface::requestMinimize, this, [this]() {
             requestMinimize();
         });
@@ -1464,6 +1471,27 @@ void SurfaceWrapper::onHideAnimationFinished()
     }
 
     onWindowAnimationFinished();
+}
+
+void SurfaceWrapper::onInitialSurfaceCommit()
+{
+    if (m_type != Type::XdgToplevel)
+        return;
+
+    auto toplevel = qobject_cast<WXdgToplevelSurface *>(m_shellSurface);
+    auto handle = toplevel->handle()->handle();
+    if (!handle->base->initial_commit)
+        return;
+
+    if (handle->requested.maximized) {
+        toplevel->handle()->set_maximized(true);
+        resize(maximizedGeometry().size());
+    }
+
+    if (handle->requested.fullscreen) {
+        toplevel->handle()->set_fullscreen(true);
+        resize(fullscreenGeometry().size());
+    }
 }
 
 void SurfaceWrapper::onMappedChanged()

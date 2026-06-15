@@ -86,6 +86,7 @@ Q_SIGNALS:
     void outputEntered(WOutput *output);
     void outputLeave(WOutput *output);
     void commit(quint32 committedState /*wlr_surface_state_field*/);
+    void initialCommit();
 
 protected:
     WSurface(WSurfacePrivate &dd, QObject *parent);

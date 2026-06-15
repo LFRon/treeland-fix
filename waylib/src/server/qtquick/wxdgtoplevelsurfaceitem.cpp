@@ -83,6 +83,7 @@ void WXdgToplevelSurfaceItem::onSurfaceCommit()
          * configures the xdg_toplevel with 0,0 size to let the client pick the
          * dimensions itself. */
         toplevelSurface()->handle()->set_size(0, 0);
+        Q_EMIT surface()->initialCommit();
     }
 }
 

@@ -357,6 +357,9 @@ Q_SIGNALS:
     void prelaunchSplashChanged();
     void typeChanged();
 
+private Q_SLOTS:
+    void onInitialSurfaceCommit();
+
 private:
     ~SurfaceWrapper() override;
     using QObject::deleteLater;
