@@ -2,25 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "wxwayland.h"
-#include "wxwaylandsurface.h"
+
+#include "private/wglobal_p.h"
 #include "wseat.h"
 #include "wsocket.h"
-#include "private/wglobal_p.h"
+#include "wxwaylandsurface.h"
 
+#include <xcb/xcb.h>
+#include <xcb/xcbext.h>
+
+#include <qwcompositor.h>
+#include <qwdisplay.h>
 #include <qwseat.h>
 #include <qwxwayland.h>
 #include <qwxwaylandserver.h>
-#include <qwxwaylandsurface.h>
 #include <qwxwaylandshellv1.h>
-#include <qwdisplay.h>
-#include <qwcompositor.h>
+#include <qwxwaylandsurface.h>
 
-#include <xcb/xcb.h>
+#include <QCoreApplication>
+#include <QSocketNotifier>
+#include <QTimer>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
-static bool xwayland_user_event_handler(wlr_xwayland *xwayland, xcb_generic_event_t *event)
+bool xwayland_user_event_handler(wlr_xwayland *xwayland, xcb_generic_event_t *event)
 {
     if (!event)
         return false;
@@ -31,8 +37,33 @@ static bool xwayland_user_event_handler(wlr_xwayland *xwayland, xcb_generic_even
 
     auto *pe = reinterpret_cast<const xcb_property_notify_event_t *>(event);
     auto *self = WXWayland::fromHandle(xwayland);
+
     if (!self)
         return false;
+
+    // Trigger async property reading infrastructure if this window is being tracked.
+    if (!self->m_asyncProps.isEmpty()) {
+        auto it = self->m_asyncProps.find(pe->window);
+        if (it != self->m_asyncProps.end()) {
+            auto &props = it.value();
+            props.propNotifySeen = true;
+            // Resend requests on PROPNOTIFY to get the latest value after the change.
+            xcb_connection_t *conn = self->xcbConnection();
+            props.cookies.clear();
+            for (const auto &req : props.requests) {
+                auto cookie = xcb_get_property_unchecked(conn,
+                                                         false,
+                                                         pe->window,
+                                                         req.atom,
+                                                         req.type,
+                                                         0,
+                                                         1024);
+                props.cookies.append(cookie);
+            }
+            xcb_flush(conn);
+            self->xcbPollReplies();
+        }
+    }
 
     for (auto *surface : self->surfaceList()) {
         QPointer<WXWaylandSurface> sp(surface);
@@ -163,6 +194,8 @@ public:
     QList<WXWaylandSurface*> toplevelSurfaces;
 
     WSocket *socket = nullptr;
+
+    QSocketNotifier *xcbNotifier = nullptr;
 
 protected:
     void instantRelease() override;
@@ -488,6 +521,196 @@ void WXWayland::destroy([[maybe_unused]] WServer *server)
 wl_global *WXWayland::global() const
 {
     return handle()->handle()->shell_v1->global;
+}
+
+void WXWayland::readAsyncProperties(
+    xcb_window_t windowId,
+    const QVector<AsyncPropRequest> &requests,
+    int timeoutMs,
+    std::function<void(xcb_window_t, const QMap<xcb_atom_t, QByteArray> &)> callback)
+{
+    W_D(WXWayland);
+
+    if (requests.isEmpty()) {
+        auto cb = std::move(callback);
+        QMetaObject::invokeMethod(qApp, [=, cb = std::move(cb)]() {
+            cb(windowId, QMap<xcb_atom_t, QByteArray>{});
+        });
+        return;
+    }
+
+    PerWindowProps props;
+    props.requests = requests;
+    props.callback = std::move(callback);
+
+    xcb_connection_t *conn = xcbConnection();
+    if (!conn) {
+        auto cb = std::move(callback);
+        QMetaObject::invokeMethod(qApp, [=, cb = std::move(cb)]() {
+            cb(windowId, QMap<xcb_atom_t, QByteArray>{});
+        });
+        return;
+    }
+
+    props.cookies.reserve(requests.size());
+    for (const auto &req : requests) {
+        auto cookie =
+            xcb_get_property_unchecked(conn, false, windowId, req.atom, req.type, 0, 1024);
+        props.cookies.append(cookie);
+    }
+    xcb_flush(conn);
+
+    // Create per-window timer.
+    props.timer = new QTimer(this);
+    props.timer->setSingleShot(true);
+    connect(props.timer, &QTimer::timeout, this, [this, windowId]() {
+        xcbAsyncTimeoutForWindow(windowId);
+    });
+    props.timer->start(timeoutMs);
+
+    m_asyncProps.insert(windowId, std::move(props));
+
+    // Lazy-init notifier.
+    if (!d->xcbNotifier) {
+        int fd = xcb_get_file_descriptor(conn);
+        if (fd >= 0) {
+            d->xcbNotifier = new QSocketNotifier(fd, QSocketNotifier::Read, this);
+            connect(d->xcbNotifier,
+                    &QSocketNotifier::activated,
+                    this,
+                    &WXWayland::xcbPollReplies,
+                    Qt::UniqueConnection);
+        }
+    }
+}
+
+void WXWayland::xcbPollReplies()
+{
+    if (m_asyncProps.isEmpty())
+        return;
+
+    xcb_connection_t *conn = xcbConnection();
+
+    QList<xcb_window_t> toRemove;
+
+    for (auto it = m_asyncProps.begin(); it != m_asyncProps.end(); ++it) {
+        xcb_window_t windowId = it.key();
+        auto &props = it.value();
+
+        bool windowDone = true;
+        for (int i = 0; i < props.cookies.size(); ++i) {
+            if (props.results.contains(props.requests[i].atom))
+                continue; // already got this one
+
+            void *replyPtr = nullptr;
+            xcb_generic_error_t *err = nullptr;
+            int ret = xcb_poll_for_reply64(conn, props.cookies[i].sequence, &replyPtr, &err);
+
+            if (ret == 0) {
+                windowDone = false;
+                continue;
+            }
+
+            if (ret == 1 && replyPtr) {
+                auto *reply = static_cast<xcb_get_property_reply_t *>(replyPtr);
+                if (reply->type != 0 && reply->value_len > 0) {
+                    QByteArray data(static_cast<const char *>(xcb_get_property_value(reply)),
+                                    xcb_get_property_value_length(reply));
+                    props.results.insert(props.requests[i].atom, data);
+                }
+                free(reply);
+            } else if (err) {
+                free(err);
+            }
+        }
+
+        // Fire callback when all replies received AND propNotifySeen.
+        if (windowDone && props.propNotifySeen) {
+            auto cb = props.callback;
+            auto resultCopy = props.results;
+            QMetaObject::invokeMethod(qApp, [=, cb = std::move(cb)]() {
+                cb(windowId, resultCopy);
+            });
+
+            toRemove.append(windowId);
+        }
+    }
+
+    // Cleanup completed windows.
+    for (auto windowId : toRemove) {
+        auto it = m_asyncProps.find(windowId);
+        if (it != m_asyncProps.end()) {
+            if (it->timer) {
+                it->timer->stop();
+                delete it->timer;
+            }
+            m_asyncProps.erase(it);
+        }
+    }
+}
+
+void WXWayland::xcbAsyncTimeoutForWindow(xcb_window_t windowId)
+{
+    auto it = m_asyncProps.find(windowId);
+    if (it == m_asyncProps.end())
+        return;
+
+    auto &props = it.value();
+
+    xcb_connection_t *conn = xcbConnection();
+    if (conn) {
+        // Drain remaining replies.
+        for (int i = 0; i < props.cookies.size(); ++i) {
+            if (props.results.contains(props.requests[i].atom))
+                continue;
+            void *replyPtr = nullptr;
+            xcb_generic_error_t *err = nullptr;
+            int ret = xcb_poll_for_reply64(conn, props.cookies[i].sequence, &replyPtr, &err);
+            if (ret == 1 && replyPtr) {
+                auto *reply = static_cast<xcb_get_property_reply_t *>(replyPtr);
+                if (reply->type != 0 && reply->value_len > 0) {
+                    QByteArray data(static_cast<const char *>(xcb_get_property_value(reply)),
+                                    xcb_get_property_value_length(reply));
+                    props.results.insert(props.requests[i].atom, data);
+                }
+                free(reply);
+            } else {
+                if (replyPtr)
+                    free(replyPtr);
+                if (err)
+                    free(err);
+            }
+        }
+    }
+
+    auto cb = props.callback;
+    auto resultCopy = props.results;
+    QMetaObject::invokeMethod(qApp, [=, cb = std::move(cb)]() {
+        cb(windowId, resultCopy);
+    });
+
+    // Cleanup.
+    if (props.timer) {
+        delete props.timer;
+    }
+    m_asyncProps.erase(it);
+}
+
+void WXWayland::cancelAsyncProperties(xcb_window_t windowId)
+{
+    auto it = m_asyncProps.find(windowId);
+    if (it == m_asyncProps.end())
+        return;
+
+    if (it->timer) {
+        delete it->timer;
+    }
+    m_asyncProps.erase(it);
+}
+
+bool WXWayland::event(QEvent *ev)
+{
+    return QObject::event(ev);
 }
 
 WAYLIB_SERVER_END_NAMESPACE

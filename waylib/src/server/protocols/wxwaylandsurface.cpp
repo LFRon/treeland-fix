@@ -36,6 +36,7 @@ public:
         , minimized(false)
         , fullscreen(false)
         , activated(false)
+        , m_hasIMCandidatePanelProperty(false)
     {
         initHandle(handle);
     }
@@ -80,6 +81,7 @@ public:
     uint minimized:1;
     uint fullscreen:1;
     uint activated:1;
+    uint m_hasIMCandidatePanelProperty : 1;
 };
 
 void WXWaylandSurfacePrivate::instantRelease()
@@ -535,6 +537,21 @@ WXWaylandSurface::DecorationsFlags WXWaylandSurface::decorationsFlags() const
 {
     W_DC(WXWaylandSurface);
     return WXWaylandSurface::DecorationsFlags::fromInt(d->nativeHandle()->decorations);
+}
+
+void WXWaylandSurface::setIMCandidatePanelProperty(bool value)
+{
+    W_D(WXWaylandSurface);
+    if (d->m_hasIMCandidatePanelProperty == value)
+        return;
+    d->m_hasIMCandidatePanelProperty = value;
+    Q_EMIT imCandidatePanelPropertyChanged();
+}
+
+bool WXWaylandSurface::hasIMCandidatePanelProperty() const
+{
+    W_DC(WXWaylandSurface);
+    return d->m_hasIMCandidatePanelProperty;
 }
 
 bool WXWaylandSurface::checkNewSize(const QSize &size, QSize *clipedSize)
