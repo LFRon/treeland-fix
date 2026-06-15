@@ -116,6 +116,9 @@ public:
     WindowTypes windowTypes() const;
     DecorationsFlags decorationsFlags() const;
 
+    void setIMCandidatePanelProperty(bool value);
+    bool hasIMCandidatePanelProperty() const;
+
 public Q_SLOTS:
     bool checkNewSize(const QSize &size, QSize *clipedSize = nullptr) override;
     void resize(const QSize &size) override;
@@ -141,6 +144,7 @@ Q_SIGNALS:
     void geometryChanged();
     void windowTypesChanged();
     void decorationsFlagsChanged();
+    void imCandidatePanelPropertyChanged();
 
     void requestConfigure(QRect geometry, ConfigureFlags flags);
     void requestActivate();
