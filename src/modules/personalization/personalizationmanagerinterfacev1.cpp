@@ -355,8 +355,6 @@ PersonalizationWindowContextV1::WindowStates PersonalizationWindowContextV1::sta
     return d->states;
 }
 
-
-
 class PersonalizationCursorContextV1Private
     : public QtWaylandServer::treeland_personalization_cursor_context_v1
 {
