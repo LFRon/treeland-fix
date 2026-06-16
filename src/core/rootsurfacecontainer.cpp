@@ -460,7 +460,7 @@ void RootSurfaceContainer::ensureSurfaceNormalPositionValid(SurfaceWrapper *surf
 
     QList<QRectF> outputRects;
     outputRects.reserve(outputs().size());
-    for (auto o : outputs())
+    for (auto o : std::as_const(outputs()))
         outputRects << o->validGeometry();
 
     // Ensure window is not outside the screen
@@ -502,7 +502,7 @@ void RootSurfaceContainer::moveSurfacesToOutput(const QList<SurfaceWrapper *> &s
     if (!surfaces.isEmpty() && targetOutput) {
         const QRectF targetGeometry = targetOutput->geometry();
 
-        for (auto *surface : surfaces) {
+        for (auto *surface : std::as_const(surfaces)) {
             if (!surface)
                 continue;
 

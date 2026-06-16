@@ -344,7 +344,7 @@ void XSettings::setSettings(const QByteArray &data)
 QByteArrayList XSettings::propertyList() const
 {
     QByteArrayList merged;
-    for (auto v : m_settings.keys())
+    for (auto v : std::as_const(m_settings.keys()))
         merged.append(v);
 
     return merged;

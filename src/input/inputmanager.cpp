@@ -60,7 +60,7 @@ void InputManager::onConfigInitializeSucceed()
 {
     auto seatMgr = Helper::instance()->seatManager();
     if (seatMgr) {
-        for (auto *seat : seatMgr->seats()) {
+        for (auto *seat : std::as_const(seatMgr->seats())) {
             if (auto *cursor = seat->cursor())
                 cursor->setScrollFactor(m_seatDConfig->pointerScrollFactor());
         }
@@ -72,7 +72,7 @@ void InputManager::onConfigInitializeSucceed()
             this,
             &InputManager::onInputAdded);
     const auto inputDevices = backend->inputDeviceList();
-    for (WInputDevice *device : inputDevices) {
+    for (WInputDevice *device : std::as_const(inputDevices)) {
         onInputAdded(device);
     }
 }
@@ -264,7 +264,7 @@ void InputManager::handleMousePointerConfigApplied(PointerDeviceConfigurationV1:
         || changes.testFlag(PointerDeviceConfigurationV1::NaturalScrollChanged)
         || changes.testFlag(PointerDeviceConfigurationV1::HandedModeChanged)) {
         const auto devices = interface->wSeat()->deviceList();
-        for (WInputDevice *device : devices) {
+        for (WInputDevice *device : std::as_const(devices)) {
             if (!device->handle()->is_libinput()) {
                 continue;
             }
@@ -412,7 +412,7 @@ void InputManager::handleTouchpadPointerConfigApplied(PointerDeviceConfiguration
     }
 
     const auto devices = interface->wSeat()->deviceList();
-    for (WInputDevice *device : devices) {
+    for (WInputDevice *device : std::as_const(devices)) {
         if (!device->handle()->is_libinput())
             continue;
 
@@ -497,7 +497,7 @@ void InputManager::handleKeyboardSettingsApplied(KeyboardSettingsInterfaceV1::Ch
     }
 
     const auto devices = interface->wSeat()->deviceList();
-    for (WInputDevice *device : devices) {
+    for (WInputDevice *device : std::as_const(devices)) {
         if (device->type() != WInputDevice::Type::Keyboard)
             continue;
 

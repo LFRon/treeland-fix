@@ -521,7 +521,7 @@ void ShortcutManagerV2Private::capture_next_shortcut(Resource *resource,
     } else if (auto *helper = Helper::instance()) {
         // No seat specified: find whichever seat currently has keyboard focus on this surface.
         const auto &seats = helper->seatManager()->seats();
-        for (auto *seat : seats) {
+        for (auto *seat : std::as_const(seats)) {
             if (seat->keyboardFocusSurface() == wSurface) {
                 requestedSeat = seat;
                 break;

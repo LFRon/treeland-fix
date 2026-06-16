@@ -113,7 +113,7 @@ void XResource::setPropertyValue(const QByteArray &property, const QVariant &val
 QByteArrayList XResource::propertyList() const
 {
     QByteArrayList merged;
-    for (auto v : m_resources.keys())
+    for (auto v : std::as_const(m_resources.keys()))
         merged.append(v);
 
     return merged;

@@ -265,7 +265,7 @@ WOutput *FpsDisplayManager::findBestOutput(const QVector<WOutput*> &outputs) con
         return outputs.first();
     }
 
-    for (auto output : outputs) {
+    for (auto output : std::as_const(outputs)) {
         if (output && output->isEnabled()) {
             return output;
         }
@@ -273,7 +273,7 @@ WOutput *FpsDisplayManager::findBestOutput(const QVector<WOutput*> &outputs) con
     WOutput *bestOutput = outputs.first();
     int maxRefreshRate = 0;
 
-    for (auto output : outputs) {
+    for (auto output : std::as_const(outputs)) {
         if (!output) continue;
 
         if (auto qwoutput = output->handle()) {
@@ -312,7 +312,7 @@ WOutput *FpsDisplayManager::getOutputForWindow() const
     }
 
     QVector<WOutput*> outputs;
-    for (auto child : renderWindow->children()) {
+    for (auto child : std::as_const(renderWindow->children())) {
         if (auto viewport = qobject_cast<WOutputViewport*>(child)) {
             if (auto output = viewport->output()) {
                 outputs.append(output);

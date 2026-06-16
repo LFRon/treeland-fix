@@ -925,14 +925,14 @@ void SurfaceWrapper::setOutputs(const QList<WOutput *> &outputs)
         return;
     }
     auto oldOutputs = surface()->outputs();
-    for (auto output : oldOutputs) {
+    for (auto output : std::as_const(oldOutputs)) {
         if (outputs.contains(output)) {
             continue;
         }
         surface()->leaveOutput(output);
     }
 
-    for (auto output : outputs) {
+    for (auto output : std::as_const(outputs)) {
         if (oldOutputs.contains(output))
             continue;
         surface()->enterOutput(output);
@@ -2301,7 +2301,7 @@ qreal SurfaceWrapper::getOutputDevicePixelRatio(const QPointF &pos) const
             return outputs.first()->scale();
         }
 
-        for (auto woutput : outputs) {
+        for (auto woutput : std::as_const(outputs)) {
             if (woutput && woutput->isEnabled()) {
                 QRectF outputGeometry(woutput->position(), woutput->size());
                 if (outputGeometry.contains(pos)) {

@@ -297,7 +297,7 @@ void Workspace::updateSurfaceOwnsOutput(SurfaceWrapper *surface)
 void Workspace::updateSurfacesOwnsOutput()
 {
     const auto surfaces = this->surfaces();
-    for (auto surface : surfaces) {
+    for (auto surface : std::as_const(surfaces)) {
         updateSurfaceOwnsOutput(surface);
     }
 }
@@ -364,7 +364,7 @@ void Workspace::pushActivedSurface(SurfaceWrapper *surface)
         return;
     }
     if (surface->showOnAllWorkspace()) [[unlikely]] {
-        for (auto wpModel : m_models->objects())
+        for (auto wpModel : std::as_const(m_models->objects()))
             wpModel->pushActivedSurface(surface);
         m_showOnAllWorkspaceModel->pushActivedSurface(surface);
     } else {
@@ -377,7 +377,7 @@ void Workspace::pushActivedSurface(SurfaceWrapper *surface)
 void Workspace::removeActivedSurface(SurfaceWrapper *surface)
 {
     if (surface->showOnAllWorkspace()) [[unlikely]] {
-        for (auto wpModel : m_models->objects())
+        for (auto wpModel : std::as_const(m_models->objects()))
             wpModel->removeActivedSurface(surface);
         m_showOnAllWorkspaceModel->removeActivedSurface(surface);
     } else {
@@ -389,7 +389,7 @@ void Workspace::removeActivedSurface(SurfaceWrapper *surface)
 
 void Workspace::clearActivedSurface()
 {
-    for (auto wpModel : m_models->objects())
+    for (auto wpModel : std::as_const(m_models->objects()))
         wpModel->clearActivedSurface();
     m_showOnAllWorkspaceModel->clearActivedSurface();
 }
@@ -440,7 +440,7 @@ void Workspace::doRemoveModel(int index)
 
     // TODO delete animation here
     const auto tmp = model->surfaces();
-    for (auto s : tmp) {
+    for (auto s : std::as_const(tmp)) {
         model->removeSurface(s);
         current->addSurface(s);
         if (s->hasActiveCapability() && !s->showOnAllWorkspace())

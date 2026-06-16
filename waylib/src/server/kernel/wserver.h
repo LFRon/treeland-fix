@@ -119,7 +119,7 @@ public:
     template<typename Interface>
     QVector<Interface*> findInterfaces() const {
         QVector<Interface*> list;
-        for (auto i : interfaceList()) {
+        for (auto i : std::as_const(interfaceList())) {
             if (auto ii = dynamic_cast<Interface*>(i))
                 list << ii;
         }
@@ -128,7 +128,7 @@ public:
     }
     template<typename Interface>
     Interface *findInterface() const {
-        for (auto i : interfaceList()) {
+        for (auto i : std::as_const(interfaceList())) {
             if (auto ii = dynamic_cast<Interface*>(i))
                 return ii;
         }

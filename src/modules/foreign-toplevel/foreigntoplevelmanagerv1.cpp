@@ -170,7 +170,7 @@ void ForeignToplevelManagerInterfaceV1Private::get_dock_preview_context(Resource
                                      const QList<ForeignToplevelHandleV1 *> &toplevels) {
                          std::vector<SurfaceWrapper *> surfaces;
                          surfaces.reserve(toplevels.size());
-                         for (auto *handle : toplevels) {
+                         for (auto *handle : std::as_const(toplevels)) {
                              if (auto *entry = handle->entry()) {
                                  surfaces.push_back(entry->wrapper);
                              }
@@ -269,7 +269,7 @@ ForeignToplevelManagerInterfaceV1Private::findHandleForClient(SurfaceWrapper *wr
         return nullptr;
     }
 
-    for (auto *handle : it->second->handles) {
+    for (auto *handle : std::as_const(it->second->handles)) {
         if (wl_resource_get_client(handle->resource()) == client) {
             return handle;
         }
@@ -309,7 +309,7 @@ void ForeignToplevelManagerInterfaceV1::removeSurface(SurfaceWrapper *wrapper)
     }
 
     auto *entry = it->second.get();
-    for (auto *handle : entry->handles) {
+    for (auto *handle : std::as_const(entry->handles)) {
         handle->send_closed();
         handle->clearEntry();
     }
@@ -330,7 +330,7 @@ void ForeignToplevelManagerInterfaceV1::releaseDockPreviewContext(DockPreviewCon
 
 ForeignToplevelHandleV1 *ForeignToplevelManagerInterfaceV1::handleForIdentifier(uint32_t identifier) const
 {
-    for (auto *handle : d->handles) {
+    for (auto *handle : std::as_const(d->handles)) {
         if (handle->identifier() == identifier) {
             return handle;
         }

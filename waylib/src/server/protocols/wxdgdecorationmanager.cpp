@@ -151,7 +151,7 @@ void WXdgDecorationManager::setPreferredMode(DecorationMode mode)
     }
     // update all existing decoration that mode changed
     const auto keys = d->decorations.keys();
-    for (auto *surface : keys) {
+    for (auto *surface : std::as_const(keys)) {
         setModeBySurface(surface, mode);
     }
     d->preferredMode = mode;

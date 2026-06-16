@@ -115,7 +115,7 @@ void TreelandKeyboardStateNotifyManagerInterfaceV1Private::setupKeyboardConnecti
 {
     auto *helper = Helper::instance();
     const auto seats = helper->seatManager()->seats();
-    for (auto *seat : seats) {
+    for (auto *seat : std::as_const(seats)) {
         handleSeatAdded(seat);
     }
 

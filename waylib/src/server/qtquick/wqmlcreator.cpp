@@ -285,9 +285,9 @@ void WQmlCreatorComponent::create(QSharedPointer<WQmlCreatorDelegateData> data, 
     } else {
         qWarning() << "WQmlCreatorComponent::create failed" << "parent=" << parent << "initialProperties=" << tmp;
 #if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
-        for (auto e: W_PRIVATE_MEMBER(*d, QQmlComponentPrivate_m_state_tag{}).errors)
+        for (auto e: std::as_const(W_PRIVATE_MEMBER(*d, QQmlComponentPrivate_m_state_tag{}).errors))
 #else
-        for (auto e: d->state.errors)
+        for (auto e: std::as_const(d->state.errors))
 #endif
             qWarning() << e.error;
     }
@@ -598,7 +598,7 @@ void WQmlCreator::removeDelegate(WAbstractCreatorComponent *delegate)
     Q_ASSERT(ok);
 
     const auto datas = delegate->datas();
-    for (auto d : datas) {
+    for (auto d : std::as_const(datas)) {
         bool ok = d->data.lock()->delegateDatas.removeOne({delegate, d});
         Q_ASSERT(ok);
     }

@@ -64,7 +64,7 @@ TreelandInfo TreelandRemoteSource::getTreelandInfo()
     if (auto *root = Helper::instance()->rootSurfaceContainer()) {
         QList<LayerInfo> layers;
         const auto subcontainers = root->subContainers();
-        for (auto *container : subcontainers) {
+        for (auto *container : std::as_const(subcontainers)) {
             if (!container)
                 continue;
             layers.append(buildLayerInfo(container));
@@ -117,7 +117,7 @@ void TreelandRemoteSource::collectSurfaceInfos(QList<WindowInfo> &infos,
 {
     infos.append(buildWindowInfo(surface, layer, containerName, z));
     const auto subSurfaces = surface->subSurfaces();
-    for (auto *child : subSurfaces) {
+    for (auto *child : std::as_const(subSurfaces)) {
         if (child) {
             collectSurfaceInfos(infos, child, layer, containerName, z);
         }
@@ -182,7 +182,7 @@ LayerInfo TreelandRemoteSource::buildLayerInfo(SurfaceContainer *container) cons
 
     if (auto *workspace = qobject_cast<Workspace *>(container)) {
         QList<WorkspaceInfo> workspaces;
-        for (auto *workspaceModel : workspace->models()->objects()) {
+        for (auto *workspaceModel : std::as_const(workspace->models()->objects())) {
             WorkspaceInfo workspaceInfo;
             workspaceInfo.setId(workspaceModel->id());
             workspaceInfo.setIsActive(workspaceModel == workspace->current());

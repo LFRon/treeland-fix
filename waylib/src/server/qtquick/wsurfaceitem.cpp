@@ -1014,7 +1014,7 @@ void WSurfaceItem::releaseResources()
         // treat cached/detached items as live subsurfaces. Once removed, the
         // queued auto-destroy handler below will skip deleteLater().
         const auto subsurfaces = d->subsurfaces;
-        for (auto item : subsurfaces) {
+        for (auto item : std::as_const(subsurfaces)) {
             item->releaseResources();
             auto surface = item->surface();
             if (surface) {
@@ -1665,7 +1665,7 @@ WSurfaceItemContent *WSurfaceItem::findItemContent() const
         auto node = q.dequeue();
         if (auto content = qobject_cast<WSurfaceItemContent *>(node))
             return content;
-        for (auto child : node->childItems()) {
+        for (auto child : std::as_const(node->childItems())) {
             q.enqueue(child);
         }
     }

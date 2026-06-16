@@ -402,7 +402,7 @@ const QVector<WServerInterface *> &WServer::interfaceList() const
 QVector<WServerInterface *> WServer::findInterfaces(void *handle) const
 {
     QVector<WServerInterface*> list;
-    for (auto i : interfaceList()) {
+    for (auto i : std::as_const(interfaceList())) {
         if (i->handle() == handle)
             list << i;
     }
@@ -412,7 +412,7 @@ QVector<WServerInterface *> WServer::findInterfaces(void *handle) const
 
 WServerInterface *WServer::findInterface(void *handle) const
 {
-    for (auto i : interfaceList()) {
+    for (auto i : std::as_const(interfaceList())) {
         if (i->handle() == handle)
             return i;
     }

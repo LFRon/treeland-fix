@@ -121,7 +121,7 @@ void WOutputItemPrivate::updateCursors()
     bool cursorsChanged = false;
 
     const auto cursorList = output->cursorList();
-    for (WCursor *cursor : cursorList) {
+    for (WCursor *cursor : std::as_const(cursorList)) {
         auto *oc = getCursorItemBy(cursor);
         if (!oc) {
             oc = new WOutputCursor(q);

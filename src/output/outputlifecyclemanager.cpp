@@ -23,7 +23,7 @@ Output *OutputLifecycleManager::findFirstAvailableOutput(Output *excludeOutput)
         return nullptr;
 
     const auto &outputs = m_rootContainer->outputs();
-    for (auto output : outputs) {
+    for (auto output : std::as_const(outputs)) {
         if (output != excludeOutput && output->output() && output->output()->isEnabled()) {
             return output;
         }

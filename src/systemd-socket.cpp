@@ -157,7 +157,7 @@ int main(int argc, char *argv[])
     active(QDBusConnection::systemBus());
 
     int ret = app.exec();
-    for (auto i : tmpFiles)
+    for (auto i : std::as_const(tmpFiles))
         delete i;
     return ret;
 }

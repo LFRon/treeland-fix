@@ -67,7 +67,7 @@ void WCursorPrivate::instantRelease()
 
     if (outputLayout) {
         qCDebug(waylibCursor) << "Removing cursor from" << outputLayout->outputs().size() << "outputs";
-        for (auto o : outputLayout->outputs())
+        for (auto o : std::as_const(outputLayout->outputs()))
             o->removeCursor(q_func());
     }
 
@@ -657,7 +657,7 @@ void WCursor::setLayout(WOutputLayout *layout)
     d->handle()->attach_output_layout(*d->outputLayout->handle());
 
     if (d->outputLayout) {
-        for (auto o : d->outputLayout->outputs())
+        for (auto o : std::as_const(d->outputLayout->outputs()))
             o->addCursor(this);
     }
 

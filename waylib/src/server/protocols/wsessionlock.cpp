@@ -44,7 +44,7 @@ void WSessionLockPrivate::instantRelease()
     W_Q(WSessionLock);
     auto list = surfaceList;
     surfaceList.clear();
-    for (auto surface : list) {
+    for (auto surface : std::as_const(list)) {
         q->surfaceRemoved(surface);
         surface->safeDeleteLater();
     }

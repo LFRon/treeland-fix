@@ -65,7 +65,7 @@ void LayerSurfaceContainer::removeOutput(Output *output)
     m_surfaceContainers.removeOne(container);
 
     const auto surfaces = container->surfaces();
-    for (SurfaceWrapper *surface : surfaces) {
+    for (SurfaceWrapper *surface : std::as_const(surfaces)) {
         auto layerSurface = qobject_cast<WLayerSurface *>(surface->shellSurface());
         Q_ASSERT(layerSurface);
         // Needs to be moved to the new primary output
@@ -140,7 +140,7 @@ void LayerSurfaceContainer::addSurfaceToContainer(SurfaceWrapper *surface)
 
 void LayerSurfaceContainer::updateSurfacesContainer()
 {
-    for (SurfaceWrapper *surface : surfaces()) {
+    for (SurfaceWrapper *surface : std::as_const(surfaces())) {
         if (!surface->container())
             addSurfaceToContainer(surface);
     }

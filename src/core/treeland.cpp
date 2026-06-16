@@ -91,7 +91,7 @@ public:
 
     ~TreelandPrivate()
     {
-        for (auto plugin : plugins) {
+        for (auto plugin : std::as_const(plugins)) {
             plugin->shutdown();
             delete plugin;
         }

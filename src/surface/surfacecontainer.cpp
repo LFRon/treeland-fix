@@ -69,7 +69,7 @@ void SurfaceFilterModel::setFilter(std::function<bool(SurfaceWrapper *)> filter)
     m_filter = filter;
     m_properties.clear();
 
-    for (auto surface : parent()->surfaces()) {
+    for (auto surface : std::as_const(parent()->surfaces())) {
         initForSourceSurface(surface);
     }
 }
@@ -168,7 +168,7 @@ void SurfaceContainer::setQmlEngine(QQmlEngine *engine)
     }
 
     const auto subContainers = this->subContainers();
-    for (auto sub : subContainers) {
+    for (auto sub : std::as_const(subContainers)) {
         sub->setQmlEngine(engine);
     }
 }
@@ -188,7 +188,7 @@ void SurfaceContainer::addOutput(Output *output)
     // Allow all outputs to manage surface containers, ensuring support
     // for both Primary and Proxy (Copy Mode) displays.
     const auto subContainers = this->subContainers();
-    for (auto sub : subContainers) {
+    for (auto sub : std::as_const(subContainers)) {
         sub->addOutput(output);
     }
 }
@@ -196,7 +196,7 @@ void SurfaceContainer::addOutput(Output *output)
 void SurfaceContainer::removeOutput(Output *output)
 {
     const auto subContainers = this->subContainers();
-    for (auto sub : subContainers) {
+    for (auto sub : std::as_const(subContainers)) {
         sub->removeOutput(output);
     }
 }
@@ -211,7 +211,7 @@ void SurfaceContainer::ensureQmlContext()
 void SurfaceContainer::geometryChange(const QRectF &newGeo, const QRectF &oldGeo)
 {
     const auto subContainers = this->subContainers();
-    for (SurfaceContainer *c : subContainers) {
+    for (SurfaceContainer *c : std::as_const(subContainers)) {
         c->setPosition(newGeo.topLeft());
         c->setSize(newGeo.size());
     }
