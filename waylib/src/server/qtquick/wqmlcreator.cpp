@@ -267,7 +267,8 @@ void WQmlCreatorComponent::create(QSharedPointer<WQmlCreatorDelegateData> data, 
             item->setParentItem(qobject_cast<QQuickItem*>(parent));
         m_delegate->completeCreate();
         if (!d->requiredProperties().empty()) {
-            for (const auto &unsetRequiredProperty : d->requiredProperties()) {
+            const auto requiredProps = d->requiredProperties();
+            for (const auto &unsetRequiredProperty : requiredProps) {
                 const QQmlError error = QQmlComponentPrivate::unsetRequiredPropertyToQQmlError(unsetRequiredProperty);
                 qmlWarning(rv, error);
             }

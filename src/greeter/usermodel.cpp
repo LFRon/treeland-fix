@@ -96,7 +96,8 @@ UserModel::UserModel(QObject *parent)
         qFatal() << userList.error();
     }
 
-    for (auto uid : userList.value()) {
+    const auto userIds = userList.value();
+    for (auto uid : userIds) {
         auto user = d->manager.findUserById(uid);
         if (!user) {
             qCWarning(treelandGreeter) << "Failed to find user by ID:" << user.error();

@@ -240,7 +240,8 @@ Helper::Helper(QObject *parent)
         if (!wrapper) {
             // Qt focus lost (e.g. focus item became null) — clear Wayland keyboard focus
             // on all seats to avoid stale focus state.
-            for (auto *seat : m_seatManager->seats()) {
+            const auto seats = m_seatManager->seats();
+            for (auto *seat : seats) {
                 if (auto *seatContainer = m_rootSurfaceContainer->getSeatContainer(seat)) {
                     seatContainer->setKeyboardFocusSurface(nullptr);
                 }
@@ -255,7 +256,8 @@ Helper::Helper(QObject *parent)
                 seatContainer->setKeyboardFocusSurface(wrapper);
             }
         } else {
-            for (auto *seat : m_seatManager->seats()) {
+            const auto seats = m_seatManager->seats();
+            for (auto *seat : seats) {
                 if (!seat || !seat->isValid()) {
                     continue;
                 }
@@ -1475,7 +1477,8 @@ void Helper::init(Treeland::Treeland *treeland)
     });
 
     // Setup drag request handling for all seats
-    for (auto *seat : m_seatManager->seats()) {
+    const auto seats = m_seatManager->seats();
+    for (auto *seat : seats) {
         disconnect(seat, &WSeat::requestDrag, this, nullptr);
         connect(seat, &WSeat::requestDrag, this, [this, seat](WSurface *surface) {
             handleRequestDragForSeat(seat, surface);
@@ -1993,7 +1996,8 @@ bool Helper::afterHandleEvent([[maybe_unused]] WSeat *seat,
 
         WSeat *eventSeat = getSeatForEvent(event);
         if (eventSeat && surface) {
-            for (auto *seat : m_seatManager->seats()) {
+            const auto seats = m_seatManager->seats();
+            for (auto *seat : seats) {
                 if (seat != eventSeat && surface) {
                     auto *container = m_rootSurfaceContainer->getSeatContainer(seat);
                     if (container && container->moveResizeState().surface == surface) {
@@ -2233,7 +2237,8 @@ void Helper::setActivatedSurface(SurfaceWrapper *newActivateSurface)
 
 void Helper::setCursorPosition(const QPointF &position)
 {
-    for (auto *seat : m_seatManager->seats()) {
+    const auto seats = m_seatManager->seats();
+    for (auto *seat : seats) {
         m_rootSurfaceContainer->endMoveResizeForSeat(seat);
     }
     m_seat->setCursorPosition(position);
