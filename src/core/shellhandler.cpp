@@ -794,7 +794,10 @@ void ShellHandler::setupSurfaceActiveWatcher(SurfaceWrapper *wrapper)
                 Helper::instance()->activateSurface(wrapper);
         });
 
-        connect(wrapper, &SurfaceWrapper::inactivationRequested, this, [this]() {
+        connect(wrapper, &SurfaceWrapper::inactivationRequested, this, [this, wrapper]() {
+            if (Helper::instance()->keyboardFocusSurface() != wrapper)
+                return;
+
             Helper::instance()->activateSurface(m_workspace->current()->latestActiveSurface());
         });
     } else { // Xdgtoplevel or X11 or Splash
@@ -807,6 +810,9 @@ void ShellHandler::setupSurfaceActiveWatcher(SurfaceWrapper *wrapper)
 
         connect(wrapper, &SurfaceWrapper::inactivationRequested, this, [this, wrapper]() {
             m_workspace->removeActivedSurface(wrapper);
+            if (Helper::instance()->keyboardFocusSurface() != wrapper)
+                return;
+
             Helper::instance()->activateSurface(m_workspace->current()->latestActiveSurface());
         });
 
