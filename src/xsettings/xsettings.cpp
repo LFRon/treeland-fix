@@ -303,8 +303,8 @@ void XSettings::populateSettings(const QByteArray &xSettings)
         keys << name;
     }
 
-    const auto keys = m_settings.keys();
-    for (const QByteArray &key : keys) {
+    const auto allKeys = m_settings.keys();
+    for (const QByteArray &key : allKeys) {
         if (!keys.contains(key)) {
             m_settings[key].updateValue(QVariant(), INT_MAX);
             m_settings.remove(key);
@@ -345,8 +345,8 @@ void XSettings::setSettings(const QByteArray &data)
 QByteArrayList XSettings::propertyList() const
 {
     QByteArrayList merged;
-    const auto keys = m_settings.keys();
-    for (auto v : keys)
+    const auto allKeys = m_settings.keys();
+    for (auto v : allKeys)
         merged.append(v);
 
     return merged;
