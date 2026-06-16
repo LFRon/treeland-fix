@@ -45,6 +45,7 @@ private:
     QPointer<WOutputItem> m_output;
     QQuickItem *item = nullptr;
     bool m_visible = true;
+    QMetaObject::Connection positionChangedConnection;
 };
 
 WAYLIB_SERVER_END_NAMESPACE
