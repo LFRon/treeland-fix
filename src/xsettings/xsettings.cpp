@@ -1,4 +1,4 @@
-// Copyright (C) 2025 UnionTech Software Technology Co., Ltd.
+// Copyright (C) 2025-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "xsettings.h"
@@ -344,7 +344,7 @@ void XSettings::setSettings(const QByteArray &data)
 QByteArrayList XSettings::propertyList() const
 {
     QByteArrayList merged;
-    for (auto v : std::as_const(m_settings.keys()))
+    for (auto v : m_settings.keys())
         merged.append(v);
 
     return merged;

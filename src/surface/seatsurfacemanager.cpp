@@ -62,7 +62,7 @@ void SeatSurfaceManager::setKeyboardFocusSurface(SurfaceWrapper *surface)
             if (!seatManager)
                 break;
 
-            for (auto *otherSeat : std::as_const(seatManager->seats())) {
+            for (auto *otherSeat : seatManager->seats()) {
                 if (otherSeat == m_seat)
                     continue;
                 auto *otherContainer = helper->rootSurfaceContainer()->getSeatContainer(otherSeat);

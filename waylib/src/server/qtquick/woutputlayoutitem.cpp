@@ -26,7 +26,8 @@ public:
         auto oldOutputs = outputs;
         outputs.clear();
 
-        for (auto output: std::as_const(layout->getIntersectedOutputs(QRectF(q->globalPosition(), q->size()).toRect()))) {
+        const auto intersectedOutputs = layout->getIntersectedOutputs(QRectF(q->globalPosition(), q->size()).toRect());
+        for (auto output: intersectedOutputs) {
             outputs.append(output);
         };
 

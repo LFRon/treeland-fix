@@ -190,7 +190,7 @@ ShortcutV2::ShortcutV2()
 void ShortcutV2::registerAllShortcuts()
 {
     QDir dir(TREELAND_DATA_DIR "/shortcuts");
-    for (auto d : std::as_const(dir.entryInfoList(QDir::Filter::Files))) {
+    for (auto d : dir.entryInfoList(QDir::Filter::Files)) {
         qCInfo(treelandShortcut) << "Load shortcut:" << d.filePath();
         auto shortcut = new Shortcut(d.filePath(), d.fileName());
         shortcut->registerForManager(this);

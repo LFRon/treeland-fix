@@ -644,7 +644,7 @@ void SeatsManager::assignExistingDevices(WBackend *backend)
         return;
     }
 
-    for (auto device : std::as_const(backend->inputDeviceList())) {
+    for (auto device : backend->inputDeviceList()) {
         if (device) {
             Q_EMIT deviceAdded(device);
         }

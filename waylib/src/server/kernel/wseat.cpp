@@ -966,7 +966,8 @@ bool WSeat::sendEvent(WSurface *target, QObject *shellObject, QObject *eventObje
     case QEvent::TouchEnd:
     {
         auto e = static_cast<QTouchEvent*>(event);
-        for (const QEventPoint &touchPoint : std::as_const(e->points())) {
+        const auto touchPoints = e->points();
+        for (const QEventPoint &touchPoint : touchPoints) {
             d->doNotifyFullTouchEvent(target, touchPoint.id(), touchPoint.position(), touchPoint.state(), e->timestamp());
         }
         break;
