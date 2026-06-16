@@ -167,6 +167,7 @@ public:
     QRectF geometry() const;
     QRectF normalGeometry() const;
     void moveNormalGeometryInOutput(const QPointF &position);
+    void ensureValidGeometry(const QRectF &validGeo, const QRectF &screenGeo);
     QPointF alignToPixelGrid(const QPointF &pos) const;
     QRectF alignGeometryToPixelGrid(const QRectF &geometry) const;
     qreal getOutputDevicePixelRatio(const QPointF &pos) const;

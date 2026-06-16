@@ -760,6 +760,39 @@ void SurfaceWrapper::moveNormalGeometryInOutput(const QPointF &position)
     }
 }
 
+void SurfaceWrapper::ensureValidGeometry(const QRectF &validGeo, const QRectF &screenGeo)
+{
+    QRectF finalGeo = normalGeometry();
+    QRectF titlebarGeo = titlebarGeometry();
+    if (!titlebarGeo.isValid()) {
+        // Fallback for CSD or windows without a titlebar: assume a 30px titlebar at the top.
+        titlebarGeo = QRectF(0, 0, finalGeo.width(), 30);
+    }
+    titlebarGeo.translate(finalGeo.topLeft());
+
+    // Top and Bottom are strict: titlebar should stay in valid area
+    if (titlebarGeo.top() < validGeo.top()) {
+        finalGeo.moveTop(finalGeo.top() + validGeo.top() - titlebarGeo.top());
+    } else if (titlebarGeo.bottom() > validGeo.bottom()) {
+        finalGeo.moveBottom(finalGeo.bottom() - (titlebarGeo.bottom() - validGeo.bottom()));
+    }
+
+    // Left and Right are soft: allow off-screen but push out of dock if on-screen
+    if (titlebarGeo.left() < validGeo.left() && titlebarGeo.left() >= screenGeo.left()) {
+        finalGeo.moveLeft(finalGeo.left() + validGeo.left() - titlebarGeo.left());
+    } else if (titlebarGeo.right() > validGeo.right() && titlebarGeo.right() <= screenGeo.right()) {
+        finalGeo.moveRight(finalGeo.right() - (titlebarGeo.right() - validGeo.right()));
+    } else if (finalGeo.right() <= validGeo.left() && finalGeo.right() > screenGeo.left()) {
+        finalGeo.translate(validGeo.left() - screenGeo.left(), 0);
+    } else if (finalGeo.left() >= validGeo.right() && finalGeo.left() < screenGeo.right()) {
+        finalGeo.translate(validGeo.right() - screenGeo.right(), 0);
+    }
+
+    if (finalGeo != normalGeometry()) {
+        moveNormalGeometryInOutput(finalGeo.topLeft());
+    }
+}
+
 void SurfaceWrapper::setNormalGeometry(const QRectF &newNormalGeometry)
 {
     if (m_normalGeometry == newNormalGeometry)

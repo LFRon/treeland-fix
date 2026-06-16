@@ -731,32 +731,7 @@ void Output::arrangeNonLayerSurface(SurfaceWrapper *surface, const QSizeF &sizeD
 
     // After all layout adjustments, ensure the titlebar is not occluded by the valid area.
     // This is especially important when the dock size changes (e.g. appears at the top).
-    QRectF finalGeo = surface->normalGeometry();
-    QRectF titlebarGeometry = surface->titlebarGeometry();
-    if (!titlebarGeometry.isValid()) {
-        // Fallback for CSD or windows without a titlebar: assume a 30px titlebar at the top.
-        titlebarGeometry = QRectF(0, 0, finalGeo.width(), 30);
-    }
-    titlebarGeometry.translate(finalGeo.topLeft());
-
-    QRectF screenGeo = this->geometry();
-    // Top and Bottom are strict: titlebar should stay in valid area
-    if (titlebarGeometry.top() < validGeo.top()) {
-        finalGeo.moveTop(finalGeo.top() + validGeo.top() - titlebarGeometry.top());
-    } else if (titlebarGeometry.bottom() > validGeo.bottom()) {
-        finalGeo.moveBottom(finalGeo.bottom() - (titlebarGeometry.bottom() - validGeo.bottom()));
-    }
-
-    // Left and Right are soft: allow off-screen but push out of dock if on-screen
-    if (titlebarGeometry.left() < validGeo.left() && titlebarGeometry.left() >= screenGeo.left()) {
-        finalGeo.moveLeft(finalGeo.left() + validGeo.left() - titlebarGeometry.left());
-    } else if (titlebarGeometry.right() > validGeo.right() && titlebarGeometry.right() <= screenGeo.right()) {
-        finalGeo.moveRight(finalGeo.right() - (titlebarGeometry.right() - validGeo.right()));
-    }
-
-    if (finalGeo != surface->normalGeometry()) {
-        surface->moveNormalGeometryInOutput(finalGeo.topLeft());
-    }
+    surface->ensureValidGeometry(validGeo, this->geometry());
 }
 
 namespace {

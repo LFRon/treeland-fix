@@ -447,51 +447,38 @@ void RootSurfaceContainer::ensureSurfaceNormalPositionValid(SurfaceWrapper *surf
         normalGeo.moveBottom(totalBounds.top() + marginY);
     }
 
-    // Ensure titlebar is not outside the screen
-    QRectF titlebarGeo = surface->titlebarGeometry();
-    if (!titlebarGeo.isValid()) {
-        // Fallback for CSD or windows without a titlebar: assume a 30px titlebar at the top.
-        titlebarGeo = QRectF(0, 0, normalGeo.width(), 30);
-    }
-    titlebarGeo.translate(normalGeo.topLeft());
+    surface->moveNormalGeometryInOutput(normalGeo.topLeft());
 
+    // Ensure titlebar is not outside the screen and handle dock collision
     bool titlebarGeometryAdjusted = false;
     const auto &outputList = outputs();
     for (int i = 0; i < outputList.size(); ++i) {
         auto *o = outputList[i];
-        QRectF r = o->validGeometry();
-        QRectF screenRect = o->geometry();
-
-        if (!screenRect.intersects(titlebarGeo))
-            continue;
-
-        // Top and Bottom are strict: titlebar should stay in valid area
-        if (titlebarGeo.top() < r.top()) {
-            normalGeo.moveTop(normalGeo.top() + r.top() - titlebarGeo.top());
-        } else if (titlebarGeo.bottom() > r.bottom()) {
-            normalGeo.moveBottom(normalGeo.bottom() - (titlebarGeo.bottom() - r.bottom()));
+        if (o->geometry().intersects(surface->titlebarGeometry().translated(surface->normalGeometry().topLeft()))) {
+            surface->ensureValidGeometry(o->validGeometry(), o->geometry());
+            titlebarGeometryAdjusted = true;
+            break;
         }
-
-        // Left and Right are soft: allow off-screen but push out of dock if on-screen
-        if (titlebarGeo.left() < r.left() && titlebarGeo.left() >= screenRect.left()) {
-            normalGeo.moveLeft(normalGeo.left() + r.left() - titlebarGeo.left());
-        } else if (titlebarGeo.right() > r.right() && titlebarGeo.right() <= screenRect.right()) {
-            normalGeo.moveRight(normalGeo.right() - (titlebarGeo.right() - r.right()));
-        }
-
-        titlebarGeometryAdjusted = true;
-        break;
     }
 
     if (!titlebarGeometryAdjusted) {
+        QRectF finalGeo = surface->normalGeometry();
+        QRectF titlebarGeo = surface->titlebarGeometry();
+        if (!titlebarGeo.isValid()) {
+            titlebarGeo = QRectF(0, 0, finalGeo.width(), 30);
+        }
+        titlebarGeo.translate(finalGeo.topLeft());
+
         if (titlebarGeo.top() < totalBounds.top()) {
-            normalGeo.moveTop(normalGeo.top() + totalBounds.top() - titlebarGeo.top());
+            finalGeo.moveTop(finalGeo.top() + totalBounds.top() - titlebarGeo.top());
         } else if (titlebarGeo.bottom() > totalBounds.bottom()) {
-            normalGeo.moveBottom(normalGeo.bottom() - (titlebarGeo.bottom() - totalBounds.bottom()));
+            finalGeo.moveBottom(finalGeo.bottom() - (titlebarGeo.bottom() - totalBounds.bottom()));
+        }
+
+        if (finalGeo != surface->normalGeometry()) {
+            surface->moveNormalGeometryInOutput(finalGeo.topLeft());
         }
     }
-
-    surface->moveNormalGeometryInOutput(normalGeo.topLeft());
 }
 
 OutputListModel *RootSurfaceContainer::outputModel() const
