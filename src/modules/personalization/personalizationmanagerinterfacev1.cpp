@@ -1024,9 +1024,10 @@ Personalization::Personalization(WToplevelSurface *target,
 {
     connect(target, &WToplevelSurface::aboutToBeInvalidated, this, [this] {
         disconnect(m_connection);
+        disconnect(m_contextDestroyedConnection);
     });
 
-    auto update = [this](PersonalizationWindowContextV1 *context) {
+    m_updateHandler = [this](PersonalizationWindowContextV1 *context) {
         assert(context);
 
         if (WSurface::fromHandle(context->surface()) != m_target->surface()) {
@@ -1034,6 +1035,7 @@ Personalization::Personalization(WToplevelSurface *target,
         }
 
         disconnect(m_connection);
+        disconnect(m_contextDestroyedConnection);
 
         connect(context,
                 &PersonalizationWindowContextV1::backgroundTypeChanged,
@@ -1073,12 +1075,19 @@ Personalization::Personalization(WToplevelSurface *target,
         m_shadow = context->shadow();
         m_border = context->border();
         m_states = context->states();
+
+        m_contextDestroyedConnection = connect(context, &QObject::destroyed, this, [this] {
+            m_backgroundType = Personalization::BackgroundType::Normal;
+            Q_EMIT backgroundTypeChanged();
+
+            m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, m_updateHandler);
+        });
     };
 
-    m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, update);
+    m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, m_updateHandler);
 
     if (auto *context = PersonalizationWindowContextV1::getWindowContext(m_target->surface())) {
-        update(context);
+        m_updateHandler(context);
     }
 }
 

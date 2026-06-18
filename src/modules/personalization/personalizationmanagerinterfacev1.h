@@ -10,6 +10,7 @@
 #include <QObject>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <functional>
 
 class SurfaceWrapper;
 class PersonalizationManagerInterfaceV1;
@@ -251,6 +252,8 @@ private:
     PersonalizationWindowContextV1::WindowStates m_states {};
 
     QMetaObject::Connection m_connection;
+    QMetaObject::Connection m_contextDestroyedConnection;
+    std::function<void(PersonalizationWindowContextV1*)> m_updateHandler;
 };
 
 class PersonalizationManagerInterfaceV1 : public QObject, public WServerInterface
