@@ -1024,62 +1024,72 @@ Personalization::Personalization(WToplevelSurface *target,
 {
     connect(target, &WToplevelSurface::aboutToBeInvalidated, this, [this] {
         disconnect(m_connection);
+        disconnect(m_contextDestroyedConnection);
     });
 
-    auto update = [this](PersonalizationWindowContextV1 *context) {
-        assert(context);
-
-        if (WSurface::fromHandle(context->surface()) != m_target->surface()) {
-            return;
-        }
-
-        disconnect(m_connection);
-
-        connect(context,
-                &PersonalizationWindowContextV1::backgroundTypeChanged,
-                this,
-                [this, context] {
-                    m_backgroundType = context->backgroundType();
-                    Q_EMIT backgroundTypeChanged();
-                });
-        connect(context,
-                &PersonalizationWindowContextV1::cornerRadiusChanged,
-                this,
-                [this, context] {
-                    m_cornerRadius = context->cornerRadius();
-                    Q_EMIT cornerRadiusChanged();
-                });
-
-        connect(context, &PersonalizationWindowContextV1::shadowChanged, this, [this, context] {
-            m_shadow = context->shadow();
-            Q_EMIT shadowChanged();
-        });
-
-        connect(context, &PersonalizationWindowContextV1::borderChanged, this, [this, context] {
-            m_border = context->border();
-            Q_EMIT borderChanged();
-        });
-
-        connect(context,
-                &PersonalizationWindowContextV1::windowStateChanged,
-                this,
-                [this, context] {
-                    m_states = context->states();
-                    Q_EMIT windowStateChanged();
-                });
-
-        m_backgroundType = context->backgroundType();
-        m_cornerRadius = context->cornerRadius();
-        m_shadow = context->shadow();
-        m_border = context->border();
-        m_states = context->states();
-    };
-
-    m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, update);
+    m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, &Personalization::updateFromContext);
 
     if (auto *context = PersonalizationWindowContextV1::getWindowContext(m_target->surface())) {
-        update(context);
+        updateFromContext(context);
     }
+}
+
+void Personalization::updateFromContext(PersonalizationWindowContextV1 *context)
+{
+    assert(context);
+
+    if (WSurface::fromHandle(context->surface()) != m_target->surface()) {
+        return;
+    }
+
+    disconnect(m_connection);
+    disconnect(m_contextDestroyedConnection);
+
+    connect(context,
+            &PersonalizationWindowContextV1::backgroundTypeChanged,
+            this,
+            [this, context] {
+                m_backgroundType = context->backgroundType();
+                Q_EMIT backgroundTypeChanged();
+            });
+    connect(context,
+            &PersonalizationWindowContextV1::cornerRadiusChanged,
+            this,
+            [this, context] {
+                m_cornerRadius = context->cornerRadius();
+                Q_EMIT cornerRadiusChanged();
+            });
+
+    connect(context, &PersonalizationWindowContextV1::shadowChanged, this, [this, context] {
+        m_shadow = context->shadow();
+        Q_EMIT shadowChanged();
+    });
+
+    connect(context, &PersonalizationWindowContextV1::borderChanged, this, [this, context] {
+        m_border = context->border();
+        Q_EMIT borderChanged();
+    });
+
+    connect(context,
+            &PersonalizationWindowContextV1::windowStateChanged,
+            this,
+            [this, context] {
+                m_states = context->states();
+                Q_EMIT windowStateChanged();
+            });
+
+    m_backgroundType = context->backgroundType();
+    m_cornerRadius = context->cornerRadius();
+    m_shadow = context->shadow();
+    m_border = context->border();
+    m_states = context->states();
+
+    m_contextDestroyedConnection = connect(context, &QObject::destroyed, this, [this] {
+        m_backgroundType = Personalization::BackgroundType::Normal;
+        Q_EMIT backgroundTypeChanged();
+
+        m_connection = connect(m_manager, &PersonalizationManagerInterfaceV1::windowContextCreated, this, &Personalization::updateFromContext);
+    });
 }
 
 SurfaceWrapper *Personalization::surfaceWrapper() const

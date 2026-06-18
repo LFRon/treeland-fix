@@ -242,6 +242,8 @@ Q_SIGNALS:
     void windowStateChanged();
 
 private:
+    void updateFromContext(PersonalizationWindowContextV1 *context);
+
     WWrapPointer<WToplevelSurface> m_target;
     PersonalizationManagerInterfaceV1 *m_manager = nullptr;
     int32_t m_backgroundType = Personalization::BackgroundType::Normal;
@@ -251,6 +253,7 @@ private:
     PersonalizationWindowContextV1::WindowStates m_states {};
 
     QMetaObject::Connection m_connection;
+    QMetaObject::Connection m_contextDestroyedConnection;
 };
 
 class PersonalizationManagerInterfaceV1 : public QObject, public WServerInterface
