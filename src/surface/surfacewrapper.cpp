@@ -25,6 +25,7 @@
 
 #include <qwbuffer.h>
 #include <qwlayershellv1.h>
+#include <qwrenderer.h>
 
 #include <QColor>
 #include <QVariant>
@@ -32,6 +33,21 @@
 #define OPEN_ANIMATION 1
 #define CLOSE_ANIMATION 2
 #define ALWAYSONTOPLAYER 1
+
+namespace {
+bool isVulkanRendererBackend()
+{
+#ifdef ENABLE_VULKAN_RENDER
+    auto *helper = Helper::instance();
+    if (!helper || !helper->window() || !helper->window()->renderer())
+        return false;
+
+    return wlr_renderer_is_vk(helper->window()->renderer()->handle());
+#else
+    return false;
+#endif
+}
+}
 
 SurfaceWrapper::SurfaceWrapper(QmlEngine *qmlEngine,
                                WToplevelSurface *shellSurface,
@@ -570,11 +586,28 @@ void SurfaceWrapper::startPrelaunchSplashHideSequence()
 {
     Q_ASSERT(m_surfaceItem != nullptr);
     if (m_windowAnimation) {
-        qCDebug(lcTlSurface) << "prelaunch splash transition is starting while window "
-                                    "animation is still running,"
-                                    "this may cause visual glitches, will delay the transition "
-                                    "until window animation finishes";
-        return;
+        const bool canFinishSplashOpenAnimation =
+            m_prelaunchSplash && isVulkanRendererBackend()
+            && m_windowAnimation->property("direction").toUInt() == OPEN_ANIMATION;
+        if (canFinishSplashOpenAnimation) {
+            qCDebug(lcTlSurface) << "prelaunch splash transition is starting while "
+                                    "window animation is still running, finish the "
+                                    "splash open animation immediately on Vulkan renderer";
+
+            QQuickItem *windowAnimation = m_windowAnimation.data();
+            windowAnimation->disconnect(this);
+            bool ok = QMetaObject::invokeMethod(windowAnimation, "stop");
+            Q_ASSERT(ok);
+            windowAnimation->deleteLater();
+            m_windowAnimation = nullptr;
+            Q_EMIT windowAnimationRunningChanged();
+        } else {
+            qCDebug(lcTlSurface) << "prelaunch splash transition is starting while window "
+                                        "animation is still running,"
+                                        "this may cause visual glitches, will delay the transition "
+                                        "until window animation finishes";
+            return;
+        }
     }
     if (m_geometryAnimation) {
         qCDebug(lcTlSurface) << "prelaunch splash transition already prepared or running, skip";
@@ -1279,6 +1312,8 @@ void SurfaceWrapper::createNewOrClose(uint direction)
     case Type::XWayland: {
         m_windowAnimation = m_engine->createNewAnimation(this, container(), direction);
         m_windowAnimation->setProperty("enableBlur", m_blur);
+        if (isVulkanRendererBackend())
+            m_windowAnimation->setProperty("liveSource", false);
     } break;
     case Type::Layer: {
         auto scope = QString(static_cast<WLayerSurfaceItem *>(m_surfaceItem)

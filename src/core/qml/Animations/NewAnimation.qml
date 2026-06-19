@@ -20,6 +20,7 @@ Item {
     required property var direction
     property int duration: 400 * Helper.animationSpeed
     property var enableBlur: false
+    property bool liveSource: direction === NewAnimation.Direction.Show
 
     x: target.x
     y: target.y
@@ -43,6 +44,12 @@ Item {
         animation.start();
     }
 
+    function stop() {
+        animation.stop();
+        effect.sourceItem = null;
+        root.visible = false;
+    }
+
     Loader {
         active: root.enableBlur
         anchors.fill: parent
@@ -60,7 +67,7 @@ Item {
         width: root.target.width + 100
         height: root.target.height + 100
         anchors.centerIn: parent
-        live: direction === NewAnimation.Direction.Show
+        live: root.liveSource
         hideSource: true
         sourceItem: root.target
         sourceRect: Qt.rect(effect.x, effect.y, effect.width, effect.height)
