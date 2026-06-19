@@ -54,7 +54,8 @@ int main(int argc, char *argv[])
     });
     //    QQuickStyle::setStyle("Material");
 
-    QGuiApplication::setAttribute(Qt::AA_UseOpenGLES);
+    if (qgetenv("WLR_RENDERER") != "vulkan")
+        QGuiApplication::setAttribute(Qt::AA_UseOpenGLES);
     QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
         Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
     QGuiApplication::setQuitOnLastWindowClosed(false);

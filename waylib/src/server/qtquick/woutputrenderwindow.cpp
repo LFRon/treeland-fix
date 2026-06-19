@@ -64,6 +64,17 @@ extern "C" {
 #include <wlr/render/vulkan.h>
 #endif
 #include <wlr/render/gles2.h>
+#include <wlr/render/egl.h>
+
+// wlr_egl_create_with_drm_fd and wlr_egl_destroy are not in the public
+// wlr/render/egl.h header, but are exported symbols in libwlroots (defined
+// in render/egl.c). We declare them here to create an independent EGL
+// display/context for GL Qt RHI when the wlroots renderer is Vulkan.
+// These are stable within the wlroots 0.19 ABI.
+extern "C" {
+struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd);
+void wlr_egl_destroy(struct wlr_egl *egl);
+}
 }
 
 #include <drm_fourcc.h>
@@ -380,6 +391,8 @@ public:
     }
     ~WOutputRenderWindowPrivate() {
         qDeleteAll(layers);
+        if (m_independentEgl)
+            wlr_egl_destroy(m_independentEgl);
     }
 
     static inline WOutputRenderWindowPrivate *get(WOutputRenderWindow *qq) {
@@ -463,6 +476,9 @@ public:
     bool renderEnabled = true;
 
     QPointer<qw_renderer> m_renderer;
+    // Independent wlr_egl created when wlroots renderer is Vulkan but Qt RHI
+    // is GL. Used to create a QW::OpenGLContext with a valid EGL display/context.
+    struct wlr_egl *m_independentEgl = nullptr;
     QPointer<qw_allocator> m_allocator;
 
     QList<OutputHelper*> outputs;
@@ -1356,6 +1372,10 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
         auto phdev = wlr_vk_renderer_get_physical_device(m_renderer->handle());
         auto dev = wlr_vk_renderer_get_device(m_renderer->handle());
         auto queue_family = wlr_vk_renderer_get_queue_family(m_renderer->handle());
+        if (Q_UNLIKELY(!phdev || !dev)) {
+            qCWarning(lcWlRenderer) << "Vulkan: wlroots renderer exposed null VkPhysicalDevice/VkDevice, cannot adopt into Qt RHI";
+            return false;
+        }
 
 #if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
         auto instance = wlr_vk_renderer_get_instance(m_renderer->handle());
@@ -1364,7 +1384,12 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
         //        vkInstance->setExtensions(fromCStyleList(vkRendererAttribs.extension_count, vkRendererAttribs.extensions));
         //        vkInstance->setLayers(fromCStyleList(vkRendererAttribs.layer_count, vkRendererAttribs.layers));
         vkInstance->setApiVersion({1, 1, 0});
-        vkInstance->create();
+        if (!vkInstance->create()) {
+            qCWarning(lcWlRenderer) << "Vulkan: QVulkanInstance::create() failed when adopting wlroots VkInstance, errorCode=" << vkInstance->errorCode();
+            return false;
+        }
+        qCInfo(lcWlRenderer) << "Vulkan: adopting wlroots VkDevice into Qt RHI (phdev=" << Qt::hex << reinterpret_cast<quintptr>(phdev)
+                             << ", dev=" << reinterpret_cast<quintptr>(dev) << ", queue_family=" << Qt::dec << queue_family << ")";
         q->setVulkanInstance(vkInstance.data());
 
         auto gd = QQuickGraphicsDevice::fromDeviceObjects(phdev, dev, queue_family);
@@ -1372,17 +1397,56 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
     } else
 #endif
     if (rhiSupport->rhiBackend() == QRhi::OpenGLES2) {
-        Q_ASSERT(wlr_renderer_is_gles2(m_renderer->handle()));
-        auto egl = wlr_gles2_renderer_get_egl(m_renderer->handle());
-        auto display = wlr_egl_get_display(egl);
-        auto context = wlr_egl_get_context(egl);
+        if (wlr_renderer_is_gles2(m_renderer->handle())) {
+            // GL wlroots renderer: adopt its EGL context (shared GL context,
+            // textures interoperable without dmabuf import).
+            auto egl = wlr_gles2_renderer_get_egl(m_renderer->handle());
+            auto display = wlr_egl_get_display(egl);
+            auto context = wlr_egl_get_context(egl);
 
-        this->glContext = new QW::OpenGLContext(display, context, rc());
-        bool ok = this->glContext->create();
-        if (!ok)
-            return false;
+            this->glContext = new QW::OpenGLContext(display, context, rc());
+            bool ok = this->glContext->create();
+            if (!ok)
+                return false;
 
-        q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+            q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+        } else {
+            // Vulkan wlroots renderer with GL Qt RHI: the waylib platform
+            // plugin (qwlrootsintegration.cpp) only accepts QW::OpenGLContext
+            // and uses its eglDisplay()/eglContext() directly for EGLConfig
+            // lookup and makeCurrent. We cannot pass placeholder EGL handles
+            // (EGL_NO_DISPLAY causes "Cannot find EGLConfig" → QRhi creation
+            // fails → crash). Instead, create an independent wlr_egl from the
+            // renderer's drm_fd (wlr_renderer_get_drm_fd works for Vulkan
+            // renderers too), and adopt its EGL display/context into a
+            // QW::OpenGLContext. This EGL context is independent of the
+            // wlroots Vulkan renderer — it's used solely for Qt RHI GL
+            // rendering and EGL dmabuf import.
+            int drm_fd = wlr_renderer_get_drm_fd(m_renderer->handle());
+            if (drm_fd < 0) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: wlr_renderer_get_drm_fd failed";
+                return false;
+            }
+            struct wlr_egl *egl = wlr_egl_create_with_drm_fd(drm_fd);
+            if (!egl) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: wlr_egl_create_with_drm_fd failed";
+                return false;
+            }
+
+            EGLDisplay display = wlr_egl_get_display(egl);
+            EGLContext context = wlr_egl_get_context(egl);
+            this->glContext = new QW::OpenGLContext(display, context, rc());
+            bool ok = this->glContext->create();
+            if (!ok) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: failed to create QW::OpenGLContext";
+                wlr_egl_destroy(egl);
+                return false;
+            }
+
+            q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+            m_independentEgl = egl;  // destroyed when window is destroyed
+            qCInfo(lcWlRenderer) << "Vulkan wlroots renderer with GL Qt RHI: using independent EGL context for dmabuf import";
+        }
     } else {
         return false;
     }

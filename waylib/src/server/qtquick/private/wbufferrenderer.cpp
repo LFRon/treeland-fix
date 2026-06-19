@@ -588,6 +588,9 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             // complete the results of this drawing here to ensure the current
             // drawing result is available for use.
             wd->rhi->finish();
+            // GL's glFinish (invoked by QRhi::finish) automatically signals the
+            // dmabuf's implicit sync fence, so KMS scanout waits correctly.
+            // No manual layout/sync transition needed (unlike the Vulkan RHI path).
         } else {
             state.dirty = softwareRenderer->flushRegion();
 

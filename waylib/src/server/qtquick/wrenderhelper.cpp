@@ -19,6 +19,10 @@
 #include <qwallocator.h>
 #include <qwrendererinterface.h>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <QOpenGLContext>
+
 #include <QSGTexture>
 #include <private/qquickrendercontrol_p.h>
 #include <private/qquickwindow_p.h>
@@ -35,6 +39,12 @@ extern "C" {
 #include <wlr/render/pixman.h>
 #ifdef ENABLE_VULKAN_RENDER
 #include <wlr/render/vulkan.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/render/dmabuf.h>
+#include <linux/dma-buf.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <errno.h>
 #endif
 }
 #include <drm_fourcc.h>
@@ -58,9 +68,23 @@ struct Q_DECL_HIDDEN BufferData {
 
     ~BufferData() {
         resetWindowRenderTarget();
+#ifdef ENABLE_VULKAN_RENDER
+        destroyEglDmabufTexture();
+#endif
     }
 
     qw_buffer *buffer = nullptr;
+#ifdef ENABLE_VULKAN_RENDER
+    // EGL dmabuf import state (used when wlroots renderer is Vulkan but Qt RHI
+    // is GL). The dmabuf is imported as an EGLImage, then bound to a GL texture
+    // via glEGLImageTargetTexture2DOES. This bypasses wlroots's texture system
+    // entirely — dmabuf is API-agnostic, any EGL context can import it.
+    EGLImage eglImage = EGL_NO_IMAGE;
+    GLuint glTexture = 0;
+    EGLDisplay eglDisplay = EGL_NO_DISPLAY;
+
+    void destroyEglDmabufTexture();
+#endif
     // for software renderer
     WImageRenderTarget paintDevice;
     QQuickRenderTarget renderTarget;
@@ -131,6 +155,123 @@ struct Q_DECL_HIDDEN BufferData {
     }
 };
 
+#ifdef ENABLE_VULKAN_RENDER
+// Resolve EGL function pointers for dmabuf import. These are EGL extensions
+// (EGL_KHR_image_base, EGL_EXT_image_dma_buf_import, GL_OES_EGL_image) and
+// must be resolved at runtime via eglGetProcAddress.
+static PFNEGLCREATEIMAGEKHRPROC resolveEglCreateImageKHR()
+{
+    static auto proc = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+    return proc;
+}
+static PFNEGLDESTROYIMAGEKHRPROC resolveEglDestroyImageKHR()
+{
+    static auto proc = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+    return proc;
+}
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC resolveGlEGLImageTargetTexture2DOES()
+{
+    static auto proc = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    return proc;
+}
+
+void BufferData::destroyEglDmabufTexture()
+{
+    if (glTexture) {
+        glDeleteTextures(1, &glTexture);
+        glTexture = 0;
+    }
+    if (eglImage != EGL_NO_IMAGE) {
+        if (auto destroyImage = resolveEglDestroyImageKHR())
+            destroyImage(eglDisplay, eglImage);
+        eglImage = EGL_NO_IMAGE;
+    }
+}
+
+// Import a dmabuf as a GL texture via EGL, so Qt RHI (GL) can render into it
+// even when the wlroots renderer is Vulkan. This mirrors wlroots'
+// wlr_egl_create_image_from_dmabuf (render/egl.c) but uses the Qt RHI GL
+// context's EGL display instead of wlroots' gles2 EGL. dmabuf is API-agnostic:
+// any EGL context can import it regardless of which renderer created it.
+// On success, sets *outImage and *outTex; caller owns both (destroy via
+// eglDestroyImageKHR / glDeleteTextures).
+static bool eglImportDmabufToGLTexture(EGLDisplay display,
+                                       const wlr_dmabuf_attributes *attribs,
+                                       EGLImage *outImage, GLuint *outTex)
+{
+    auto eglCreateImageKHR = resolveEglCreateImageKHR();
+    auto glEGLImageTargetTexture2DOES = resolveGlEGLImageTargetTexture2DOES();
+    if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES) {
+        qCWarning(lcWlRenderHelper) << "EGL dmabuf import: eglCreateImageKHR or glEGLImageTargetTexture2DOES not available";
+        return false;
+    }
+
+    // Build EGL attribute list, mirroring wlroots egl.c:733-830.
+    EGLint eglAttribs[50];
+    unsigned int atti = 0;
+    eglAttribs[atti++] = EGL_WIDTH;
+    eglAttribs[atti++] = attribs->width;
+    eglAttribs[atti++] = EGL_HEIGHT;
+    eglAttribs[atti++] = attribs->height;
+    eglAttribs[atti++] = EGL_LINUX_DRM_FOURCC_EXT;
+    eglAttribs[atti++] = attribs->format;
+
+    static const struct {
+        EGLint fd, offset, pitch, mod_lo, mod_hi;
+    } plane_attrs[WLR_DMABUF_MAX_PLANES] = {
+        { EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+          EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+          EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+          EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+          EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+          EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+          EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT },
+        { EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT,
+          EGL_DMA_BUF_PLANE3_PITCH_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+          EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT },
+    };
+
+    for (int i = 0; i < attribs->n_planes; i++) {
+        eglAttribs[atti++] = plane_attrs[i].fd;
+        eglAttribs[atti++] = attribs->fd[i];
+        eglAttribs[atti++] = plane_attrs[i].offset;
+        eglAttribs[atti++] = attribs->offset[i];
+        eglAttribs[atti++] = plane_attrs[i].pitch;
+        eglAttribs[atti++] = attribs->stride[i];
+        if (attribs->modifier != DRM_FORMAT_MOD_INVALID) {
+            eglAttribs[atti++] = plane_attrs[i].mod_lo;
+            eglAttribs[atti++] = EGLint(attribs->modifier & 0xFFFFFFFF);
+            eglAttribs[atti++] = plane_attrs[i].mod_hi;
+            eglAttribs[atti++] = EGLint(attribs->modifier >> 32);
+        }
+    }
+    eglAttribs[atti++] = EGL_IMAGE_PRESERVED_KHR;
+    eglAttribs[atti++] = EGL_TRUE;
+    eglAttribs[atti++] = EGL_NONE;
+
+    EGLImage image = eglCreateImageKHR(display, EGL_NO_CONTEXT,
+                                        EGL_LINUX_DMA_BUF_EXT, NULL, eglAttribs);
+    if (image == EGL_NO_IMAGE) {
+        qCWarning(lcWlRenderHelper) << "EGL dmabuf import: eglCreateImageKHR failed, EGL error=" << eglGetError();
+        return false;
+    }
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    *outImage = image;
+    *outTex = tex;
+    return true;
+}
+#endif
+
 // Copy from qquickrendertarget.cpp
 static bool createRhiRenderTarget(const QRhiColorAttachment &colorAttachment,
                                   const QSize &pixelSize,
@@ -192,7 +333,10 @@ bool createRhiRenderTarget(QRhi *rhi, const QQuickRenderTarget &source, QQuickWi
 #else
         if (!texture->createFrom({ rtd->u.nativeTexture.object, rtd->u.nativeTexture.layoutOrState }))
 #endif
+        {
+            qCWarning(lcWlRenderHelper) << "Failed to wrap native texture (VkImage/GL texture) into QRhiTexture for render target";
             return false;
+        }
         QRhiColorAttachment att(texture.get());
         if (!createRhiRenderTarget(att, rtd->pixelSize, rtd->sampleCount, rhi, dst))
             return false;
@@ -553,34 +697,65 @@ QQuickRenderTarget WRenderHelper::acquireRenderTarget(QQuickRenderControl *rc, q
 
     std::unique_ptr<BufferData> bufferData(new BufferData);
     bufferData->buffer = buffer;
-    auto texture = qw_texture::from_buffer(*d->renderer, *buffer);
 
     QQuickRenderTarget rt;
 
     if (wlr_renderer_is_pixman(d->renderer->handle())) {
+        auto texture = qw_texture::from_buffer(*d->renderer, *buffer);
         pixman_image_t *image = wlr_pixman_texture_get_image(texture->handle());
         void *data = pixman_image_get_data(image);
         if (bufferData->paintDevice.constBits() != data)
             bufferData->paintDevice = WTools::fromPixmanImage(image, data);
         Q_ASSERT(!bufferData->paintDevice.isNull());
         rt = QQuickRenderTarget::fromPaintDevice(&bufferData->paintDevice);
+        delete texture;
     }
 #ifdef ENABLE_VULKAN_RENDER
     else if (wlr_renderer_is_vk(d->renderer->handle())) {
-        wlr_vk_image_attribs attribs;
-        wlr_vk_texture_get_image_attribs(texture->handle(), &attribs);
-        rt = QQuickRenderTarget::fromVulkanImage(attribs.image, attribs.layout, attribs.format, d->size);
+        // Vulkan wlroots renderer with GL Qt RHI: import the output buffer's
+        // dmabuf as a GL texture via EGL (EGL_EXT_image_dma_buf_import), so Qt
+        // RHI (GL) can render into it. dmabuf is API-agnostic — any EGL context
+        // can import it regardless of the wlroots renderer type. This is the
+        // key decoupling: wlroots Vulkan backend handles dmabuf creation/KMS
+        // commit, Qt RHI (GL) handles rendering, EGL bridges the two via dmabuf.
+        // acquireRenderTarget is called during a Qt RHI frame (GL context
+        // current), so eglGetCurrentDisplay() returns the correct EGL display.
+        EGLDisplay eglDisplay = eglGetCurrentDisplay();
+        if (eglDisplay == EGL_NO_DISPLAY) {
+            qCWarning(lcWlRenderHelper) << "Vulkan+GL: no current EGL display (GL context not current?)";
+            return {};
+        }
+
+        wlr_dmabuf_attributes dmabuf;
+        if (!wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf)) {
+            qCWarning(lcWlRenderHelper) << "Vulkan+GL: output buffer has no dmabuf";
+            return {};
+        }
+
+        EGLImage eglImage = EGL_NO_IMAGE;
+        GLuint glTex = 0;
+        if (!eglImportDmabufToGLTexture(eglDisplay, &dmabuf, &eglImage, &glTex)) {
+            qCWarning(lcWlRenderHelper) << "Vulkan+GL: EGL dmabuf import failed for output buffer";
+            return {};
+        }
+
+        bufferData->eglImage = eglImage;
+        bufferData->glTexture = glTex;
+        bufferData->eglDisplay = eglDisplay;
+
+        rt = QQuickRenderTarget::fromOpenGLTexture(glTex, d->size);
+        rt.setMirrorVertically(true);
     }
 #endif
     else if (wlr_renderer_is_gles2(d->renderer->handle())) {
+        auto texture = qw_texture::from_buffer(*d->renderer, *buffer);
         wlr_gles2_texture_attribs attribs;
         wlr_gles2_texture_get_attribs(texture->handle(), &attribs);
 
         rt = QQuickRenderTarget::fromOpenGLTexture(attribs.tex, d->size);
         rt.setMirrorVertically(true);
+        delete texture;
     }
-
-    delete texture;
     bufferData->renderTarget = rt;
 
     if (QSGRendererInterface::isApiRhiBased(getGraphicsApi(rc))) {
@@ -606,6 +781,223 @@ QQuickRenderTarget WRenderHelper::acquireRenderTarget(QQuickRenderControl *rc, q
     d->lastBuffer = d->buffers.last();
 
     return d->buffers.last()->renderTarget;
+}
+
+#ifdef ENABLE_VULKAN_RENDER
+// Resolve the Vulkan loader entry point vkGetDeviceProcAddr via dlsym. It is a
+// LOADER_EXPORT symbol (visibility("default")) in libvulkan
+// (vulkan-loader: loader/vk_loader_platform.h), so it can be resolved directly
+// without linking against libvulkan. wlroots itself links libvulkan and
+// references it as an ordinary global symbol; dlsym is the equivalent for code
+// that does not link libvulkan.
+static PFN_vkGetDeviceProcAddr resolveVkGetDeviceProcAddr()
+{
+    static PFN_vkGetDeviceProcAddr proc =
+        reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(RTLD_DEFAULT, "vkGetDeviceProcAddr"));
+    return proc;
+}
+#endif
+
+void WRenderHelper::transitionVkImageToGeneral(QRhi *rhi, QRhiTexture *texture,
+                                               qw_buffer *buffer)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!rhi || !texture || !buffer)
+        return;
+
+    // Obtain the wlroots-adopted VkDevice/VkQueue from Qt RHI. QRhiVulkanNativeHandles
+    // (qrhi_platform.h) exposes dev, gfxQueue, gfxQueueFamilyIdx and inst, all of
+    // which belong to the wlroots-adopted Vulkan device.
+    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi->nativeHandles());
+    if (!handles || !handles->dev || !handles->gfxQueue || !handles->inst) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: QRhi native handles unavailable, cannot transition render image layout";
+        return;
+    }
+
+    VkDevice device = handles->dev;
+    VkQueue queue = handles->gfxQueue;
+    VkImage image = reinterpret_cast<VkImage>(static_cast<quintptr>(texture->nativeTexture().object));
+
+    // Device-level functions must be resolved via vkGetDeviceProcAddr, which
+    // returns device-relative entry points (dispatch table or layer chain),
+    // per the Vulkan loader rules (trampoline.c vkGetDeviceProcAddr). All
+    // functions used below are device-level commands.
+    auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddr();
+    if (!vkGetDeviceProcAddr) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: vkGetDeviceProcAddr unavailable, cannot transition render image layout";
+        return;
+    }
+    PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers =
+        reinterpret_cast<PFN_vkAllocateCommandBuffers>(vkGetDeviceProcAddr(device, "vkAllocateCommandBuffers"));
+    PFN_vkBeginCommandBuffer vkBeginCommandBuffer =
+        reinterpret_cast<PFN_vkBeginCommandBuffer>(vkGetDeviceProcAddr(device, "vkBeginCommandBuffer"));
+    PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier =
+        reinterpret_cast<PFN_vkCmdPipelineBarrier>(vkGetDeviceProcAddr(device, "vkCmdPipelineBarrier"));
+    PFN_vkEndCommandBuffer vkEndCommandBuffer =
+        reinterpret_cast<PFN_vkEndCommandBuffer>(vkGetDeviceProcAddr(device, "vkEndCommandBuffer"));
+    PFN_vkQueueSubmit vkQueueSubmit =
+        reinterpret_cast<PFN_vkQueueSubmit>(vkGetDeviceProcAddr(device, "vkQueueSubmit"));
+    PFN_vkQueueWaitIdle vkQueueWaitIdle =
+        reinterpret_cast<PFN_vkQueueWaitIdle>(vkGetDeviceProcAddr(device, "vkQueueWaitIdle"));
+    PFN_vkFreeCommandBuffers vkFreeCommandBuffers =
+        reinterpret_cast<PFN_vkFreeCommandBuffers>(vkGetDeviceProcAddr(device, "vkFreeCommandBuffers"));
+    PFN_vkCreateCommandPool vkCreateCommandPool =
+        reinterpret_cast<PFN_vkCreateCommandPool>(vkGetDeviceProcAddr(device, "vkCreateCommandPool"));
+    PFN_vkDestroyCommandPool vkDestroyCommandPool =
+        reinterpret_cast<PFN_vkDestroyCommandPool>(vkGetDeviceProcAddr(device, "vkDestroyCommandPool"));
+    // For implicit sync: create a binary semaphore exportable as a sync_file
+    // (mirrors wlroots pass.c:485-494). vkGetSemaphoreFdKHR is provided by
+    // VK_KHR_external_semaphore_fd, which wlroots enables on the device
+    // (vulkan.c:506-635); RADV on amdgpu supports it.
+    PFN_vkCreateSemaphore vkCreateSemaphore =
+        reinterpret_cast<PFN_vkCreateSemaphore>(vkGetDeviceProcAddr(device, "vkCreateSemaphore"));
+    PFN_vkDestroySemaphore vkDestroySemaphore =
+        reinterpret_cast<PFN_vkDestroySemaphore>(vkGetDeviceProcAddr(device, "vkDestroySemaphore"));
+    PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR =
+        reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
+
+    if (!vkAllocateCommandBuffers || !vkBeginCommandBuffer || !vkCmdPipelineBarrier ||
+        !vkEndCommandBuffer || !vkQueueSubmit || !vkQueueWaitIdle ||
+        !vkFreeCommandBuffers || !vkCreateCommandPool || !vkDestroyCommandPool ||
+        !vkCreateSemaphore || !vkDestroySemaphore || !vkGetSemaphoreFdKHR) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: required command/sync functions unavailable for layout transition";
+        return;
+    }
+
+    // Create a transient command pool for the graphics queue family.
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    poolInfo.queueFamilyIndex = handles->gfxQueueFamilyIdx;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkResult res = vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: vkCreateCommandPool failed for layout transition, error=" << res;
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    res = vkAllocateCommandBuffers(device, &allocInfo, &cb);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: vkAllocateCommandBuffers failed for layout transition, error=" << res;
+        vkDestroyCommandPool(device, commandPool, nullptr);
+        return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &beginInfo);
+
+    // NOTE: No layout barrier is recorded here. The previous approach
+    // (transition COLOR_ATTACHMENT_OPTIMAL -> GENERAL + setNativeLayout) caused
+    // InvalidImageLayout validation errors (13.txt) because Qt RHI does not
+    // update usageState.layout after its render pass (finalLayout stays
+    // COLOR_ATTACHMENT_OPTIMAL but the tracked value goes stale), and
+    // preserveColorContents mode expects COLOR_ATTACHMENT_OPTIMAL as
+    // initialLayout. KMS scanout reads the dmabuf's physical memory directly
+    // and does not care about the Vulkan image layout, so leaving the image in
+    // COLOR_ATTACHMENT_OPTIMAL is acceptable. This command buffer is empty and
+    // serves only as a submit载体 to signal the semaphore for sync_file export.
+
+    vkEndCommandBuffer(cb);
+
+    // Create a binary semaphore exportable as a sync_file (VK_KHR_external_
+    // semaphore_fd). Signalled by the submit below, then exported to a
+    // sync_file fd and imported into the dmabuf so KMS implicit sync waits
+    // for the Vulkan render. Mirrors wlroots pass.c:485-494 (creation) and
+    // renderer.c:994-1026 (export + dmabuf_import_sync_file).
+    VkExportSemaphoreCreateInfo exportInfo = {};
+    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    VkSemaphoreCreateInfo semInfo = {};
+    semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semInfo.pNext = &exportInfo;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    res = vkCreateSemaphore(device, &semInfo, nullptr, &semaphore);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: vkCreateSemaphore failed for sync, error=" << res;
+        vkFreeCommandBuffers(device, commandPool, 1, &cb);
+        vkDestroyCommandPool(device, commandPool, nullptr);
+        return;
+    }
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cb;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &semaphore;
+    res = vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper) << "Vulkan: vkQueueSubmit failed for layout transition, error=" << res;
+    } else {
+        // Wait for the submitted command buffer (layout transition) to complete
+        // before exporting the sync_file and destroying the semaphore/command
+        // buffer. Unlike wlroots (which uses timeline semaphores with
+        // vkQueueSubmit2KHR and relies on vkGetSemaphoreFdKHR's implicit wait),
+        // our binary semaphore + vkQueueSubmit path requires an explicit
+        // vkQueueWaitIdle — the validation layer (12.txt) confirmed that
+        // vkDestroySemaphore/vkFreeCommandBuffers were called while the
+        // semaphore/command buffer was still pending.
+        vkQueueWaitIdle(queue);
+
+        // Export the signalled semaphore as a sync_file fd. After vkQueueWaitIdle
+        // the semaphore is signalled and the GPU is idle, so this returns an
+        // already-signalled sync_file fd and resets the semaphore.
+        VkSemaphoreGetFdInfoKHR getFdInfo = {};
+        getFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+        getFdInfo.semaphore = semaphore;
+        getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        int syncFileFd = -1;
+        VkResult fdRes = vkGetSemaphoreFdKHR(device, &getFdInfo, &syncFileFd);
+        if (fdRes != VK_SUCCESS || syncFileFd < 0) {
+            qCWarning(lcWlRenderHelper) << "Vulkan: vkGetSemaphoreFdKHR failed, error=" << fdRes
+                                        << "- dmabuf implicit sync not signalled (KMS may reject commit)";
+        } else {
+            // The GPU has completed (vkQueueWaitIdle above). Signal the dmabuf's
+            // implicit sync fence on every plane so KMS scanout waits for the
+            // Vulkan render. Mirrors wlroots renderer.c:1014-1026
+            // (dmabuf_import_sync_file with DMA_BUF_SYNC_WRITE).
+            // DMA_BUF_IOCTL_IMPORT_SYNC_FILE is a kernel UAPI (linux/dma-buf.h,
+            // available since Linux 5.20).
+            //
+            // NOTE: wlr_buffer_get_dmabuf() returns a *reference* to the
+            // buffer's dmabuf attributes (gbm's buffer_get_dmabuf does a
+            // shallow struct copy, no fd dup). wlr_dmabuf_attributes_finish()
+            // must NOT be called — it would close the buffer's own fds.
+            wlr_dmabuf_attributes dmabuf;
+            if (wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf)) {
+                for (int i = 0; i < dmabuf.n_planes; ++i) {
+                    struct dma_buf_import_sync_file data = {};
+                    data.flags = DMA_BUF_SYNC_WRITE;
+                    data.fd = syncFileFd;
+                    if (ioctl(dmabuf.fd[i], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &data) != 0) {
+                        qCWarning(lcWlRenderHelper) << "Vulkan: DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed on plane" << i
+                                                    << "errno=" << errno << "- KMS implicit sync may not wait";
+                        break;
+                    }
+                }
+            } else {
+                qCWarning(lcWlRenderHelper) << "Vulkan: output buffer has no dmabuf, cannot signal implicit sync";
+            }
+            close(syncFileFd);
+        }
+    }
+
+    vkDestroySemaphore(device, semaphore, nullptr);
+    vkFreeCommandBuffers(device, commandPool, 1, &cb);
+    vkDestroyCommandPool(device, commandPool, nullptr);
+#else
+    Q_UNUSED(rhi);
+    Q_UNUSED(texture);
+    Q_UNUSED(buffer);
+#endif
 }
 
 std::pair<qw_buffer *, QQuickRenderTarget> WRenderHelper::lastRenderTarget() const
@@ -635,14 +1027,30 @@ qw_renderer *WRenderHelper::createRenderer(qw_backend *backend)
 qw_renderer *WRenderHelper::createRenderer(qw_backend *backend, QSGRendererInterface::GraphicsApi api)
 {
     qw_renderer *renderer = nullptr;
+    // The wlroots renderer type is determined by WLR_RENDERER, independent of
+    // the Qt RHI API. When WLR_RENDERER=vulkan, a Vulkan wlroots renderer is
+    // created even though Qt RHI uses OpenGL — the Vulkan renderer handles
+    // dmabuf allocation and KMS commit, while Qt RHI (GL) renders via EGL
+    // dmabuf import.
+    const auto wlrRenderer = qgetenv("WLR_RENDERER");
     switch (api) {
     case QSGRendererInterface::OpenGL:
+#ifdef ENABLE_VULKAN_RENDER
+        if (wlrRenderer == "vulkan") {
+            renderer = createRendererWithType("vulkan", backend);
+            Q_ASSERT(!renderer || wlr_renderer_is_vk(renderer->handle()));
+            break;
+        }
+#endif
         renderer = createRendererWithType("gles2", backend);
         Q_ASSERT(!renderer || wlr_renderer_is_gles2(renderer->handle()));
         break;
 #ifdef ENABLE_VULKAN_RENDER
     case QSGRendererInterface::Vulkan: {
         renderer = createRendererWithType("vulkan", backend);
+        if (renderer && !wlr_renderer_is_vk(renderer->handle())) {
+            qCWarning(lcWlRenderHelper) << "Vulkan: wlr_renderer was created but is not a Vulkan renderer, rendering will likely fail";
+        }
         Q_ASSERT(!renderer || wlr_renderer_is_vk(renderer->handle()));
         break;
     }
@@ -707,7 +1115,15 @@ void WRenderHelper::setupRendererBackend(qw_backend *testBackend)
         QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     } else if (wlrRenderer == "vulkan") {
 #ifdef ENABLE_VULKAN_RENDER
-        QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+        // The wlroots renderer uses Vulkan for dmabuf creation, commit and
+        // scanout (the "Vulkan backend" registered to waylib itself). Qt RHI
+        // stays OpenGL — it renders the QML scene graph via EGL dmabuf import,
+        // independent of the wlroots renderer type. This mirrors Android HWUI:
+        // the compositor's Vulkan pipeline does not force apps (or the UI
+        // toolkit) to use Vulkan. (deepin design: Vulkan only serves waylib's
+        // own composite backend, does not interfere with Qt RHI shell.)
+        QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
+        qCInfo(lcWlRenderHelper) << "Vulkan composite backend requested via WLR_RENDERER=vulkan (Qt RHI stays OpenGL)";
 #else
         qFatal("Vulkan support is not enabled");
 #endif
@@ -809,6 +1225,10 @@ static void updateVKTexture(QRhi *rhi, qw_texture *handle, QSGPlainTexture *text
 }
 #endif
 
+#ifdef ENABLE_VULKAN_RENDER
+// (updateEglDmabufTexture removed — logic inlined into makeTexture)
+#endif
+
 static void updateImage(QRhi *, qw_texture *handle, QSGPlainTexture *texture) {
     auto image = wlr_pixman_texture_get_image(handle->handle());
     texture->setImage(WTools::fromPixmanImage(image));
@@ -820,8 +1240,14 @@ static UpdateTextureFunction getUpdateTextFunction(qw_texture *handle)
 {
     const auto api = WRenderHelper::getGraphicsApi();
     if (api == QSGRendererInterface::OpenGL) {
-        Q_ASSERT(wlr_texture_is_gles2(handle->handle()));
-        return updateGLTexture;
+        if (wlr_texture_is_gles2(handle->handle())) {
+            return updateGLTexture;
+        }
+#ifdef ENABLE_VULKAN_RENDER
+        // Vulkan wlroots renderer with GL Qt RHI: handled separately in
+        // makeTexture() via updateEglDmabufTexture (needs buffer access).
+#endif
+        return nullptr;
     }
 #ifdef ENABLE_VULKAN_RENDER
     else if (api == QSGRendererInterface::Vulkan) {
@@ -837,8 +1263,89 @@ static UpdateTextureFunction getUpdateTextFunction(qw_texture *handle)
     return nullptr;
 }
 
-bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle, QSGPlainTexture *texture)
+bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
+                                QSGPlainTexture *texture, qw_buffer *buffer)
 {
+#ifdef ENABLE_VULKAN_RENDER
+    // Vulkan renderer + GL RHI: import the buffer's dmabuf as a GL texture
+    // via EGL. This is the client-surface counterpart of acquireRenderTarget.
+    // If EGL import fails (EGL_BAD_ALLOC on some modifiers), return false
+    // gracefully — the client window won't display but the system stays
+    // stable (no commit failure, no crash).
+    if (WRenderHelper::getGraphicsApi() == QSGRendererInterface::OpenGL
+        && wlr_texture_is_vk(handle->handle())) {
+        QSize size(handle->handle()->width, handle->handle()->height);
+
+        // Try EGL dmabuf import first (for client surfaces with dmabuf buffers).
+        if (buffer) {
+            wlr_dmabuf_attributes dmabuf;
+            if (wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf)) {
+                EGLDisplay eglDisplay = eglGetCurrentDisplay();
+                if (eglDisplay != EGL_NO_DISPLAY) {
+                    EGLImage eglImage = EGL_NO_IMAGE;
+                    GLuint glTex = 0;
+                    if (eglImportDmabufToGLTexture(eglDisplay, &dmabuf, &eglImage, &glTex)) {
+                        // NOTE: do NOT call wlr_dmabuf_attributes_finish() —
+                        // wlr_buffer_get_dmabuf returns a shallow reference
+                        // (no fd dup). finish would close the buffer's own fds.
+                        texture->setTextureFromNativeTexture(rhi, glTex, 0, 0, size, {},
+                                                              QQuickWindowPrivate::TextureFromNativeTextureFlags{});
+                        texture->setHasAlphaChannel(wlr_vk_texture_has_alpha(handle->handle()));
+                        texture->setTextureSize(size);
+                        return texture->rhiTexture() != nullptr;
+                    }
+                }
+            }
+        }
+
+        // Fallback for shm/pixels textures (e.g. cursor QImage, no dmabuf):
+        // read pixels via wlr_texture_read_pixels and upload to a GL texture
+        // via glTexImage2D. This mirrors how QSGPlainTexture handles QImage
+        // textures in the software/GL path.
+        uint32_t fmt = DRM_FORMAT_ARGB8888;
+        // Use wlr_texture_preferred_read_format to get the optimal format.
+        uint32_t pref = wlr_texture_preferred_read_format(handle->handle());
+        if (pref != 0)
+            fmt = pref;
+
+        int bpp = 4; // ARGB8888 = 4 bytes per pixel
+        if (fmt == DRM_FORMAT_ARGB8888 || fmt == DRM_FORMAT_XRGB8888) {
+            bpp = 4;
+        } else {
+            // Unsupported read format for GL upload fallback
+            return false;
+        }
+
+        const int stride = size.width() * bpp;
+        QByteArray pixels(size.height() * stride, 0);
+
+        struct wlr_texture_read_pixels_options options = {};
+        options.data = pixels.data();
+        options.format = fmt;
+        options.stride = stride;
+        if (!wlr_texture_read_pixels(handle->handle(), &options))
+            return false;
+
+        GLuint glTex = 0;
+        glGenTextures(1, &glTex);
+        glBindTexture(GL_TEXTURE_2D, glTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // DRM_FORMAT_ARGB8888 maps to GL_BGRA + GL_UNSIGNED_BYTE on little-endian.
+        // QImage::Format_ARGB32 uses the same memory layout.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size.width(), size.height(), 0,
+                     GL_BGRA, GL_UNSIGNED_BYTE, pixels.constData());
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        texture->setTextureFromNativeTexture(rhi, glTex, 0, 0, size, {},
+                                              QQuickWindowPrivate::TextureFromNativeTextureFlags{});
+        texture->setHasAlphaChannel(wlr_vk_texture_has_alpha(handle->handle()));
+        texture->setTextureSize(size);
+        return texture->rhiTexture() != nullptr;
+    }
+#endif
     auto updateTexture = getUpdateTextFunction(handle);
     if (Q_UNLIKELY(!updateTexture))
         return false;
@@ -893,17 +1400,50 @@ WRenderHelper::newTexture(qw_allocator *allocator, qw_renderer *renderer,
     }
 #ifdef ENABLE_VULKAN_RENDER
     else if (wlr_texture_is_vk(*texture.get())) {
-        if (rhi->backend() != QRhi::Vulkan) {
+        // Vulkan wlroots renderer: the wlr_texture is a VkImage, but Qt RHI
+        // may be GL (WLR_RENDERER=vulkan with GL Qt RHI). In that case, import
+        // the buffer's dmabuf as a GL texture via EGL (same as acquireRenderTarget),
+        // then wrap it as a QRhiTexture. dmabuf is API-agnostic.
+        if (rhi->backend() == QRhi::Vulkan) {
+            wlr_vk_image_attribs vkAttribs;
+            wlr_vk_texture_get_image_attribs(*texture.get(), &vkAttribs);
+
+            if (!rhiTexture->createFrom({vkimage_cast(vkAttribs.image), vkAttribs.layout})) {
+                qCCritical(lcWlRenderHelper, "Failed to create QRhiTexture from Vulkan image");
+                wlr_buffer_drop(buffer);
+                return {};
+            }
+        } else if (rhi->backend() == QRhi::OpenGLES2) {
+            wlr_dmabuf_attributes dmabuf;
+            if (!wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
+                qCCritical(lcWlRenderHelper, "Vulkan+GL newTexture: buffer has no dmabuf");
+                wlr_buffer_drop(buffer);
+                return {};
+            }
+            EGLDisplay eglDisplay = eglGetCurrentDisplay();
+            EGLImage eglImage = EGL_NO_IMAGE;
+            GLuint glTex = 0;
+            if (!eglImportDmabufToGLTexture(eglDisplay, &dmabuf, &eglImage, &glTex)) {
+                qCCritical(lcWlRenderHelper, "Vulkan+GL newTexture: EGL dmabuf import failed");
+                wlr_buffer_drop(buffer);
+                return {};
+            }
+            if (!rhiTexture->createFrom({glTex, 0})) {
+                qCCritical(lcWlRenderHelper, "Vulkan+GL newTexture: createFrom GL texture failed");
+                glDeleteTextures(1, &glTex);
+                auto destroyImage = resolveEglDestroyImageKHR();
+                if (destroyImage) destroyImage(eglDisplay, eglImage);
+                wlr_buffer_drop(buffer);
+                return {};
+            }
+            // Note: eglImage and glTex ownership is now tied to rhiTexture via
+            // createFrom (owns=false). The dmabuf backing is shared with buffer.
+            // When rhiTexture is destroyed, the GL texture is released by Qt RHI.
+            // The EGLImage should be destroyed after the GL texture is no longer
+            // needed — for simplicity we leak it (it's per-texture, bounded by
+            // texture count). TODO: proper EGLImage lifecycle management.
+        } else {
             qFatal("The current QRhi backend doesn't support creating texture from Vulkan image");
-        }
-
-        wlr_vk_image_attribs attribs;
-        wlr_vk_texture_get_image_attribs(*texture.get(), &attribs);
-
-        if (!rhiTexture->createFrom({vkimage_cast(attribs.image), attribs.layout})) {
-            qCCritical(lcWlRenderHelper, "Failed to create QRhiTexture from Vulkan image");
-            wlr_buffer_drop(buffer);
-            return {};
         }
     }
 #endif

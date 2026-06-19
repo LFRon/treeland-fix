@@ -35,24 +35,17 @@ public:
     }
 
     void cleanTexture() {
-        if (rhiTexture) {
-            Q_ASSERT(window);
-            class TextureCleanupJob : public QRunnable
-            {
-            public:
-                TextureCleanupJob(QRhiTexture *texture)
-                    : texture(texture) { }
-                void run() override {
-                    texture->deleteLater();
-                }
-                QRhiTexture *texture;
-            };
-
-            // Delay clean the qt rhi textures.
-            window->scheduleRenderJob(new TextureCleanupJob(rhiTexture),
-                                      QQuickWindow::AfterSynchronizingStage);
-            rhiTexture = nullptr;
-        }
+        // QSGPlainTexture owns its QRhiTexture (m_owns_texture=true by default).
+        // Its setTexture() deletes the old m_texture when replaced, and its
+        // destructor deletes m_texture. We must NOT delete rhiTexture ourselves
+        // — that causes double-delete with QSGPlainTexture's own management.
+        //
+        // cleanTexture() is called before updateRhiTexture() (which calls
+        // setTextureFromNativeTexture→setTexture(new), deleting the old m_texture
+        // on the render thread where GL context is current). If there's no
+        // subsequent updateRhiTexture (object destruction), QSGPlainTexture's
+        // destructor handles cleanup. We just clear our cached pointer.
+        rhiTexture = nullptr;
 
         if (ownsTexture && texture)
             delete texture;
@@ -61,7 +54,12 @@ public:
 
     void updateRhiTexture() {
         Q_ASSERT(texture);
-        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture);
+        // NOTE: We cannot cache by wlr_texture* pointer — wlroots may reuse the
+        // same texture object (via wlr_client_buffer_apply_damage) but update
+        // its contents. Caching would show stale content. Every surface update
+        // must re-run makeTexture. (The GL/gles2 path also re-wraps every frame
+        // but setTextureFromNativeTexture is lightweight; EGL import is heavier.)
+        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture, buffer);
         if (Q_UNLIKELY(!ok)) {
             qCWarning(lcWlQtQuickTexture) << "Failed to make texture:" << texture
                                         << ", width height:" << texture->handle()->width

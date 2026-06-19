@@ -7,6 +7,9 @@
 
 extern "C" {
 #include <wlr/render/wlr_texture.h>
+#if WLR_HAVE_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 }
 
 QW_BEGIN_NAMESPACE
@@ -17,6 +20,10 @@ public:
     QW_FUNC_STATIC(texture, from_pixels, qw_texture *, wlr_renderer *renderer, uint32_t fmt, uint32_t stride, uint32_t width, uint32_t height, const void *data)
     QW_FUNC_STATIC(texture, from_dmabuf, qw_texture *, wlr_renderer *renderer, wlr_dmabuf_attributes *attribs)
     QW_FUNC_STATIC(texture, from_buffer, qw_texture *, wlr_renderer *renderer, wlr_buffer *buffer)
+#if WLR_HAVE_VULKAN_RENDERER
+    QW_FUNC_MEMBER(vk_texture, get_image_attribs, void, wlr_vk_image_attribs *attribs)
+    QW_FUNC_MEMBER(vk_texture, has_alpha, bool)
+#endif
 
     QW_FUNC_MEMBER(texture, update_from_buffer, bool, wlr_buffer *buffer, const pixman_region32_t *damage)
 

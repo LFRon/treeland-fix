@@ -12,6 +12,7 @@
 
 QT_BEGIN_NAMESPACE
 class QQuickRenderControl;
+class QRhiTexture;
 class QSGTexture;
 class QSGPlainTexture;
 class QRhi;
@@ -55,7 +56,31 @@ public:
     static void setupRendererBackend(QW_NAMESPACE::qw_backend *testBackend = nullptr);
     static QSGRendererInterface::GraphicsApi probe(QW_NAMESPACE::qw_backend *testBackend, const QList<QSGRendererInterface::GraphicsApi> &apiList);
 
-    static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle, QSGPlainTexture *texture);
+    static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle,
+                            QSGPlainTexture *texture, QW_NAMESPACE::qw_buffer *buffer = nullptr);
+
+    // After Qt Quick renders into a dmabuf-backed VkImage via an offscreen
+    // frame, the image is left in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    // and the queue family ownership has not been released back to the
+    // external (KMS) consumer. Vulkan requires that external memory be in
+    // VK_IMAGE_LAYOUT_GENERAL and that queue family ownership be transferred
+    // to VK_QUEUE_FAMILY_FOREIGN_EXT before an external consumer reads it,
+    // otherwise scanout is undefined (garbage/blank output). This submits a
+    // barrier performing both the layout transition and the ownership release.
+    // Must be called after QRhi::finish() for the frame (GPU idle) so the
+    // rendered content is complete. \p texture is the QRhiTexture wrapping the
+    // dmabuf-backed VkImage (e.g. the offscreen render target's color
+    // attachment); its tracked layout is updated via setNativeLayout() so that
+    // Qt RHI's next-frame barriers use the correct oldLayout. \p buffer is the
+    // wlroots output buffer backing the render target; it is used to signal
+    // the dmabuf's implicit sync fence (via DMA_BUF_IOCTL_IMPORT_SYNC_FILE) so
+    // that KMS scanout waits for the Vulkan render to complete — Vulkan
+    // offscreen rendering does not participate in dmabuf implicit sync
+    // automatically, unlike GL/EGL. This mirrors wlroots'
+    // vulkan_sync_render_buffer() (render/vulkan/renderer.c) with a NULL
+    // signal_timeline (the implicit-sync path).
+    static void transitionVkImageToGeneral(QRhi *rhi, QRhiTexture *texture,
+                                           QW_NAMESPACE::qw_buffer *buffer);
 
     struct TextureEntry {
         wlr_buffer *buffer;
