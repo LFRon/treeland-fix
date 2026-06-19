@@ -272,6 +272,34 @@ static bool eglImportDmabufToGLTexture(EGLDisplay display,
 }
 #endif
 
+void WRenderHelper::releaseNativeTexture(NativeTextureCleanup *cleanup)
+{
+    if (!cleanup || cleanup->type == NativeTextureCleanup::Type::None)
+        return;
+
+#ifdef ENABLE_VULKAN_RENDER
+    if (cleanup->type == NativeTextureCleanup::Type::OpenGLTexture) {
+        if (!QOpenGLContext::currentContext()) {
+            *cleanup = {};
+            return;
+        }
+
+        if (cleanup->texture) {
+            GLuint texture = GLuint(cleanup->texture);
+            glDeleteTextures(1, &texture);
+        }
+
+        if (cleanup->eglImage) {
+            if (auto destroyImage = resolveEglDestroyImageKHR())
+                destroyImage(reinterpret_cast<EGLDisplay>(cleanup->eglDisplay),
+                             reinterpret_cast<EGLImage>(cleanup->eglImage));
+        }
+    }
+#endif
+
+    *cleanup = {};
+}
+
 // Copy from qquickrendertarget.cpp
 static bool createRhiRenderTarget(const QRhiColorAttachment &colorAttachment,
                                   const QSize &pixelSize,
@@ -1264,7 +1292,8 @@ static UpdateTextureFunction getUpdateTextFunction(qw_texture *handle)
 }
 
 bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
-                                QSGPlainTexture *texture, qw_buffer *buffer)
+                                QSGPlainTexture *texture, qw_buffer *buffer,
+                                NativeTextureCleanup *nativeCleanup)
 {
 #ifdef ENABLE_VULKAN_RENDER
     // Vulkan renderer + GL RHI: import the buffer's dmabuf as a GL texture
@@ -1292,6 +1321,14 @@ bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
                                                               QQuickWindowPrivate::TextureFromNativeTextureFlags{});
                         texture->setHasAlphaChannel(wlr_vk_texture_has_alpha(handle->handle()));
                         texture->setTextureSize(size);
+                        if (nativeCleanup) {
+                            *nativeCleanup = {
+                                NativeTextureCleanup::Type::OpenGLTexture,
+                                glTex,
+                                reinterpret_cast<void *>(eglImage),
+                                reinterpret_cast<void *>(eglDisplay),
+                            };
+                        }
                         return texture->rhiTexture() != nullptr;
                     }
                 }
@@ -1343,6 +1380,14 @@ bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
                                               QQuickWindowPrivate::TextureFromNativeTextureFlags{});
         texture->setHasAlphaChannel(wlr_vk_texture_has_alpha(handle->handle()));
         texture->setTextureSize(size);
+        if (nativeCleanup) {
+            *nativeCleanup = {
+                NativeTextureCleanup::Type::OpenGLTexture,
+                glTex,
+                nullptr,
+                nullptr,
+            };
+        }
         return texture->rhiTexture() != nullptr;
     }
 #endif
@@ -1383,6 +1428,7 @@ WRenderHelper::newTexture(qw_allocator *allocator, qw_renderer *renderer,
     const auto qformat = static_cast<QRhiTexture::Format>(rhiFormat);
     const auto qflags = QRhiTexture::Flags(rhiFlags);
     std::unique_ptr<QRhiTexture> rhiTexture(rhi->newTexture(qformat, size, 1, qflags));
+    NativeTextureCleanup nativeCleanup;
 
     if (wlr_texture_is_gles2(*texture.get())) {
         if (rhi->backend() != QRhi::OpenGLES2) {
@@ -1428,20 +1474,18 @@ WRenderHelper::newTexture(qw_allocator *allocator, qw_renderer *renderer,
                 wlr_buffer_drop(buffer);
                 return {};
             }
+            nativeCleanup = {
+                NativeTextureCleanup::Type::OpenGLTexture,
+                glTex,
+                reinterpret_cast<void *>(eglImage),
+                reinterpret_cast<void *>(eglDisplay),
+            };
             if (!rhiTexture->createFrom({glTex, 0})) {
                 qCCritical(lcWlRenderHelper, "Vulkan+GL newTexture: createFrom GL texture failed");
-                glDeleteTextures(1, &glTex);
-                auto destroyImage = resolveEglDestroyImageKHR();
-                if (destroyImage) destroyImage(eglDisplay, eglImage);
+                releaseNativeTexture(&nativeCleanup);
                 wlr_buffer_drop(buffer);
                 return {};
             }
-            // Note: eglImage and glTex ownership is now tied to rhiTexture via
-            // createFrom (owns=false). The dmabuf backing is shared with buffer.
-            // When rhiTexture is destroyed, the GL texture is released by Qt RHI.
-            // The EGLImage should be destroyed after the GL texture is no longer
-            // needed — for simplicity we leak it (it's per-texture, bounded by
-            // texture count). TODO: proper EGLImage lifecycle management.
         } else {
             qFatal("The current QRhi backend doesn't support creating texture from Vulkan image");
         }
@@ -1455,7 +1499,7 @@ WRenderHelper::newTexture(qw_allocator *allocator, qw_renderer *renderer,
 
     rhiTexture->setName("WaylibTexture");
 
-    return {buffer, texture.release(), rhiTexture.release()};
+    return {buffer, texture.release(), rhiTexture.release(), nativeCleanup};
 }
 
 WRenderHelper::TextureEntry

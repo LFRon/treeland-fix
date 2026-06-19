@@ -35,17 +35,14 @@ public:
     }
 
     void cleanTexture() {
-        // QSGPlainTexture owns its QRhiTexture (m_owns_texture=true by default).
-        // Its setTexture() deletes the old m_texture when replaced, and its
-        // destructor deletes m_texture. We must NOT delete rhiTexture ourselves
-        // — that causes double-delete with QSGPlainTexture's own management.
-        //
-        // cleanTexture() is called before updateRhiTexture() (which calls
-        // setTextureFromNativeTexture→setTexture(new), deleting the old m_texture
-        // on the render thread where GL context is current). If there's no
-        // subsequent updateRhiTexture (object destruction), QSGPlainTexture's
-        // destructor handles cleanup. We just clear our cached pointer.
-        rhiTexture = nullptr;
+        // QSGPlainTexture owns the QRhiTexture wrapper, but QRhiTexture::createFrom()
+        // does not own the native GL object. Drop the wrapper first, then release
+        // any Vulkan+GL import objects that WRenderHelper created for it.
+        if (rhiTexture) {
+            qtTexture.setTexture(nullptr);
+            rhiTexture = nullptr;
+        }
+        WRenderHelper::releaseNativeTexture(&nativeCleanup);
 
         if (ownsTexture && texture)
             delete texture;
@@ -54,13 +51,15 @@ public:
 
     void updateRhiTexture() {
         Q_ASSERT(texture);
-        // NOTE: We cannot cache by wlr_texture* pointer — wlroots may reuse the
-        // same texture object (via wlr_client_buffer_apply_damage) but update
-        // its contents. Caching would show stale content. Every surface update
-        // must re-run makeTexture. (The GL/gles2 path also re-wraps every frame
-        // but setTextureFromNativeTexture is lightweight; EGL import is heavier.)
-        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture, buffer);
+        // NOTE: We cannot cache by wlr_texture* alone: wlroots may reuse the
+        // same texture object (via wlr_client_buffer_apply_damage) while updating
+        // its contents. Callers should re-run makeTexture for real buffer updates,
+        // but reuse the provider texture for pure scene graph animation frames.
+        WRenderHelper::NativeTextureCleanup newCleanup;
+        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture,
+                                             buffer, &newCleanup);
         if (Q_UNLIKELY(!ok)) {
+            WRenderHelper::releaseNativeTexture(&newCleanup);
             qCWarning(lcWlQtQuickTexture) << "Failed to make texture:" << texture
                                         << ", width height:" << texture->handle()->width
                                         << texture->handle()->height;
@@ -68,6 +67,7 @@ public:
         }
 
         rhiTexture = qtTexture.rhiTexture();
+        nativeCleanup = newCleanup;
     }
 
     W_DECLARE_PUBLIC(WSGTextureProvider)
@@ -82,6 +82,7 @@ public:
     // qt resources
     QSGPlainTexture qtTexture;
     QRhiTexture *rhiTexture = nullptr;
+    WRenderHelper::NativeTextureCleanup nativeCleanup;
     bool smooth = true;
 };
 

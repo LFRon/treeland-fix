@@ -222,6 +222,7 @@ public:
             }
             surface = nullptr;
         }
+        textureDirty = true;
 
         if (frameDoneConnection)
             QObject::disconnect(frameDoneConnection);
@@ -251,6 +252,7 @@ public:
             const bool bufferChanged = committedState & WLR_SURFACE_STATE_BUFFER;
 
             if (bufferChanged) {
+                textureDirty = true;
                 // Get the new buffer pointer from surface
                 auto newBuffer = surface->buffer();
 
@@ -332,8 +334,10 @@ public:
     }
 
     inline void swapBufferIfNeeded() {
-        if (pendingBuffer)
+        if (pendingBuffer) {
             buffer = std::move(pendingBuffer);
+            textureDirty = true;
+        }
     }
 
     inline void setDevicePixelRatio(qreal dpr) {
@@ -369,6 +373,7 @@ public:
     mutable QMetaObject::Connection updateTextureConnection;
     bool dontCacheLastBuffer = false;
     bool live = true;
+    mutable bool textureDirty = true;
     bool ignoreBufferOffset = false;
     bool lastRendered = false;
     QAtomicInteger<bool> rendered = false;
@@ -469,6 +474,8 @@ WSGTextureProvider *WSurfaceItemContent::wTextureProvider() const
             } else {
                 d->textureProvider->setBuffer(d->buffer.get());
             }
+            if (d->textureProvider->texture())
+                d->textureDirty = false;
         }
     }
     return d->textureProvider;
@@ -508,6 +515,7 @@ void WSurfaceItemContent::setLive(bool live)
     d->live = live;
     if (live) {
         d->swapBufferIfNeeded();
+        d->textureDirty = true;
         update();
     }
     Q_EMIT liveChanged();
@@ -594,13 +602,14 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     W_D(WSurfaceItemContent);
 
     auto tp = wTextureProvider();
-    if (d->live || !tp->texture()) {
+    if ((d->live && d->textureDirty) || !tp->texture()) {
         auto texture = d->surface ? d->surface->handle()->get_texture() : nullptr;
         if (texture) {
             tp->setTexture(qw_texture::from(texture), d->buffer.get());
         } else {
             tp->setBuffer(d->buffer.get());
         }
+        d->textureDirty = false;
     }
 
     if (!tp->texture() || width() <= 0 || height() <= 0) {

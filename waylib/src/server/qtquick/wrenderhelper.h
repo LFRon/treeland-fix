@@ -56,8 +56,23 @@ public:
     static void setupRendererBackend(QW_NAMESPACE::qw_backend *testBackend = nullptr);
     static QSGRendererInterface::GraphicsApi probe(QW_NAMESPACE::qw_backend *testBackend, const QList<QSGRendererInterface::GraphicsApi> &apiList);
 
+    struct NativeTextureCleanup {
+        enum class Type {
+            None,
+            OpenGLTexture,
+        };
+
+        Type type = Type::None;
+        quint64 texture = 0;
+        void *eglImage = nullptr;
+        void *eglDisplay = nullptr;
+    };
+
+    static void releaseNativeTexture(NativeTextureCleanup *cleanup);
+
     static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle,
-                            QSGPlainTexture *texture, QW_NAMESPACE::qw_buffer *buffer = nullptr);
+                            QSGPlainTexture *texture, QW_NAMESPACE::qw_buffer *buffer = nullptr,
+                            NativeTextureCleanup *nativeCleanup = nullptr);
 
     // After Qt Quick renders into a dmabuf-backed VkImage via an offscreen
     // frame, the image is left in VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
@@ -86,6 +101,7 @@ public:
         wlr_buffer *buffer;
         QW_NAMESPACE::qw_texture *texture;
         QRhiTexture *rhiTexture;
+        NativeTextureCleanup nativeCleanup;
     };
     static TextureEntry newTexture(QW_NAMESPACE::qw_allocator *allocator,
                                    QW_NAMESPACE::qw_renderer *renderer,
