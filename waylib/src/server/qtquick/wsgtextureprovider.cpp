@@ -35,13 +35,19 @@ public:
     }
 
     void cleanTexture() {
-        // QSGPlainTexture owns the QRhiTexture wrapper, but QRhiTexture::createFrom()
-        // does not own the native GL object. Drop the wrapper first, then release
-        // any Vulkan+GL import objects that WRenderHelper created for it.
+        const bool releaseImportedWrapper =
+            nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None;
+        QRhiTexture *importedWrapper = releaseImportedWrapper ? rhiTexture : nullptr;
+
+        // QSGPlainTexture does not own the QRhiTexture wrapper in this provider.
+        // For Vulkan+GL imports, QRhiTexture::createFrom() also does not own the
+        // native GL object, so drop Qt's reference, delete the wrapper, then
+        // release the native import objects created by WRenderHelper.
         if (rhiTexture) {
             qtTexture.setTexture(nullptr);
             rhiTexture = nullptr;
         }
+        delete importedWrapper;
         WRenderHelper::releaseNativeTexture(&nativeCleanup);
 
         if (ownsTexture && texture)
