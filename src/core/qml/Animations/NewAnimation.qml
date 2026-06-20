@@ -44,12 +44,6 @@ Item {
         animation.start();
     }
 
-    function stop() {
-        animation.stop();
-        effect.sourceItem = null;
-        root.visible = false;
-    }
-
     Loader {
         active: root.enableBlur
         anchors.fill: parent
