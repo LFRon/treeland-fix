@@ -2105,6 +2105,11 @@ void SurfaceWrapper::setHasInitializeContainer(bool value)
         // m_prelaunchSplash can't get mapped signal
         createNewOrClose(OPEN_ANIMATION);
     }
+
+    if (!m_prelaunchSplash && value && surface() && surface()->mapped()
+        && !m_hasActiveCapability.testFlag(ActiveControlState::MappedOrSplash)) {
+        onMappedChanged();
+    }
 }
 
 void SurfaceWrapper::disableWindowAnimation(bool disable)
