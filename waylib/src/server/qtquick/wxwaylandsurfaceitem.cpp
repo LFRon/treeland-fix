@@ -185,6 +185,12 @@ QPointF WXWaylandSurfaceItem::implicitPosition() const
     return QPointF(epos) / ssr - QPointF(leftPadding(), topPadding());
 }
 
+void WXWaylandSurfaceItem::configureSurfaceGeometry(const QRect &geometry)
+{
+    Q_D(WXWaylandSurfaceItem);
+    d->configureSurface(geometry);
+}
+
 
 void WXWaylandSurfaceItem::onSurfaceCommit()
 {
