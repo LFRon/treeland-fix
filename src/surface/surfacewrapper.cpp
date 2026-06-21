@@ -393,8 +393,73 @@ void SurfaceWrapper::setup()
                 &WXWaylandSurfaceItem::implicitPositionChanged,
                 this,
                 [this, xwaylandSurfaceItem]() {
+                    const QPointF implicitPosition = xwaylandSurfaceItem->implicitPosition();
                     if (m_xwaylandPositionFromSurface)
-                        moveNormalGeometryInOutput(xwaylandSurfaceItem->implicitPosition());
+                        moveNormalGeometryInOutput(implicitPosition);
+                });
+
+        connect(xwaylandSurface,
+                &WXWaylandSurface::requestConfigure,
+                this,
+                [this, xwaylandSurface, xwaylandSurfaceItem](const QRect &,
+                                                             WXWaylandSurface::ConfigureFlags flags) {
+                    if (m_wrapperAboutToRemove || !m_surfaceItem || !xwaylandSurfaceItem
+                        || xwaylandSurface->isBypassManager())
+                        return;
+                    if (!flags.testAnyFlags(WXWaylandSurface::ConfigureFlag::XCB_CONFIG_WINDOW_SIZE))
+                        return;
+
+                    updateSurfaceSizeRatio();
+
+                    const QRect requestGeometry = xwaylandSurface->requestConfigureGeometry();
+                    const QSize requestedBufferSize = requestGeometry.size();
+                    if (!requestedBufferSize.isValid() || requestedBufferSize.isEmpty())
+                        return;
+                    const QSize currentBufferSize = xwaylandSurface->geometry().size();
+
+                    const qreal surfaceSizeRatio = xwaylandSurfaceItem->surfaceSizeRatio();
+                    if (surfaceSizeRatio <= 0.0)
+                        return;
+
+                    const QSizeF requestedSceneSize(
+                        requestedBufferSize.width() / surfaceSizeRatio
+                            + xwaylandSurfaceItem->leftPadding()
+                            + xwaylandSurfaceItem->rightPadding(),
+                        requestedBufferSize.height() / surfaceSizeRatio
+                            + xwaylandSurfaceItem->topPadding()
+                            + xwaylandSurfaceItem->bottomPadding());
+
+                    const bool sceneSizeUnchanged =
+                        qFuzzyCompare(width() + 1.0, requestedSceneSize.width() + 1.0)
+                        && qFuzzyCompare(height() + 1.0, requestedSceneSize.height() + 1.0);
+                    const bool surfaceSizeUnchanged = currentBufferSize == requestedBufferSize;
+                    if (sceneSizeUnchanged && surfaceSizeUnchanged)
+                        return;
+
+                    QRectF requestedNormalGeometry = normalGeometry();
+                    if (!requestedNormalGeometry.isValid() || requestedNormalGeometry.isEmpty())
+                        requestedNormalGeometry = QRectF(position(), size());
+                    requestedNormalGeometry.setSize(requestedSceneSize);
+
+                    setNormalGeometry(requestedNormalGeometry);
+                    if (isNormal()) {
+                        if (m_geometryAnimation)
+                            m_geometryAnimation->setProperty("toGeometry", requestedNormalGeometry);
+                        else {
+                            m_applyingXwaylandConfigureRequestSize = true;
+                            setSize(requestedSceneSize);
+                            m_applyingXwaylandConfigureRequestSize = false;
+
+                            if (!surfaceSizeUnchanged) {
+                                QRect configureGeometry = requestGeometry;
+                                if (!m_xwaylandPositionFromSurface)
+                                    configureGeometry.moveTopLeft(xwaylandSurface->geometry().topLeft());
+                                xwaylandSurfaceItem->configureSurfaceGeometry(configureGeometry);
+                            }
+                        }
+                    } else if (m_pendingState == State::Normal && m_geometryAnimation) {
+                        m_geometryAnimation->setProperty("toGeometry", requestedNormalGeometry);
+                    }
                 });
 
         connect(this, &QQuickItem::xChanged, xwaylandSurface, [this, xwaylandSurfaceItem]() {
@@ -1249,7 +1314,7 @@ void SurfaceWrapper::geometryChange(const QRectF &newGeo, const QRectF &oldGeome
         setNormalGeometry(newGeometry);
     }
 
-    if (widthValid() && heightValid()) {
+    if (widthValid() && heightValid() && !m_applyingXwaylandConfigureRequestSize) {
         resize(newGeometry.size());
     }
 
