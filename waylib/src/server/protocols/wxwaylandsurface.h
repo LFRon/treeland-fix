@@ -84,6 +84,7 @@ public:
     static WXWaylandSurface *fromSurface(WSurface *surface);
 
     WSurface *surface() const override;
+    WSurface *parentSurface() const override;
     QW_NAMESPACE::qw_xwayland_surface *handle() const;
     WXWaylandSurface *parentXWaylandSurface() const;
     WXWayland *xwayland() const;
