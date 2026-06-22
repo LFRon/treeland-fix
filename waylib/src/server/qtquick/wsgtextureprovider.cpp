@@ -34,6 +34,27 @@ public:
         cleanTexture();
     }
 
+    bool isVulkanRenderer() const {
+#ifdef ENABLE_VULKAN_RENDER
+        return window && window->renderer()
+            && wlr_renderer_is_vk(window->renderer()->handle());
+#else
+        return false;
+#endif
+    }
+
+    static void releaseDetachedTexture(qw_texture *texture, bool ownsTexture,
+                                       QRhiTexture *rhiTexture,
+                                       WRenderHelper::NativeTextureCleanup nativeCleanup)
+    {
+        if (nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None)
+            delete rhiTexture;
+        WRenderHelper::releaseNativeTexture(&nativeCleanup);
+
+        if (ownsTexture && texture)
+            delete texture;
+    }
+
     void cleanTexture() {
         const bool releaseImportedWrapper =
             nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None;
@@ -53,6 +74,36 @@ public:
         if (ownsTexture && texture)
             delete texture;
         texture = nullptr;
+    }
+
+    bool replaceTexture(qw_texture *newTexture, bool newOwnsTexture, qw_buffer *newBuffer) {
+        Q_ASSERT(newTexture);
+
+        WRenderHelper::NativeTextureCleanup newCleanup;
+        if (!WRenderHelper::makeTexture(window->rhi(), newTexture, &qtTexture,
+                                        newBuffer, &newCleanup)) {
+            WRenderHelper::releaseNativeTexture(&newCleanup);
+            qCWarning(lcWlQtQuickTexture) << "Failed to make texture:" << newTexture
+                                          << ", width height:" << newTexture->handle()->width
+                                          << newTexture->handle()->height;
+            if (newOwnsTexture)
+                delete newTexture;
+            return false;
+        }
+
+        auto oldTexture = texture;
+        const bool oldOwnsTexture = ownsTexture;
+        auto oldRhiTexture = rhiTexture;
+        auto oldNativeCleanup = nativeCleanup;
+
+        texture = newTexture;
+        ownsTexture = newOwnsTexture;
+        buffer = newBuffer;
+        rhiTexture = qtTexture.rhiTexture();
+        nativeCleanup = newCleanup;
+
+        releaseDetachedTexture(oldTexture, oldOwnsTexture, oldRhiTexture, oldNativeCleanup);
+        return true;
     }
 
     void updateRhiTexture() {
@@ -115,6 +166,35 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
     }
 
     W_D(WSGTextureProvider);
+    if (d->isVulkanRenderer()) {
+        if (!buffer) {
+            d->cleanTexture();
+            Q_EMIT textureChanged();
+            return;
+        }
+
+        bool ownsTexture = false;
+        qw_texture *texture = nullptr;
+        if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
+            texture = qw_texture::from(clientBuffer->handle()->texture);
+        } else {
+            texture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
+            ownsTexture = true;
+        }
+
+        if (Q_UNLIKELY(!texture)) {
+            qCWarning(lcWlQtQuickTexture) << "Failed to update texture from buffer:" << buffer
+                                        << ", width height:" << buffer->handle()->width
+                                        << buffer->handle()->height
+                                        << ", n_locks:" << buffer->handle()->n_locks;
+            return;
+        }
+
+        if (d->replaceTexture(texture, ownsTexture, buffer))
+            Q_EMIT textureChanged();
+        return;
+    }
+
     d->cleanTexture();
     d->buffer = buffer;
 
@@ -147,6 +227,18 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
 {
     W_D(WSGTextureProvider);
+    if (d->isVulkanRenderer()) {
+        if (!texture) {
+            d->cleanTexture();
+            Q_EMIT textureChanged();
+            return;
+        }
+
+        if (d->replaceTexture(texture, false, srcBuffer))
+            Q_EMIT textureChanged();
+        return;
+    }
+
     d->cleanTexture();
     d->texture = texture;
     d->buffer = srcBuffer;

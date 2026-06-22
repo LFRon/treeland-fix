@@ -178,14 +178,18 @@ static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC resolveGlEGLImageTargetTexture2DOES()
 void BufferData::destroyEglDmabufTexture()
 {
     if (glTexture) {
-        glDeleteTextures(1, &glTexture);
+        if (QOpenGLContext::currentContext()) {
+            GLuint texture = glTexture;
+            glDeleteTextures(1, &texture);
+        }
         glTexture = 0;
     }
-    if (eglImage != EGL_NO_IMAGE) {
+    if (eglImage != EGL_NO_IMAGE && eglDisplay != EGL_NO_DISPLAY) {
         if (auto destroyImage = resolveEglDestroyImageKHR())
             destroyImage(eglDisplay, eglImage);
         eglImage = EGL_NO_IMAGE;
     }
+    eglDisplay = EGL_NO_DISPLAY;
 }
 
 // Import a dmabuf as a GL texture via EGL, so Qt RHI (GL) can render into it
@@ -441,6 +445,10 @@ void WRenderHelperPrivate::onBufferDestroy()
             if (lastBuffer == data)
                 lastBuffer = nullptr;
             buffers.removeAt(i);
+#ifdef ENABLE_VULKAN_RENDER
+            if (renderer && wlr_renderer_is_vk(renderer->handle()))
+                delete data;
+#endif
             break;
         }
     }
