@@ -177,6 +177,17 @@ static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC resolveGlEGLImageTargetTexture2DOES()
     return proc;
 }
 
+static void clearGlErrors()
+{
+    while (glGetError() != GL_NO_ERROR) {
+    }
+}
+
+static bool textureUploadSucceeded()
+{
+    return glGetError() == GL_NO_ERROR;
+}
+
 Q_GLOBAL_STATIC(QMutex, s_pendingNativeTextureCleanupMutex)
 Q_GLOBAL_STATIC(QVector<WRenderHelper::NativeTextureCleanup>, s_pendingNativeTextureCleanups)
 
@@ -334,12 +345,25 @@ static bool eglImportDmabufToGLTexture(EGLDisplay display,
     }
 
     GLuint tex = 0;
+    clearGlErrors();
     glGenTextures(1, &tex);
+    if (!tex) {
+        if (auto destroyImage = resolveEglDestroyImageKHR())
+            destroyImage(display, image);
+        return false;
+    }
+
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
     glBindTexture(GL_TEXTURE_2D, 0);
+    if (!textureUploadSucceeded()) {
+        glDeleteTextures(1, &tex);
+        if (auto destroyImage = resolveEglDestroyImageKHR())
+            destroyImage(display, image);
+        return false;
+    }
 
     *outImage = image;
     *outTex = tex;
@@ -1433,7 +1457,11 @@ bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
             return false;
 
         GLuint glTex = 0;
+        clearGlErrors();
         glGenTextures(1, &glTex);
+        if (!glTex)
+            return false;
+
         glBindTexture(GL_TEXTURE_2D, glTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1444,6 +1472,10 @@ bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, size.width(), size.height(), 0,
                      GL_BGRA, GL_UNSIGNED_BYTE, pixels.constData());
         glBindTexture(GL_TEXTURE_2D, 0);
+        if (!textureUploadSucceeded()) {
+            glDeleteTextures(1, &glTex);
+            return false;
+        }
 
         texture->setTextureFromNativeTexture(rhi, glTex, 0, 0, size, {},
                                               QQuickWindowPrivate::TextureFromNativeTextureFlags{});

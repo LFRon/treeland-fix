@@ -200,6 +200,42 @@ public:
         return output()->output()->handle();
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    inline bool isVulkanRenderer() const {
+        return m_output && m_output->output() && m_output->output()->renderer()
+            && wlr_renderer_is_vk(m_output->output()->renderer()->handle());
+    }
+
+    inline bool shouldDeferVulkanRenderRetry() {
+        if (!isVulkanRenderer() || m_vulkanRenderRetryDelayFrames <= 0)
+            return false;
+
+        --m_vulkanRenderRetryDelayFrames;
+        scheduleFrame();
+        return true;
+    }
+
+    inline bool noteVulkanRenderFailed() {
+        if (!isVulkanRenderer())
+            return false;
+
+        m_vulkanRenderFailureBackoffFrames = m_vulkanRenderFailureBackoffFrames
+            ? qMin(m_vulkanRenderFailureBackoffFrames * 2, 4)
+            : 1;
+        m_vulkanRenderRetryDelayFrames = m_vulkanRenderFailureBackoffFrames;
+        scheduleFrame();
+        return true;
+    }
+
+    inline void noteVulkanRenderSucceeded() {
+        if (!isVulkanRenderer())
+            return;
+
+        m_vulkanRenderFailureBackoffFrames = 0;
+        m_vulkanRenderRetryDelayFrames = 0;
+    }
+#endif
+
     inline WOutputRenderWindow *renderWindow() const {
         return static_cast<WOutputRenderWindow*>(parent());
     }
@@ -269,6 +305,10 @@ private:
     BufferRendererProxy *m_cursorLayerProxy = nullptr;
     bool m_cursorDirty = false;
     bool m_hardwareCursorRenderComplete = false;
+#ifdef ENABLE_VULKAN_RENDER
+    int m_vulkanRenderFailureBackoffFrames = 0;
+    int m_vulkanRenderRetryDelayFrames = 0;
+#endif
 
     // for compositeLayers
     QPointer<WOutputViewport> m_output2;
@@ -1544,9 +1584,25 @@ WOutputRenderWindowPrivate::doRenderOutputs(qw_output *needsFrameOutput, const Q
         if (!helper->output()->depends().isEmpty())
             updateDirtyNodes();
 
+#ifdef ENABLE_VULKAN_RENDER
+        if (helper->shouldDeferVulkanRenderRetry())
+            continue;
+#endif
+
         qw_buffer *buffer = helper->beginRender(helper->bufferRenderer(), helper->output()->output()->size(), format,
                                                 WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject);
         Q_ASSERT(buffer == helper->bufferRenderer()->currentBuffer());
+        if (!buffer) {
+#ifdef ENABLE_VULKAN_RENDER
+            if (!helper->extraState() && helper->noteVulkanRenderFailed())
+                continue;
+#endif
+        }
+#ifdef ENABLE_VULKAN_RENDER
+        else {
+            helper->noteVulkanRenderSucceeded();
+        }
+#endif
         if (buffer) {
             helper->render(helper->bufferRenderer(), 0, renderMatrix,
                            helper->output()->effectiveSourceRect(),
@@ -1631,8 +1687,13 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     if (doCommit) {
         committedOutputs.reserve(needsCommit.size());
         for (auto i : std::as_const(needsCommit)) {
+            bool commitAttempted = false;
+            bool commitSucceeded = false;
+            const bool hadCurrentBuffer = i.second->currentBuffer();
             if (Q_UNLIKELY(!i.first->framePending())) {
-                if (Q_LIKELY(i.first->commit(i.second))) {
+                commitAttempted = true;
+                commitSucceeded = i.first->commit(i.second);
+                if (Q_LIKELY(commitSucceeded)) {
                     // Make sure the output is still valid after commit
                     auto output = i.first->output()->output();
                     if (Q_LIKELY(needsFrameOutput)) {
@@ -1645,11 +1706,17 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
                 }
             }
 
-            if (i.second->currentBuffer()) {
+            if (hadCurrentBuffer) {
                 i.second->endRender();
             }
 
             i.first->resetState();
+#ifdef ENABLE_VULKAN_RENDER
+            if (hadCurrentBuffer && commitAttempted && !commitSucceeded
+                && i.first->noteVulkanRenderFailed()) {
+                i.first->update();
+            }
+#endif
         }
     }
 

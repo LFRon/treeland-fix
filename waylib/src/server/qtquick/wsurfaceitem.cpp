@@ -223,6 +223,10 @@ public:
             surface = nullptr;
         }
         textureDirty = true;
+#ifdef ENABLE_VULKAN_RENDER
+        textureRetryBackoffFrames = 0;
+        textureRetryDelayFrames = 0;
+#endif
 
         if (frameDoneConnection)
             QObject::disconnect(frameDoneConnection);
@@ -333,6 +337,37 @@ public:
         q->setImplicitSize(s.width(), s.height());
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    inline bool isVulkanRenderer() const {
+        auto rw = qobject_cast<WOutputRenderWindow *>(window);
+        return rw && rw->renderer() && wlr_renderer_is_vk(rw->renderer()->handle());
+    }
+
+    inline bool shouldDeferTextureRetry(bool hasCachedTexture) {
+        if (!hasCachedTexture || !isVulkanRenderer() || textureRetryDelayFrames <= 0)
+            return false;
+
+        --textureRetryDelayFrames;
+        return true;
+    }
+
+    inline void noteTextureUpdateResult(bool ok) {
+        if (!isVulkanRenderer())
+            return;
+
+        if (ok) {
+            textureRetryBackoffFrames = 0;
+            textureRetryDelayFrames = 0;
+            return;
+        }
+
+        textureRetryBackoffFrames = textureRetryBackoffFrames
+            ? qMin(textureRetryBackoffFrames * 2, 4)
+            : 1;
+        textureRetryDelayFrames = textureRetryBackoffFrames;
+    }
+#endif
+
     inline void swapBufferIfNeeded() {
         if (pendingBuffer) {
             buffer = std::move(pendingBuffer);
@@ -377,6 +412,10 @@ public:
     bool ignoreBufferOffset = false;
     bool lastRendered = false;
     QAtomicInteger<bool> rendered = false;
+#ifdef ENABLE_VULKAN_RENDER
+    int textureRetryBackoffFrames = 0;
+    int textureRetryDelayFrames = 0;
+#endif
 };
 
 
@@ -516,6 +555,10 @@ void WSurfaceItemContent::setLive(bool live)
     if (live) {
         d->swapBufferIfNeeded();
         d->textureDirty = true;
+#ifdef ENABLE_VULKAN_RENDER
+        d->textureRetryBackoffFrames = 0;
+        d->textureRetryDelayFrames = 0;
+#endif
         update();
     }
     Q_EMIT liveChanged();
@@ -602,7 +645,12 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     W_D(WSurfaceItemContent);
 
     auto tp = wTextureProvider();
-    if ((d->live && d->textureDirty) || !tp->texture()) {
+    const bool hasCachedTexture = tp->texture();
+    if (((d->live && d->textureDirty) || !hasCachedTexture)
+#ifdef ENABLE_VULKAN_RENDER
+        && !d->shouldDeferTextureRetry(hasCachedTexture)
+#endif
+    ) {
         auto texture = d->surface ? d->surface->handle()->get_texture() : nullptr;
         bool textureUpdated = false;
         if (texture) {
@@ -610,8 +658,12 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
         } else {
             textureUpdated = tp->setBuffer(d->buffer.get());
         }
-        if (textureUpdated)
+#ifdef ENABLE_VULKAN_RENDER
+        d->noteTextureUpdateResult(textureUpdated);
+#endif
+        if (textureUpdated) {
             d->textureDirty = false;
+        }
     }
 
     if (!tp->texture() || width() <= 0 || height() <= 0) {
