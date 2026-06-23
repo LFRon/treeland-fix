@@ -604,12 +604,14 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     auto tp = wTextureProvider();
     if ((d->live && d->textureDirty) || !tp->texture()) {
         auto texture = d->surface ? d->surface->handle()->get_texture() : nullptr;
+        bool textureUpdated = false;
         if (texture) {
-            tp->setTexture(qw_texture::from(texture), d->buffer.get());
+            textureUpdated = tp->setTexture(qw_texture::from(texture), d->buffer.get());
         } else {
-            tp->setBuffer(d->buffer.get());
+            textureUpdated = tp->setBuffer(d->buffer.get());
         }
-        d->textureDirty = false;
+        if (textureUpdated)
+            d->textureDirty = false;
     }
 
     if (!tp->texture() || width() <= 0 || height() <= 0) {

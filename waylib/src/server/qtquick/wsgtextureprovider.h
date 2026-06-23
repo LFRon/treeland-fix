@@ -27,8 +27,8 @@ public:
 
     WOutputRenderWindow *window() const;
 
-    void setBuffer(QW_NAMESPACE::qw_buffer *buffer);
-    void setTexture(QW_NAMESPACE::qw_texture *texture, QW_NAMESPACE::qw_buffer *srcBuffer);
+    bool setBuffer(QW_NAMESPACE::qw_buffer *buffer);
+    bool setTexture(QW_NAMESPACE::qw_texture *texture, QW_NAMESPACE::qw_buffer *srcBuffer);
     void invalidate();
 
     QSGTexture *texture() const override;

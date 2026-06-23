@@ -21,6 +21,8 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QOpenGLContext>
 
 #include <QSGTexture>
@@ -175,20 +177,87 @@ static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC resolveGlEGLImageTargetTexture2DOES()
     return proc;
 }
 
-void BufferData::destroyEglDmabufTexture()
+Q_GLOBAL_STATIC(QMutex, s_pendingNativeTextureCleanupMutex)
+Q_GLOBAL_STATIC(QVector<WRenderHelper::NativeTextureCleanup>, s_pendingNativeTextureCleanups)
+
+static bool releaseNativeTextureNow(WRenderHelper::NativeTextureCleanup *cleanup)
 {
-    if (glTexture) {
-        if (QOpenGLContext::currentContext()) {
-            GLuint texture = glTexture;
+    if (!cleanup || cleanup->type == WRenderHelper::NativeTextureCleanup::Type::None)
+        return true;
+
+    if (cleanup->type == WRenderHelper::NativeTextureCleanup::Type::OpenGLTexture) {
+        if (!cleanup->texture && !cleanup->eglImage) {
+            *cleanup = {};
+            return true;
+        }
+
+        if (!QOpenGLContext::currentContext())
+            return false;
+
+        if (cleanup->texture) {
+            GLuint texture = GLuint(cleanup->texture);
             glDeleteTextures(1, &texture);
         }
-        glTexture = 0;
+
+        if (cleanup->eglImage && cleanup->eglDisplay) {
+            if (auto destroyImage = resolveEglDestroyImageKHR())
+                destroyImage(reinterpret_cast<EGLDisplay>(cleanup->eglDisplay),
+                             reinterpret_cast<EGLImage>(cleanup->eglImage));
+        }
     }
-    if (eglImage != EGL_NO_IMAGE && eglDisplay != EGL_NO_DISPLAY) {
-        if (auto destroyImage = resolveEglDestroyImageKHR())
-            destroyImage(eglDisplay, eglImage);
-        eglImage = EGL_NO_IMAGE;
+
+    *cleanup = {};
+    return true;
+}
+
+static void queueNativeTextureCleanup(WRenderHelper::NativeTextureCleanup *cleanup)
+{
+    if (!cleanup || cleanup->type == WRenderHelper::NativeTextureCleanup::Type::None)
+        return;
+
+    QMutexLocker locker(s_pendingNativeTextureCleanupMutex());
+    s_pendingNativeTextureCleanups->append(*cleanup);
+    *cleanup = {};
+}
+
+static void flushPendingNativeTextureCleanups()
+{
+    if (!QOpenGLContext::currentContext())
+        return;
+
+    QVector<WRenderHelper::NativeTextureCleanup> pending;
+    {
+        QMutexLocker locker(s_pendingNativeTextureCleanupMutex());
+        if (s_pendingNativeTextureCleanups->isEmpty())
+            return;
+        pending.swap(*s_pendingNativeTextureCleanups);
     }
+
+    QVector<WRenderHelper::NativeTextureCleanup> remaining;
+    for (auto &cleanup : pending) {
+        if (!releaseNativeTextureNow(&cleanup))
+            remaining.append(cleanup);
+    }
+
+    if (!remaining.isEmpty()) {
+        QMutexLocker locker(s_pendingNativeTextureCleanupMutex());
+        *s_pendingNativeTextureCleanups += remaining;
+    }
+}
+
+void BufferData::destroyEglDmabufTexture()
+{
+    WRenderHelper::NativeTextureCleanup cleanup {
+        glTexture || eglImage != EGL_NO_IMAGE
+            ? WRenderHelper::NativeTextureCleanup::Type::OpenGLTexture
+            : WRenderHelper::NativeTextureCleanup::Type::None,
+        glTexture,
+        eglImage != EGL_NO_IMAGE ? reinterpret_cast<void *>(eglImage) : nullptr,
+        eglDisplay != EGL_NO_DISPLAY ? reinterpret_cast<void *>(eglDisplay) : nullptr,
+    };
+    WRenderHelper::releaseNativeTexture(&cleanup);
+    glTexture = 0;
+    eglImage = EGL_NO_IMAGE;
     eglDisplay = EGL_NO_DISPLAY;
 }
 
@@ -203,6 +272,8 @@ static bool eglImportDmabufToGLTexture(EGLDisplay display,
                                        const wlr_dmabuf_attributes *attribs,
                                        EGLImage *outImage, GLuint *outTex)
 {
+    flushPendingNativeTextureCleanups();
+
     auto eglCreateImageKHR = resolveEglCreateImageKHR();
     auto glEGLImageTargetTexture2DOES = resolveGlEGLImageTargetTexture2DOES();
     if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES) {
@@ -283,21 +354,11 @@ void WRenderHelper::releaseNativeTexture(NativeTextureCleanup *cleanup)
 
 #ifdef ENABLE_VULKAN_RENDER
     if (cleanup->type == NativeTextureCleanup::Type::OpenGLTexture) {
-        if (!QOpenGLContext::currentContext()) {
-            *cleanup = {};
-            return;
-        }
-
-        if (cleanup->texture) {
-            GLuint texture = GLuint(cleanup->texture);
-            glDeleteTextures(1, &texture);
-        }
-
-        if (cleanup->eglImage) {
-            if (auto destroyImage = resolveEglDestroyImageKHR())
-                destroyImage(reinterpret_cast<EGLDisplay>(cleanup->eglDisplay),
-                             reinterpret_cast<EGLImage>(cleanup->eglImage));
-        }
+        if (QOpenGLContext::currentContext())
+            flushPendingNativeTextureCleanups();
+        if (!releaseNativeTextureNow(cleanup))
+            queueNativeTextureCleanup(cleanup);
+        return;
     }
 #endif
 

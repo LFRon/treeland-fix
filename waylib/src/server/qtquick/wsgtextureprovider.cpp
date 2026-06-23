@@ -155,14 +155,14 @@ WOutputRenderWindow *WSGTextureProvider::window() const
     return d->window;
 }
 
-void WSGTextureProvider::setBuffer(qw_buffer *buffer)
+bool WSGTextureProvider::setBuffer(qw_buffer *buffer)
 {
     if (buffer == qwBuffer()) {
         // The buffer object is not changed, but maybe the buffer's content is changed.
         // So should emit textureChanged() signal too.
         if (buffer)
             Q_EMIT textureChanged();
-        return;
+        return true;
     }
 
     W_D(WSGTextureProvider);
@@ -170,7 +170,7 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
         if (!buffer) {
             d->cleanTexture();
             Q_EMIT textureChanged();
-            return;
+            return true;
         }
 
         bool ownsTexture = false;
@@ -187,12 +187,14 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
                                         << ", width height:" << buffer->handle()->width
                                         << buffer->handle()->height
                                         << ", n_locks:" << buffer->handle()->n_locks;
-            return;
+            return false;
         }
 
-        if (d->replaceTexture(texture, ownsTexture, buffer))
+        if (d->replaceTexture(texture, ownsTexture, buffer)) {
             Q_EMIT textureChanged();
-        return;
+            return true;
+        }
+        return false;
     }
 
     d->cleanTexture();
@@ -222,21 +224,24 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
     }
 
     Q_EMIT textureChanged();
+    return true;
 }
 
-void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
+bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
 {
     W_D(WSGTextureProvider);
     if (d->isVulkanRenderer()) {
         if (!texture) {
             d->cleanTexture();
             Q_EMIT textureChanged();
-            return;
+            return true;
         }
 
-        if (d->replaceTexture(texture, false, srcBuffer))
+        if (d->replaceTexture(texture, false, srcBuffer)) {
             Q_EMIT textureChanged();
-        return;
+            return true;
+        }
+        return false;
     }
 
     d->cleanTexture();
@@ -247,6 +252,7 @@ void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
         d->updateRhiTexture();
 
     Q_EMIT textureChanged();
+    return true;
 }
 
 void WSGTextureProvider::invalidate()
