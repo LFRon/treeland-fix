@@ -13,6 +13,15 @@
 #include "wsurfaceitem_p.h"
 #include "wayliblogging.h"
 
+#ifdef ENABLE_VULKAN_RENDER
+#include "private/wvulkansurfacerendernode_p.h"
+
+extern "C" {
+#include <wlr/render/dmabuf.h>
+#include <wlr/types/wlr_linux_drm_syncobj_v1.h>
+}
+#endif
+
 #include <private/qquickitem_p.h>
 
 #include <qwalphamodifierv1.h>
@@ -23,14 +32,30 @@
 #include <qwsubcompositor.h>
 #include <qwtexture.h>
 
+#include <QByteArray>
 #include <QPointer>
 #include <QQueue>
 #include <QQuickWindow>
 #include <QSGImageNode>
 #include <QSGRenderNode>
 
+#include <memory>
+
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+#ifdef ENABLE_VULKAN_RENDER
+static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer);
+
+static bool bufferHasDmabuf(qw_buffer *buffer)
+{
+    if (!buffer || !buffer->handle())
+        return false;
+
+    wlr_dmabuf_attributes dmabuf = {};
+    return wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf);
+}
+#endif
 
 class Q_DECL_HIDDEN SubsurfaceContainer : public QQuickItem
 {
@@ -215,6 +240,10 @@ public:
 
     void invalidate() {
         W_Q(WSurfaceItemContent);
+#ifdef ENABLE_VULKAN_RENDER
+        if (auto rw = qobject_cast<WOutputRenderWindow *>(q->window()))
+            rw->removeVulkanDirectSurfaceLayer(q);
+#endif
         if (surface) {
             surface->safeDisconnect(q);
             if (textureProvider) {
@@ -222,6 +251,11 @@ public:
             }
             surface = nullptr;
         }
+        textureDirty = true;
+#ifdef ENABLE_VULKAN_RENDER
+        textureRetryBackoffFrames = 0;
+        textureRetryDelayFrames = 0;
+#endif
 
         if (frameDoneConnection)
             QObject::disconnect(frameDoneConnection);
@@ -251,8 +285,12 @@ public:
             const bool bufferChanged = committedState & WLR_SURFACE_STATE_BUFFER;
 
             if (bufferChanged) {
+                textureDirty = true;
                 // Get the new buffer pointer from surface
                 auto newBuffer = surface->buffer();
+#ifdef ENABLE_VULKAN_RENDER
+                registerSurfaceBufferExplicitRelease(surface.data(), newBuffer);
+#endif
 
                 if (!live) {
                     // Non-live mode: defer to pendingBuffer
@@ -331,9 +369,42 @@ public:
         q->setImplicitSize(s.width(), s.height());
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    inline bool isVulkanRenderer() const {
+        auto rw = qobject_cast<WOutputRenderWindow *>(window);
+        return rw && rw->renderer() && wlr_renderer_is_vk(rw->renderer()->handle());
+    }
+
+    inline bool shouldDeferTextureRetry(bool hasCachedTexture) {
+        if (!hasCachedTexture || !isVulkanRenderer() || textureRetryDelayFrames <= 0)
+            return false;
+
+        --textureRetryDelayFrames;
+        return true;
+    }
+
+    inline void noteTextureUpdateResult(bool ok) {
+        if (!isVulkanRenderer())
+            return;
+
+        if (ok) {
+            textureRetryBackoffFrames = 0;
+            textureRetryDelayFrames = 0;
+            return;
+        }
+
+        textureRetryBackoffFrames = textureRetryBackoffFrames
+            ? qMin(textureRetryBackoffFrames * 2, 4)
+            : 1;
+        textureRetryDelayFrames = textureRetryBackoffFrames;
+    }
+#endif
+
     inline void swapBufferIfNeeded() {
-        if (pendingBuffer)
+        if (pendingBuffer) {
             buffer = std::move(pendingBuffer);
+            textureDirty = true;
+        }
     }
 
     inline void setDevicePixelRatio(qreal dpr) {
@@ -369,9 +440,14 @@ public:
     mutable QMetaObject::Connection updateTextureConnection;
     bool dontCacheLastBuffer = false;
     bool live = true;
+    mutable bool textureDirty = true;
     bool ignoreBufferOffset = false;
     bool lastRendered = false;
     QAtomicInteger<bool> rendered = false;
+#ifdef ENABLE_VULKAN_RENDER
+    int textureRetryBackoffFrames = 0;
+    int textureRetryDelayFrames = 0;
+#endif
 };
 
 
@@ -459,16 +535,37 @@ WSGTextureProvider *WSurfaceItemContent::wTextureProvider() const
 
     if (!d->textureProvider) {
         d->textureProvider = new WSGTextureProvider(w);
+        d->textureProvider->setDirectBufferImportAllowed(true);
         d->textureProvider->setSmooth(smooth());
         connect(this, &WSurfaceItemContent::smoothChanged,
                 d->textureProvider, &WSGTextureProvider::setSmooth);
 
         if (d->surface) {
-            if (auto texture = d->surface->handle()->get_texture()) {
-                d->textureProvider->setTexture(qw_texture::from(texture), d->buffer.get());
-            } else {
-                d->textureProvider->setBuffer(d->buffer.get());
+            bool textureUpdated = false;
+            wlr_surface *surfaceHandle = d->surface->handle()
+                ? d->surface->handle()->handle()
+                : nullptr;
+#ifdef ENABLE_VULKAN_RENDER
+            if (WSGTextureProvider::prefersDirectBufferImport(w)) {
+                textureUpdated = d->textureProvider->setBuffer(d->buffer.get(), surfaceHandle);
+                qCDebug(lcWlSurface)
+                    << "Initialized surface texture provider through preferred direct client dmabuf path"
+                    << "surface" << d->surface
+                    << "buffer" << d->buffer.get()
+                    << "updated" << textureUpdated;
             }
+#endif
+            if (!textureUpdated) {
+                if (auto texture = d->surface->handle()->get_texture()) {
+                    textureUpdated = d->textureProvider->setTexture(qw_texture::from(texture),
+                                                                    d->buffer.get(),
+                                                                    surfaceHandle);
+                } else {
+                    textureUpdated = d->textureProvider->setBuffer(d->buffer.get(), surfaceHandle);
+                }
+            }
+            if (textureUpdated && d->textureProvider->texture())
+                d->textureDirty = false;
         }
     }
     return d->textureProvider;
@@ -508,6 +605,11 @@ void WSurfaceItemContent::setLive(bool live)
     d->live = live;
     if (live) {
         d->swapBufferIfNeeded();
+        d->textureDirty = true;
+#ifdef ENABLE_VULKAN_RENDER
+        d->textureRetryBackoffFrames = 0;
+        d->textureRetryDelayFrames = 0;
+#endif
         update();
     }
     Q_EMIT liveChanged();
@@ -566,11 +668,13 @@ qreal WSurfaceItemContent::alphaModifier() const
 class Q_DECL_HIDDEN WSGRenderFootprintNode: public QSGRenderNode
 {
 public:
-    WSGRenderFootprintNode(WSurfaceItemContent *owner)
+    WSGRenderFootprintNode(WSurfaceItemContent *owner, bool opaque = true, bool ownedByParent = true)
         : QSGRenderNode()
         , m_owner(owner)
+        , m_opaque(opaque)
     {
-        setFlag(QSGNode::OwnedByParent); // parent is fixed, auto release
+        if (ownedByParent)
+            setFlag(QSGNode::OwnedByParent); // parent is fixed, auto release
     }
 
     ~WSGRenderFootprintNode() {}
@@ -581,38 +685,273 @@ public:
             m_owner->d_func()->rendered = true;
     }
 
+    QRectF rect() const override
+    {
+        return m_rect;
+    }
+
+    void setRect(const QRectF &rect)
+    {
+        if (m_rect == rect)
+            return;
+
+        m_rect = rect;
+        markDirty(QSGNode::DirtyGeometry);
+    }
+
     RenderingFlags flags() const override
     {
-        return NoExternalRendering | BoundedRectRendering | DepthAwareRendering | OpaqueRendering;
+        RenderingFlags result = NoExternalRendering | BoundedRectRendering | DepthAwareRendering;
+        if (m_opaque)
+            result |= OpaqueRendering;
+        return result;
     }
 
     QPointer<WSurfaceItemContent> m_owner;
+    QRectF m_rect;
+    bool m_opaque = true;
 };
+
+static WSurfaceItem *findOwningSurfaceItem(QQuickItem *item)
+{
+    for (auto node = item; node; node = node->parentItem()) {
+        if (auto surfaceItem = qobject_cast<WSurfaceItem *>(node))
+            return surfaceItem;
+    }
+
+    return nullptr;
+}
+
+#ifdef ENABLE_VULKAN_RENDER
+static bool envFlagExplicitlyDisabledForVulkanSurfaceNode(const char *name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return value == "0" || value == "false" || value == "no" || value == "off";
+}
+
+static bool vulkanSurfaceRenderNodeEnabled(WOutputRenderWindow *window)
+{
+    static const bool enabled =
+        !envFlagExplicitlyDisabledForVulkanSurfaceNode("WAYLIB_VK_SURFACE_RENDER_NODE")
+        && !envFlagExplicitlyDisabledForVulkanSurfaceNode("TREELAND_VK_SURFACE_RENDER_NODE");
+    if (!enabled || !window || !window->renderer() || !window->rhi())
+        return false;
+
+    return window->rhi()->backend() == QRhi::Vulkan
+        && wlr_renderer_is_vk(window->renderer()->handle());
+}
+
+static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer)
+{
+    if (!surface || !surface->handle() || !surface->handle()->handle()
+        || !buffer || !buffer->handle()) {
+        return;
+    }
+
+    auto *syncState =
+        wlr_linux_drm_syncobj_v1_get_surface_state(surface->handle()->handle());
+    if (!syncState || !syncState->release_timeline)
+        return;
+
+    auto *wlrBuffer = buffer->handle();
+    if (wlrBuffer->n_locks == 0) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan surface explicit release skipped: buffer has no locks"
+            << "surface" << surface
+            << "buffer" << buffer;
+        return;
+    }
+
+    if (!wlr_linux_drm_syncobj_v1_state_signal_release_with_buffer(syncState, wlrBuffer)) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan surface explicit release registration failed"
+            << "surface" << surface
+            << "buffer" << buffer
+            << "releasePoint" << syncState->release_point;
+        return;
+    }
+
+    qCDebug(lcWlVulkanCompositor)
+        << "Vulkan surface explicit release registered"
+        << "surface" << surface
+        << "buffer" << buffer
+        << "releasePoint" << syncState->release_point;
+}
+#endif
 
 QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
     W_D(WSurfaceItemContent);
 
+    const QRectF targetGeometry(d->ignoreBufferOffset ? QPointF() : d->bufferOffset, size());
+#ifdef ENABLE_VULKAN_RENDER
+    WSurfaceItem *owningSurfaceItem = findOwningSurfaceItem(this);
+    if (auto rw = outputRenderWindow();
+        vulkanSurfaceRenderNodeEnabled(rw)
+        && owningSurfaceItem
+        && owningSurfaceItem->vulkanDirectSurfaceAllowed()
+        && d->buffer.get()
+        && bufferHasDmabuf(d->buffer.get())
+        && width() > 0
+        && height() > 0) {
+        wlr_surface *surfaceHandle = nullptr;
+        uint32_t surfaceCommitSeq = 0;
+        if (d->surface && d->surface->handle()) {
+            surfaceHandle = d->surface->handle()->handle();
+            if (surfaceHandle)
+                surfaceCommitSeq = surfaceHandle->current.seq;
+        }
+
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan surface render node candidate"
+            << "surface" << d->surface
+            << "surfaceHandle" << surfaceHandle
+            << "buffer" << d->buffer.get()
+            << "surfaceCommitSeq" << surfaceCommitSeq
+            << "targetGeometry" << targetGeometry
+            << "sourceRect" << d->bufferSourceBox
+            << "devicePixelRatio" << d->devicePixelRatio
+            << "smooth" << smooth()
+            << "live" << d->live
+            << "textureDirty" << d->textureDirty
+            << "cachedTexture" << (d->textureProvider && d->textureProvider->texture())
+            << "surfaceSize" << (surfaceHandle
+                                  ? QSize(surfaceHandle->current.width,
+                                          surfaceHandle->current.height)
+                                  : QSize());
+
+        auto existingNode = dynamic_cast<WVulkanSurfaceRenderNode *>(oldNode);
+        std::unique_ptr<WVulkanSurfaceRenderNode> candidate;
+        WVulkanSurfaceRenderNode *node = existingNode;
+        if (!node) {
+            candidate = std::make_unique<WVulkanSurfaceRenderNode>(window());
+            node = candidate.get();
+        }
+
+        node->setGeometry(targetGeometry, d->bufferSourceBox, d->devicePixelRatio);
+        node->setSmooth(smooth());
+        if (node->setBuffer(d->buffer.get(), surfaceHandle, surfaceCommitSeq)) {
+            d->rendered = true;
+            d->textureDirty = false;
+            if (candidate) {
+                delete oldNode;
+                return candidate.release();
+            }
+            return node;
+        }
+
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan surface render node import failed; falling back to texture provider"
+            << "surface" << d->surface
+            << "buffer" << d->buffer.get()
+            << "surfaceCommitSeq" << surfaceCommitSeq
+            << "targetGeometry" << targetGeometry
+            << "sourceRect" << d->bufferSourceBox;
+
+        if (existingNode) {
+            delete oldNode;
+            oldNode = nullptr;
+        }
+    }
+
+    bool hideQtContentForVulkanDirectSurface = false;
+    if (auto rw = outputRenderWindow()) {
+        hideQtContentForVulkanDirectSurface =
+            rw->updateVulkanDirectSurfaceLayer(this,
+                                               d->surface,
+                                               d->buffer.get(),
+                                               targetGeometry,
+                                               d->bufferSourceBox,
+                                               d->devicePixelRatio,
+                                               d->live,
+                                               !d->dontCacheLastBuffer,
+                                               owningSurfaceItem);
+    }
+    if (hideQtContentForVulkanDirectSurface) {
+        d->rendered = true;
+
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan direct surface requested Qt content footprint only"
+            << "surface" << d->surface
+            << "buffer" << d->buffer.get()
+            << "targetGeometry" << targetGeometry
+            << "sourceRect" << d->bufferSourceBox
+            << "devicePixelRatio" << d->devicePixelRatio;
+
+        auto footprintNode = dynamic_cast<WSGRenderFootprintNode *>(oldNode);
+        if (!footprintNode) {
+            delete oldNode;
+            footprintNode = new WSGRenderFootprintNode(this, false, false);
+        }
+        footprintNode->setRect(targetGeometry);
+        return footprintNode;
+    }
+#endif
+
     auto tp = wTextureProvider();
-    if (d->live || !tp->texture()) {
-        auto texture = d->surface ? d->surface->handle()->get_texture() : nullptr;
+    wlr_surface *surfaceHandle = d->surface && d->surface->handle()
+        ? d->surface->handle()->handle()
+        : nullptr;
+    const bool hasCachedTexture = tp->texture();
+    if (((d->live && d->textureDirty) || !hasCachedTexture)
+#ifdef ENABLE_VULKAN_RENDER
+        && !d->shouldDeferTextureRetry(hasCachedTexture)
+#endif
+    ) {
+        bool textureUpdated = false;
+#ifdef ENABLE_VULKAN_RENDER
+        if (WSGTextureProvider::prefersDirectBufferImport(tp->window())) {
+            textureUpdated = tp->setBuffer(d->buffer.get(), surfaceHandle);
+            qCDebug(lcWlSurface)
+                << "Updated surface texture through preferred direct client dmabuf path"
+                << "surface" << d->surface
+                << "buffer" << d->buffer.get()
+                << "updated" << textureUpdated;
+        }
+#endif
+        auto texture = !textureUpdated && d->surface ? d->surface->handle()->get_texture() : nullptr;
         if (texture) {
-            tp->setTexture(qw_texture::from(texture), d->buffer.get());
-        } else {
-            tp->setBuffer(d->buffer.get());
+            textureUpdated = tp->setTexture(qw_texture::from(texture), d->buffer.get(), surfaceHandle);
+        } else if (!textureUpdated) {
+            textureUpdated = tp->setBuffer(d->buffer.get(), surfaceHandle);
+        }
+#ifdef ENABLE_VULKAN_RENDER
+        d->noteTextureUpdateResult(textureUpdated);
+#endif
+        if (textureUpdated) {
+            d->textureDirty = false;
         }
     }
 
     if (!tp->texture() || width() <= 0 || height() <= 0) {
+#ifdef ENABLE_VULKAN_RENDER
+        if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
+            qCDebug(lcWlSurface)
+                << "Surface texture node skipped"
+                << "surfacePtr" << quintptr(d->surface.data())
+                << "bufferPtr" << quintptr(d->buffer.get())
+                << "hasTexture" << bool(tp->texture())
+                << "itemSize" << size()
+                << "targetRect" << targetGeometry
+                << "sourceRect" << d->bufferSourceBox
+                << "sourceRectValid" << d->bufferSourceBox.isValid()
+                << "live" << d->live
+                << "textureDirty" << d->textureDirty
+                << "visible" << isVisible()
+                << "opacity" << opacity();
+        }
+#endif
         delete oldNode;
         return nullptr;
     }
 
-    auto node = static_cast<QSGImageNode*>(oldNode);
+    auto node = dynamic_cast<QSGImageNode *>(oldNode);
     if (Q_UNLIKELY(!node)) {
+        delete oldNode;
         node = window()->createImageNode();
         node->setOwnsTexture(false);
         QSGNode *fpnode = new WSGRenderFootprintNode(this);
+        static_cast<WSGRenderFootprintNode *>(fpnode)->setRect(targetGeometry);
         node->appendChildNode(fpnode);
     }
 
@@ -620,9 +959,31 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     node->setTexture(texture);
     const QRectF textureGeometry = d->bufferSourceBox;
     node->setSourceRect(textureGeometry);
-    const QRectF targetGeometry(d->ignoreBufferOffset ? QPointF() : d->bufferOffset, size());
     node->setRect(targetGeometry);
     node->setFiltering(smooth() ? QSGTexture::Linear : QSGTexture::Nearest);
+
+#ifdef ENABLE_VULKAN_RENDER
+    if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
+        qCDebug(lcWlSurface)
+            << "Surface texture node updated"
+            << "surfacePtr" << quintptr(d->surface.data())
+            << "bufferPtr" << quintptr(d->buffer.get())
+            << "texturePtr" << quintptr(texture)
+            << "textureSize" << texture->textureSize()
+            << "textureHasAlpha" << texture->hasAlphaChannel()
+            << "itemSize" << size()
+            << "targetRect" << targetGeometry
+            << "targetRectValid" << targetGeometry.isValid()
+            << "sourceRect" << textureGeometry
+            << "sourceRectValid" << textureGeometry.isValid()
+            << "devicePixelRatio" << d->devicePixelRatio
+            << "live" << d->live
+            << "textureDirty" << d->textureDirty
+            << "smooth" << smooth()
+            << "visible" << isVisible()
+            << "opacity" << opacity();
+    }
+#endif
 
     return node;
 }
@@ -1656,6 +2017,25 @@ bool WSurfaceItem::isReady() const
 {
     Q_D(const WSurfaceItem);
     return d->ready;
+}
+
+bool WSurfaceItem::vulkanDirectSurfaceAllowed() const
+{
+    Q_D(const WSurfaceItem);
+    return d->vulkanDirectSurfaceAllowed;
+}
+
+void WSurfaceItem::setVulkanDirectSurfaceAllowed(bool allowed)
+{
+    Q_D(WSurfaceItem);
+    if (d->vulkanDirectSurfaceAllowed == allowed)
+        return;
+
+    d->vulkanDirectSurfaceAllowed = allowed;
+    Q_EMIT vulkanDirectSurfaceAllowedChanged();
+
+    if (auto content = findItemContent())
+        content->update();
 }
 
 WSurfaceItemContent *WSurfaceItem::findItemContent() const

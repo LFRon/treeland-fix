@@ -12,6 +12,9 @@ extern "C" {
 #include <wlr/render/pass.h>
 #undef static
 #include <wlr/util/box.h>
+#if WLR_HAVE_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 }
 
 struct wlr_renderer;
@@ -37,6 +40,14 @@ public:
     QW_FUNC_MEMBER(renderer, init_wl_shm, bool, wl_display *wl_display)
     QW_FUNC_MEMBER(renderer, get_drm_fd, int)
     QW_FUNC_MEMBER(renderer, get_texture_formats, const wlr_drm_format_set *, uint32_t buffer_caps)
+#if WLR_HAVE_VULKAN_RENDERER
+    // Access the wlroots-adopted Vulkan device handles. Used by compositors
+    // (e.g. waylib) that adopt the wlroots VkDevice into Qt RHI.
+    QW_FUNC_MEMBER(vk_renderer, get_instance, VkInstance)
+    QW_FUNC_MEMBER(vk_renderer, get_physical_device, VkPhysicalDevice)
+    QW_FUNC_MEMBER(vk_renderer, get_device, VkDevice)
+    QW_FUNC_MEMBER(vk_renderer, get_queue_family, uint32_t)
+#endif
 
 protected:
     QW_FUNC_MEMBER(renderer, destroy, void)

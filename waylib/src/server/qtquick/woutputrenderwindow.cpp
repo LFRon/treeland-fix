@@ -11,6 +11,10 @@
 #include "wqmlhelper_p.h"
 #include "woutputlayer.h"
 #include "wbufferrenderer_p.h"
+#include "wsurfaceitem.h"
+#include "wxdgpopupsurfaceitem.h"
+#include "wxdgtoplevelsurfaceitem.h"
+#include "wxwaylandsurfaceitem.h"
 #include "wquicktextureproxy.h"
 #include "weventjunkman.h"
 #include "winputdevice.h"
@@ -39,6 +43,9 @@
 #include <QQuickRenderControl>
 #include <QOpenGLFunctions>
 #include <QRunnable>
+#include <QHash>
+#include <QStringList>
+#include <algorithm>
 #include <memory>
 
 #include <private/qsgrenderer_p.h>
@@ -62,8 +69,22 @@
 extern "C" {
 #ifdef ENABLE_VULKAN_RENDER
 #include <wlr/render/vulkan.h>
+#include <wlr/render/pass.h>
+#include <wlr/render/dmabuf.h>
+#include <wlr/types/wlr_buffer.h>
 #endif
 #include <wlr/render/gles2.h>
+#include <wlr/render/egl.h>
+
+// wlr_egl_create_with_drm_fd and wlr_egl_destroy are not in the public
+// wlr/render/egl.h header, but are exported symbols in libwlroots (defined
+// in render/egl.c). We declare them here to create an independent EGL
+// display/context for GL Qt RHI when the wlroots renderer is Vulkan.
+// These are stable within the wlroots 0.19 ABI.
+extern "C" {
+struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd);
+void wlr_egl_destroy(struct wlr_egl *egl);
+}
 }
 
 #include <drm_fourcc.h>
@@ -78,6 +99,300 @@ W_DECLARE_PRIVATE_MEMBER(QQuickAnimCtrl_m_runningAnimators_tag, QQuickAnimatorCo
 W_DECLARE_PRIVATE_MEMBER(QQuickAnimCtrl_m_window_tag, QQuickAnimatorController, m_window, QQuickWindow*);
 
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+#ifdef ENABLE_VULKAN_RENDER
+static bool envFlagEnabledForVulkanRenderer(const char *name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+static bool envFlagEnabledForVulkanDirectSurface(const char *name)
+{
+    return envFlagEnabledForVulkanRenderer(name);
+}
+
+static bool vulkanSoftwareCursorRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_FORCE_SOFTWARE_CURSOR")
+        || envFlagEnabledForVulkanRenderer("TREELAND_VK_FORCE_SOFTWARE_CURSOR");
+    return enabled;
+}
+
+static bool vulkanHardwareCursorRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_ENABLE_HARDWARE_CURSOR")
+        || envFlagEnabledForVulkanRenderer("TREELAND_VK_ENABLE_HARDWARE_CURSOR");
+    return enabled;
+}
+
+static bool vulkanOutputLayerCompositorDisabled()
+{
+    static const bool disabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_DISABLE_OUTPUT_LAYER_COMPOSITOR")
+        || envFlagEnabledForVulkanRenderer("TREELAND_VK_DISABLE_OUTPUT_LAYER_COMPOSITOR");
+    return disabled;
+}
+
+static bool vulkanDirectSurfaceDryRunRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanDirectSurface("WAYLIB_VK_DIRECT_SURFACE_DRY_RUN")
+        || envFlagEnabledForVulkanDirectSurface("TREELAND_VK_DIRECT_SURFACE_DRY_RUN");
+    return enabled;
+}
+
+static bool vulkanDirectSurfaceCompositorRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanDirectSurface("WAYLIB_VK_DIRECT_SURFACE_COMPOSITOR")
+        || envFlagEnabledForVulkanDirectSurface("TREELAND_VK_DIRECT_SURFACE_COMPOSITOR");
+    return enabled;
+}
+
+static bool vulkanDirectSurfaceAllowAlphaRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanDirectSurface("WAYLIB_VK_DIRECT_SURFACE_ALLOW_ALPHA")
+        || envFlagEnabledForVulkanDirectSurface("TREELAND_VK_DIRECT_SURFACE_ALLOW_ALPHA");
+    return enabled;
+}
+
+static bool vulkanDirectSurfaceHideQtContentRequested()
+{
+    static const bool enabled = envFlagEnabledForVulkanDirectSurface("WAYLIB_VK_DIRECT_SURFACE_HIDE_QT")
+        || envFlagEnabledForVulkanDirectSurface("TREELAND_VK_DIRECT_SURFACE_HIDE_QT");
+    return enabled;
+}
+
+static int vulkanDirectSurfaceMinStableFrames()
+{
+    static const int frames = [] {
+        bool ok = false;
+        int value = qEnvironmentVariableIntValue("WAYLIB_VK_DIRECT_SURFACE_MIN_STABLE_FRAMES", &ok);
+        if (!ok)
+            value = qEnvironmentVariableIntValue("TREELAND_VK_DIRECT_SURFACE_MIN_STABLE_FRAMES", &ok);
+        if (!ok)
+            return 2;
+        return qBound(0, value, 120);
+    }();
+    return frames;
+}
+
+static bool vulkanDirectSurfaceCollectionRequested()
+{
+    return vulkanDirectSurfaceDryRunRequested() || vulkanDirectSurfaceCompositorRequested();
+}
+
+static bool isOrdinaryClientSurfaceItemChain(QQuickItem *item)
+{
+    for (auto node = item; node; node = node->parentItem()) {
+        if (qobject_cast<WXdgToplevelSurfaceItem *>(node)
+            || qobject_cast<WXdgPopupSurfaceItem *>(node)
+            || qobject_cast<WXWaylandSurfaceItem *>(node)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool nearlySameVulkanDirectSurfaceCoordinate(qreal a, qreal b)
+{
+    return qAbs(a - b) <= 0.01;
+}
+
+static bool itemSceneRectMappingIsAxisAligned(QQuickItem *item, const QRectF &rect)
+{
+    if (!item || rect.isEmpty())
+        return false;
+
+    const QPointF topLeft = item->mapToScene(rect.topLeft());
+    const QPointF topRight = item->mapToScene(rect.topRight());
+    const QPointF bottomRight = item->mapToScene(rect.bottomRight());
+    const QPointF bottomLeft = item->mapToScene(rect.bottomLeft());
+
+    return nearlySameVulkanDirectSurfaceCoordinate(topLeft.y(), topRight.y())
+        && nearlySameVulkanDirectSurfaceCoordinate(topRight.x(), bottomRight.x())
+        && nearlySameVulkanDirectSurfaceCoordinate(bottomRight.y(), bottomLeft.y())
+        && nearlySameVulkanDirectSurfaceCoordinate(bottomLeft.x(), topLeft.x())
+        && topRight.x() >= topLeft.x()
+        && bottomRight.y() >= topRight.y();
+}
+
+static bool effectiveVulkanDirectSurfaceVisible(QQuickItem *item)
+{
+    if (!item)
+        return false;
+
+    for (auto node = item; node; node = node->parentItem()) {
+        if (!node->isVisible())
+            return false;
+    }
+
+    return true;
+}
+
+static qreal effectiveVulkanDirectSurfaceOpacity(QQuickItem *item)
+{
+    qreal opacity = 1.0;
+    for (auto node = item; node; node = node->parentItem())
+        opacity *= node->opacity();
+
+    return opacity;
+}
+
+static QList<QQuickItem *> vulkanDirectSurfaceAncestorPath(QQuickItem *item)
+{
+    QList<QQuickItem *> path;
+    for (auto node = item; node; node = node->parentItem())
+        path.prepend(node);
+
+    return path;
+}
+
+static bool vulkanDirectSurfacePaintOrderLess(QQuickItem *a, QQuickItem *b)
+{
+    if (a == b)
+        return false;
+    if (!a)
+        return true;
+    if (!b)
+        return false;
+
+    const QList<QQuickItem *> aPath = vulkanDirectSurfaceAncestorPath(a);
+    const QList<QQuickItem *> bPath = vulkanDirectSurfaceAncestorPath(b);
+    const int commonCount = qMin(aPath.size(), bPath.size());
+    int divergence = 0;
+    while (divergence < commonCount && aPath.at(divergence) == bPath.at(divergence))
+        ++divergence;
+
+    if (divergence == aPath.size())
+        return true;
+    if (divergence == bPath.size())
+        return false;
+    if (divergence == 0)
+        return false;
+
+    auto aChild = aPath.at(divergence);
+    auto bChild = bPath.at(divergence);
+    if (!qFuzzyCompare(aChild->z(), bChild->z()))
+        return aChild->z() < bChild->z();
+
+    auto parent = aPath.at(divergence - 1);
+    const auto children = parent->childItems();
+    return children.indexOf(aChild) < children.indexOf(bChild);
+}
+
+static bool nearlySameVulkanDirectSurfaceRect(const QRectF &a, const QRectF &b)
+{
+    return nearlySameVulkanDirectSurfaceCoordinate(a.x(), b.x())
+        && nearlySameVulkanDirectSurfaceCoordinate(a.y(), b.y())
+        && nearlySameVulkanDirectSurfaceCoordinate(a.width(), b.width())
+        && nearlySameVulkanDirectSurfaceCoordinate(a.height(), b.height());
+}
+
+static bool drmFormatHasAlpha(uint32_t format)
+{
+    switch (format) {
+#ifdef DRM_FORMAT_ARGB4444
+    case DRM_FORMAT_ARGB4444:
+#endif
+#ifdef DRM_FORMAT_ABGR4444
+    case DRM_FORMAT_ABGR4444:
+#endif
+#ifdef DRM_FORMAT_RGBA4444
+    case DRM_FORMAT_RGBA4444:
+#endif
+#ifdef DRM_FORMAT_BGRA4444
+    case DRM_FORMAT_BGRA4444:
+#endif
+#ifdef DRM_FORMAT_ARGB1555
+    case DRM_FORMAT_ARGB1555:
+#endif
+#ifdef DRM_FORMAT_ABGR1555
+    case DRM_FORMAT_ABGR1555:
+#endif
+#ifdef DRM_FORMAT_RGBA5551
+    case DRM_FORMAT_RGBA5551:
+#endif
+#ifdef DRM_FORMAT_BGRA5551
+    case DRM_FORMAT_BGRA5551:
+#endif
+#ifdef DRM_FORMAT_ARGB8888
+    case DRM_FORMAT_ARGB8888:
+#endif
+#ifdef DRM_FORMAT_ABGR8888
+    case DRM_FORMAT_ABGR8888:
+#endif
+#ifdef DRM_FORMAT_RGBA8888
+    case DRM_FORMAT_RGBA8888:
+#endif
+#ifdef DRM_FORMAT_BGRA8888
+    case DRM_FORMAT_BGRA8888:
+#endif
+#ifdef DRM_FORMAT_ARGB2101010
+    case DRM_FORMAT_ARGB2101010:
+#endif
+#ifdef DRM_FORMAT_ABGR2101010
+    case DRM_FORMAT_ABGR2101010:
+#endif
+#ifdef DRM_FORMAT_RGBA1010102
+    case DRM_FORMAT_RGBA1010102:
+#endif
+#ifdef DRM_FORMAT_BGRA1010102
+    case DRM_FORMAT_BGRA1010102:
+#endif
+#ifdef DRM_FORMAT_ARGB16161616
+    case DRM_FORMAT_ARGB16161616:
+#endif
+#ifdef DRM_FORMAT_ABGR16161616
+    case DRM_FORMAT_ABGR16161616:
+#endif
+#ifdef DRM_FORMAT_RGBA16161616
+    case DRM_FORMAT_RGBA16161616:
+#endif
+#ifdef DRM_FORMAT_BGRA16161616
+    case DRM_FORMAT_BGRA16161616:
+#endif
+#ifdef DRM_FORMAT_ARGB16161616F
+    case DRM_FORMAT_ARGB16161616F:
+#endif
+#ifdef DRM_FORMAT_ABGR16161616F
+    case DRM_FORMAT_ABGR16161616F:
+#endif
+#ifdef DRM_FORMAT_RGBA16161616F
+    case DRM_FORMAT_RGBA16161616F:
+#endif
+#ifdef DRM_FORMAT_BGRA16161616F
+    case DRM_FORMAT_BGRA16161616F:
+#endif
+#ifdef DRM_FORMAT_AYUV
+    case DRM_FORMAT_AYUV:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
+
+static QString drmFormatName(uint32_t format)
+{
+    if (format == DRM_FORMAT_INVALID)
+        return QStringLiteral("<invalid>");
+
+    char name[5] = {
+        char(format & 0xff),
+        char((format >> 8) & 0xff),
+        char((format >> 16) & 0xff),
+        char((format >> 24) & 0xff),
+        0,
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        if (name[i] < 0x20 || name[i] > 0x7e)
+            return QStringLiteral("0x%1").arg(format, 8, 16, QLatin1Char('0'));
+    }
+
+    return QString::fromLatin1(name, 4);
+}
+#endif
 
 // Call it before any wlroots render to clean up the GL state in Qt.
 // If you don't do this, there will be tearing, flickering and other graphics problems
@@ -193,6 +508,42 @@ public:
         return output()->output()->handle();
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    inline bool isVulkanRenderer() const {
+        return m_output && m_output->output() && m_output->output()->renderer()
+            && wlr_renderer_is_vk(m_output->output()->renderer()->handle());
+    }
+
+    inline bool shouldDeferVulkanRenderRetry() {
+        if (!isVulkanRenderer() || m_vulkanRenderRetryDelayFrames <= 0)
+            return false;
+
+        --m_vulkanRenderRetryDelayFrames;
+        scheduleFrame();
+        return true;
+    }
+
+    inline bool noteVulkanRenderFailed() {
+        if (!isVulkanRenderer())
+            return false;
+
+        m_vulkanRenderFailureBackoffFrames = m_vulkanRenderFailureBackoffFrames
+            ? qMin(m_vulkanRenderFailureBackoffFrames * 2, 4)
+            : 1;
+        m_vulkanRenderRetryDelayFrames = m_vulkanRenderFailureBackoffFrames;
+        scheduleFrame();
+        return true;
+    }
+
+    inline void noteVulkanRenderSucceeded() {
+        if (!isVulkanRenderer())
+            return;
+
+        m_vulkanRenderFailureBackoffFrames = 0;
+        m_vulkanRenderRetryDelayFrames = 0;
+    }
+#endif
+
     inline WOutputRenderWindow *renderWindow() const {
         return static_cast<WOutputRenderWindow*>(parent());
     }
@@ -262,6 +613,10 @@ private:
     BufferRendererProxy *m_cursorLayerProxy = nullptr;
     bool m_cursorDirty = false;
     bool m_hardwareCursorRenderComplete = false;
+#ifdef ENABLE_VULKAN_RENDER
+    int m_vulkanRenderFailureBackoffFrames = 0;
+    int m_vulkanRenderRetryDelayFrames = 0;
+#endif
 
     // for compositeLayers
     QPointer<WOutputViewport> m_output2;
@@ -384,6 +739,8 @@ public:
     }
     ~WOutputRenderWindowPrivate() {
         qDeleteAll(layers);
+        if (m_independentEgl)
+            wlr_egl_destroy(m_independentEgl);
     }
 
     static inline WOutputRenderWindowPrivate *get(WOutputRenderWindow *qq) {
@@ -437,6 +794,76 @@ public:
     bool initRCWithRhi();
     void updateSceneDPR();
     void sortOutputs();
+#ifdef ENABLE_VULKAN_RENDER
+    struct VulkanDirectSurfaceCandidate {
+        QPointer<QQuickItem> contentItem;
+        QPointer<WSurface> surface;
+        QPointer<WSurfaceItem> surfaceItem;
+        QPointer<qw_buffer> buffer;
+        QRectF localRect;
+        QRectF sceneRect;
+        QRectF sourceRect;
+        QSize bufferSize;
+        QString surfaceItemType;
+        QString bufferFormatName;
+        qreal opacity = 1.0;
+        qreal devicePixelRatio = 1.0;
+        uint32_t bufferFormat = DRM_FORMAT_INVALID;
+        int stableFrames = 0;
+        bool live = true;
+        bool cacheLastBuffer = true;
+        bool hasDmabuf = false;
+        bool bufferFormatHasAlpha = false;
+        bool ordinaryClientSurface = false;
+        bool axisAligned = true;
+        bool qmlAllowed = false;
+        bool overlaySucceededLastFrame = false;
+        bool overlaySucceededThisFrame = false;
+        bool directActive = false;
+        bool hideQtContent = false;
+        bool eligible = false;
+        QString rejectReason;
+    };
+    struct VulkanDirectSurfaceLayerState {
+        QPointer<QQuickItem> contentItem;
+        QPointer<WSurface> surface;
+        QPointer<WSurfaceItem> surfaceItem;
+        QPointer<qw_buffer> buffer;
+        QRectF localRect;
+        QRectF sceneRect;
+        QRectF sourceRect;
+        QSize bufferSize;
+        QString surfaceItemType;
+        QString bufferFormatName;
+        qreal opacity = 1.0;
+        qreal devicePixelRatio = 1.0;
+        uint32_t bufferFormat = DRM_FORMAT_INVALID;
+        int stableFrames = 0;
+        quint64 lastUpdatedFrame = 0;
+        quint64 lastRenderedFrame = 0;
+        bool live = true;
+        bool cacheLastBuffer = true;
+        bool hasDmabuf = false;
+        bool bufferFormatHasAlpha = false;
+        bool ordinaryClientSurface = false;
+        bool axisAligned = true;
+        bool qmlAllowed = false;
+        bool overlaySucceededLastFrame = false;
+        bool overlaySucceededThisFrame = false;
+        bool directActive = false;
+        bool hiddenInQt = false;
+        bool eligible = false;
+        QString rejectReason;
+    };
+    VulkanDirectSurfaceCandidate evaluateVulkanDirectSurfaceLayer(
+        const VulkanDirectSurfaceLayerState &state,
+        quint64 frameSerial) const;
+    void dumpVulkanDirectSurfaceCandidates() const;
+    void renderVulkanDirectSurfaceCandidates(OutputHelper *helper,
+                                             wlr_render_pass *pass,
+                                             const QSize &targetSize);
+    void noteVulkanDirectSurfaceCommitFailed(OutputHelper *helper);
+#endif
 
     QVector<std::pair<OutputHelper *, WBufferRenderer *>>
     doRenderOutputs(qw_output *needsFrameOutput, const QList<OutputHelper *> &outputs,
@@ -467,6 +894,9 @@ public:
     bool renderEnabled = true;
 
     QPointer<qw_renderer> m_renderer;
+    // Independent wlr_egl created when wlroots renderer is Vulkan but Qt RHI
+    // is GL. Used to create a QW::OpenGLContext with a valid EGL display/context.
+    struct wlr_egl *m_independentEgl = nullptr;
     QPointer<qw_allocator> m_allocator;
 
     QList<OutputHelper*> outputs;
@@ -476,6 +906,8 @@ public:
     QOpenGLContext *glContext = nullptr;
 #ifdef ENABLE_VULKAN_RENDER
     QScopedPointer<QVulkanInstance> vkInstance;
+    QHash<QQuickItem *, VulkanDirectSurfaceLayerState> vulkanDirectSurfaceLayers;
+    quint64 vulkanDirectSurfaceCollectionSerial = 0;
 #endif
 
     QStack<WBufferRenderer*> rendererList;
@@ -490,6 +922,508 @@ void OutputHelper::updateSceneDPR()
 {
     WOutputRenderWindowPrivate::get(renderWindow())->updateSceneDPR();
 }
+
+#ifdef ENABLE_VULKAN_RENDER
+bool WOutputRenderWindow::updateVulkanDirectSurfaceLayer(QQuickItem *contentItem,
+                                                        WSurface *surface,
+                                                        qw_buffer *buffer,
+                                                        const QRectF &localRect,
+                                                        const QRectF &sourceRect,
+                                                        qreal devicePixelRatio,
+                                                        bool live,
+                                                        bool cacheLastBuffer,
+                                                        WSurfaceItem *surfaceItem)
+{
+    if (!vulkanDirectSurfaceCollectionRequested() || !contentItem)
+        return false;
+
+    Q_D(WOutputRenderWindow);
+
+    static bool announced = false;
+    if (vulkanDirectSurfaceDryRunRequested() && !announced) {
+        announced = true;
+        qCInfo(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor dry-run enabled:"
+            << "collecting Qt scene geometry and client buffers without changing output composition."
+            << "Env: WAYLIB_VK_DIRECT_SURFACE_DRY_RUN=1 or TREELAND_VK_DIRECT_SURFACE_DRY_RUN=1";
+    }
+    static bool compositorAnnounced = false;
+    if (vulkanDirectSurfaceCompositorRequested() && !compositorAnnounced) {
+        compositorAnnounced = true;
+        qCInfo(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor enabled:"
+            << "eligible ordinary client dmabufs are tracked as persistent layers and drawn by the wlroots Vulkan pass."
+            << "QML must mark a surface safe before it can be promoted."
+            << "Alpha dmabufs are skipped unless WAYLIB_VK_DIRECT_SURFACE_ALLOW_ALPHA=1."
+            << "minimumStableFrames" << vulkanDirectSurfaceMinStableFrames()
+            << "Env: WAYLIB_VK_DIRECT_SURFACE_COMPOSITOR=1 or TREELAND_VK_DIRECT_SURFACE_COMPOSITOR=1";
+    }
+    static bool hideQtAnnounced = false;
+    if (vulkanDirectSurfaceHideQtContentRequested() && !hideQtAnnounced) {
+        hideQtAnnounced = true;
+        qCInfo(lcWlVulkanCompositor)
+            << "Vulkan direct surface Qt-content hiding enabled:"
+            << "eligible client content is removed from the Qt Quick layer only after the previous frame was rendered by the Vulkan direct surface pass."
+            << "Env: WAYLIB_VK_DIRECT_SURFACE_HIDE_QT=1 or TREELAND_VK_DIRECT_SURFACE_HIDE_QT=1";
+    }
+
+    QSize bufferSize;
+    bool hasDmabuf = false;
+    bool bufferFormatHasAlpha = false;
+    uint32_t bufferFormat = DRM_FORMAT_INVALID;
+    QString bufferFormatName;
+    if (buffer && buffer->handle()) {
+        bufferSize = QSize(buffer->handle()->width, buffer->handle()->height);
+        wlr_dmabuf_attributes dmabuf = {};
+        hasDmabuf = wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf);
+        if (hasDmabuf) {
+            bufferFormat = dmabuf.format;
+            bufferFormatName = drmFormatName(dmabuf.format);
+            bufferFormatHasAlpha = drmFormatHasAlpha(dmabuf.format);
+        }
+    }
+
+    auto &state = d->vulkanDirectSurfaceLayers[contentItem];
+    const bool sameLayer = state.contentItem == contentItem
+        && state.surface == surface
+        && state.surfaceItem == surfaceItem
+        && nearlySameVulkanDirectSurfaceRect(state.localRect, localRect)
+        && nearlySameVulkanDirectSurfaceRect(state.sourceRect, sourceRect)
+        && state.bufferSize == bufferSize;
+
+    state.contentItem = contentItem;
+    state.surface = surface;
+    state.surfaceItem = surfaceItem;
+    state.buffer = buffer;
+    state.localRect = localRect;
+    state.sourceRect = sourceRect;
+    state.bufferSize = bufferSize;
+    state.surfaceItemType = surfaceItem ? QString::fromLatin1(surfaceItem->metaObject()->className())
+                                        : QStringLiteral("<none>");
+    state.devicePixelRatio = devicePixelRatio;
+    state.bufferFormat = bufferFormat;
+    state.bufferFormatName = bufferFormatName;
+    state.stableFrames = sameLayer ? state.stableFrames + 1 : 0;
+    state.lastUpdatedFrame = d->vulkanDirectSurfaceCollectionSerial;
+    state.live = live;
+    state.cacheLastBuffer = cacheLastBuffer;
+    state.hasDmabuf = hasDmabuf;
+    state.bufferFormatHasAlpha = bufferFormatHasAlpha;
+    state.ordinaryClientSurface = isOrdinaryClientSurfaceItemChain(surfaceItem);
+    state.qmlAllowed = surfaceItem && surfaceItem->vulkanDirectSurfaceAllowed();
+
+    auto candidate = d->evaluateVulkanDirectSurfaceLayer(state, d->vulkanDirectSurfaceCollectionSerial);
+    state.sceneRect = candidate.sceneRect;
+    state.opacity = candidate.opacity;
+    state.axisAligned = candidate.axisAligned;
+    state.qmlAllowed = candidate.qmlAllowed;
+    state.eligible = candidate.eligible;
+    state.rejectReason = candidate.rejectReason;
+    state.directActive = candidate.eligible && state.overlaySucceededLastFrame;
+    state.hiddenInQt = vulkanDirectSurfaceHideQtContentRequested() && state.directActive;
+
+    candidate.directActive = state.directActive;
+    candidate.hideQtContent = state.hiddenInQt;
+    return state.hiddenInQt;
+}
+
+void WOutputRenderWindow::removeVulkanDirectSurfaceLayer(QQuickItem *contentItem)
+{
+    if (!contentItem)
+        return;
+
+    Q_D(WOutputRenderWindow);
+    auto it = d->vulkanDirectSurfaceLayers.find(contentItem);
+    if (it == d->vulkanDirectSurfaceLayers.end())
+        return;
+
+    if (it.value().directActive || it.value().hiddenInQt) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor: removing persistent layer"
+            << "contentItem" << contentItem
+            << "surface" << it.value().surface.data()
+            << "surfaceItem" << it.value().surfaceItem.data()
+            << "directActive" << it.value().directActive
+            << "hiddenInQt" << it.value().hiddenInQt;
+    }
+    d->vulkanDirectSurfaceLayers.erase(it);
+}
+
+WOutputRenderWindowPrivate::VulkanDirectSurfaceCandidate
+WOutputRenderWindowPrivate::evaluateVulkanDirectSurfaceLayer(
+    const VulkanDirectSurfaceLayerState &state,
+    quint64 frameSerial) const
+{
+    Q_UNUSED(frameSerial);
+
+    VulkanDirectSurfaceCandidate candidate;
+    candidate.contentItem = state.contentItem;
+    candidate.surface = state.surface;
+    candidate.surfaceItem = state.surfaceItem;
+    candidate.buffer = state.buffer;
+    candidate.localRect = state.localRect;
+    candidate.sourceRect = state.sourceRect;
+    candidate.bufferSize = state.bufferSize;
+    candidate.surfaceItemType = state.surfaceItemType;
+    candidate.bufferFormatName = state.bufferFormatName;
+    candidate.devicePixelRatio = state.devicePixelRatio;
+    candidate.bufferFormat = state.bufferFormat;
+    candidate.stableFrames = state.stableFrames;
+    candidate.live = state.live;
+    candidate.cacheLastBuffer = state.cacheLastBuffer;
+    candidate.hasDmabuf = state.hasDmabuf;
+    candidate.bufferFormatHasAlpha = state.bufferFormatHasAlpha;
+    candidate.ordinaryClientSurface = state.ordinaryClientSurface;
+    candidate.overlaySucceededLastFrame = state.overlaySucceededLastFrame;
+    candidate.overlaySucceededThisFrame = state.overlaySucceededThisFrame;
+    candidate.directActive = state.directActive;
+    candidate.hideQtContent = state.hiddenInQt;
+
+    if (state.contentItem) {
+        candidate.sceneRect = state.contentItem->mapRectToScene(state.localRect);
+        candidate.axisAligned = itemSceneRectMappingIsAxisAligned(state.contentItem, state.localRect);
+        candidate.opacity = effectiveVulkanDirectSurfaceOpacity(state.contentItem);
+    } else {
+        candidate.sceneRect = state.sceneRect;
+        candidate.axisAligned = false;
+        candidate.opacity = state.opacity;
+    }
+    candidate.qmlAllowed = state.surfaceItem && state.surfaceItem->vulkanDirectSurfaceAllowed();
+
+    auto reject = [&candidate](const QString &reason) {
+        if (!candidate.eligible)
+            candidate.rejectReason = reason;
+    };
+
+    candidate.eligible = true;
+    if (!m_renderer || !wlr_renderer_is_vk(m_renderer->handle())) {
+        candidate.eligible = false;
+        reject(QStringLiteral("wlroots renderer is not Vulkan"));
+    } else if (!WOutputHelper::isVulkanOutputLayerCompositorRequested()) {
+        candidate.eligible = false;
+        reject(QStringLiteral("Vulkan output-layer compositor is disabled"));
+    } else if (WRenderHelper::getGraphicsApi() != QSGRendererInterface::OpenGL) {
+        candidate.eligible = false;
+        reject(QStringLiteral("Qt Quick RHI is not OpenGL"));
+    } else if (!state.contentItem) {
+        candidate.eligible = false;
+        reject(QStringLiteral("missing QML content item"));
+    } else if (!effectiveVulkanDirectSurfaceVisible(state.contentItem)) {
+        candidate.eligible = false;
+        reject(QStringLiteral("QML content item is not effectively visible"));
+    } else if (!candidate.surface) {
+        candidate.eligible = false;
+        reject(QStringLiteral("missing WSurface"));
+    } else if (!candidate.surfaceItem) {
+        candidate.eligible = false;
+        reject(QStringLiteral("missing WSurfaceItem owner"));
+    } else if (!candidate.ordinaryClientSurface) {
+        candidate.eligible = false;
+        reject(QStringLiteral("not an ordinary client surface item"));
+    } else if (!candidate.qmlAllowed) {
+        candidate.eligible = false;
+        reject(QStringLiteral("QML scene did not mark this surface safe for direct Vulkan composition"));
+    } else if (!candidate.buffer) {
+        candidate.eligible = false;
+        reject(QStringLiteral("missing client buffer"));
+    } else if (!candidate.buffer->handle()) {
+        candidate.eligible = false;
+        reject(QStringLiteral("buffer has no wlroots handle"));
+    } else if (!candidate.hasDmabuf) {
+        candidate.eligible = false;
+        reject(QStringLiteral("buffer has no dmabuf"));
+    } else if (candidate.bufferFormatHasAlpha && !vulkanDirectSurfaceAllowAlphaRequested()) {
+        candidate.eligible = false;
+        reject(QStringLiteral("buffer format has alpha; set WAYLIB_VK_DIRECT_SURFACE_ALLOW_ALPHA=1 only for unsafe diagnostics"));
+    } else if (candidate.stableFrames < vulkanDirectSurfaceMinStableFrames()) {
+        candidate.eligible = false;
+        reject(QStringLiteral("waiting for stable layer content"));
+    } else if (candidate.sceneRect.isEmpty() || candidate.sourceRect.isEmpty()) {
+        candidate.eligible = false;
+        reject(QStringLiteral("empty scene or source rectangle"));
+    } else if (!candidate.axisAligned) {
+        candidate.eligible = false;
+        reject(QStringLiteral("non-axis-aligned Qt scene transform"));
+    } else if (!candidate.live) {
+        candidate.eligible = false;
+        reject(QStringLiteral("non-live SurfaceItemContent"));
+    } else if (candidate.opacity < 0.999) {
+        candidate.eligible = false;
+        reject(QStringLiteral("translucent Qt surface content"));
+    }
+
+    return candidate;
+}
+
+void WOutputRenderWindowPrivate::dumpVulkanDirectSurfaceCandidates() const
+{
+    if (!vulkanDirectSurfaceDryRunRequested() || !lcWlVulkanCompositor().isDebugEnabled())
+        return;
+
+    QVector<VulkanDirectSurfaceCandidate> snapshots;
+    snapshots.reserve(vulkanDirectSurfaceLayers.size());
+    for (auto it = vulkanDirectSurfaceLayers.cbegin(); it != vulkanDirectSurfaceLayers.cend(); ++it)
+        snapshots.append(evaluateVulkanDirectSurfaceLayer(it.value(),
+                                                          vulkanDirectSurfaceCollectionSerial));
+
+    if (snapshots.isEmpty())
+        return;
+
+    int eligibleCount = 0;
+    int activeCount = 0;
+    int hiddenCount = 0;
+    for (const auto &candidate : snapshots) {
+        if (candidate.eligible)
+            ++eligibleCount;
+        if (candidate.directActive)
+            ++activeCount;
+        if (candidate.hideQtContent)
+            ++hiddenCount;
+    }
+
+    qCDebug(lcWlVulkanCompositor)
+        << "Vulkan direct surface dry-run registered layers"
+        << snapshots.size()
+        << "eligible" << eligibleCount
+        << "directActive" << activeCount
+        << "hiddenInQt" << hiddenCount;
+
+    for (const auto &candidate : snapshots) {
+        QStringList outputNames;
+        for (auto helper : outputs) {
+            auto viewport = helper->output();
+            if (!viewport || !viewport->output())
+                continue;
+
+            const QRectF outputSceneRect =
+                viewport->mapRectToScene(QRectF(QPointF(), viewport->size()));
+            if (outputSceneRect.intersects(candidate.sceneRect))
+                outputNames << viewport->output()->name();
+        }
+
+        qCDebug(lcWlVulkanCompositor)
+            << "  direct-surface layer"
+            << "eligible" << candidate.eligible
+            << "reason" << (candidate.eligible ? QStringLiteral("ready-for-direct-render")
+                                                : candidate.rejectReason)
+            << "contentItem" << candidate.contentItem.data()
+            << "surface" << candidate.surface.data()
+            << "surfaceItem" << candidate.surfaceItem.data()
+            << "surfaceItemType" << candidate.surfaceItemType
+            << "buffer" << candidate.buffer.data()
+            << "bufferSize" << candidate.bufferSize
+            << "hasDmabuf" << candidate.hasDmabuf
+            << "bufferFormat" << candidate.bufferFormatName
+            << "bufferFormatHasAlpha" << candidate.bufferFormatHasAlpha
+            << "ordinaryClientSurface" << candidate.ordinaryClientSurface
+            << "axisAligned" << candidate.axisAligned
+            << "qmlAllowed" << candidate.qmlAllowed
+            << "overlaySucceededLastFrame" << candidate.overlaySucceededLastFrame
+            << "directActive" << candidate.directActive
+            << "hideQtContent" << candidate.hideQtContent
+            << "stableFrames" << candidate.stableFrames
+            << "localRect" << candidate.localRect
+            << "sceneRect" << candidate.sceneRect
+            << "sourceRect" << candidate.sourceRect
+            << "opacity" << candidate.opacity
+            << "dpr" << candidate.devicePixelRatio
+            << "live" << candidate.live
+            << "cacheLastBuffer" << candidate.cacheLastBuffer
+            << "outputs" << outputNames.join(QLatin1Char(','));
+    }
+}
+
+void WOutputRenderWindowPrivate::renderVulkanDirectSurfaceCandidates(OutputHelper *helper,
+                                                                     wlr_render_pass *pass,
+                                                                     const QSize &targetSize)
+{
+    if (!vulkanDirectSurfaceCompositorRequested() || !helper || !pass || targetSize.isEmpty()
+        || vulkanDirectSurfaceLayers.isEmpty()) {
+        return;
+    }
+
+    auto viewport = helper->output();
+    if (!viewport || !viewport->output() || !m_renderer)
+        return;
+
+    const QRectF outputSceneRect =
+        viewport->mapRectToScene(QRectF(QPointF(), viewport->size()));
+    if (outputSceneRect.isEmpty())
+        return;
+    if (!itemSceneRectMappingIsAxisAligned(viewport, QRectF(QPointF(), viewport->size()))) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor: skipped output with non-axis-aligned viewport mapping"
+            << viewport->output()->name();
+        return;
+    }
+
+    const qreal sx = qreal(targetSize.width()) / outputSceneRect.width();
+    const qreal sy = qreal(targetSize.height()) / outputSceneRect.height();
+
+    pixman_region32_t outputClip;
+    pixman_region32_init_rect(&outputClip, 0, 0, targetSize.width(), targetSize.height());
+
+    QVector<wlr_texture *> texturesToDestroy;
+    texturesToDestroy.reserve(vulkanDirectSurfaceLayers.size());
+
+    QVector<VulkanDirectSurfaceLayerState *> layers;
+    layers.reserve(vulkanDirectSurfaceLayers.size());
+    for (auto it = vulkanDirectSurfaceLayers.begin(); it != vulkanDirectSurfaceLayers.end(); ++it)
+        layers.append(&it.value());
+    std::sort(layers.begin(), layers.end(), [](const VulkanDirectSurfaceLayerState *a,
+                                               const VulkanDirectSurfaceLayerState *b) {
+        return vulkanDirectSurfacePaintOrderLess(a ? a->contentItem.data() : nullptr,
+                                                 b ? b->contentItem.data() : nullptr);
+    });
+
+    int rendered = 0;
+    int skipped = 0;
+    int failed = 0;
+    for (auto state : std::as_const(layers)) {
+        if (!state)
+            continue;
+
+        auto candidate = evaluateVulkanDirectSurfaceLayer(*state, vulkanDirectSurfaceCollectionSerial);
+        state->sceneRect = candidate.sceneRect;
+        state->opacity = candidate.opacity;
+        state->axisAligned = candidate.axisAligned;
+        state->qmlAllowed = candidate.qmlAllowed;
+        state->eligible = candidate.eligible;
+        state->rejectReason = candidate.rejectReason;
+
+        if (!candidate.eligible || !candidate.sceneRect.intersects(outputSceneRect)) {
+            ++skipped;
+            if (state->hiddenInQt && !candidate.eligible) {
+                state->hiddenInQt = false;
+                state->directActive = false;
+                if (state->contentItem)
+                    state->contentItem->update();
+            }
+            continue;
+        }
+
+        if (candidate.opacity < 0.999) {
+            ++skipped;
+            qCDebug(lcWlVulkanCompositor)
+                << "Vulkan direct surface compositor: skipped translucent candidate in overlay mode"
+                << "surface" << candidate.surface.data()
+                << "opacity" << candidate.opacity
+                << "bufferFormat" << candidate.bufferFormatName
+                << "stableFrames" << candidate.stableFrames;
+            state->hiddenInQt = false;
+            state->directActive = false;
+            if (state->contentItem)
+                state->contentItem->update();
+            continue;
+        }
+
+        if (!candidate.buffer || !candidate.buffer->handle()) {
+            ++skipped;
+            continue;
+        }
+
+        wlr_texture *texture =
+            wlr_texture_from_buffer(m_renderer->handle(), candidate.buffer->handle());
+        if (!texture) {
+            ++failed;
+            qCWarning(lcWlVulkanCompositor)
+                << "Vulkan direct surface compositor: failed to import client buffer for output"
+                << viewport->output()->name()
+                << "surface" << candidate.surface.data()
+                << "buffer" << candidate.buffer.data()
+                << "bufferSize" << candidate.bufferSize
+                << "bufferFormat" << candidate.bufferFormatName
+                << "stableFrames" << candidate.stableFrames;
+            state->overlaySucceededThisFrame = false;
+            state->directActive = false;
+            if (state->hiddenInQt) {
+                state->hiddenInQt = false;
+                if (state->contentItem)
+                    state->contentItem->update();
+            }
+            continue;
+        }
+
+        const QRectF dstSceneRect = candidate.sceneRect;
+        wlr_render_texture_options options = {};
+        options.texture = texture;
+        options.src_box.x = candidate.sourceRect.x();
+        options.src_box.y = candidate.sourceRect.y();
+        options.src_box.width = candidate.sourceRect.width();
+        options.src_box.height = candidate.sourceRect.height();
+        options.dst_box.x = qRound((dstSceneRect.x() - outputSceneRect.x()) * sx);
+        options.dst_box.y = qRound((dstSceneRect.y() - outputSceneRect.y()) * sy);
+        options.dst_box.width = qRound(dstSceneRect.width() * sx);
+        options.dst_box.height = qRound(dstSceneRect.height() * sy);
+        options.clip = &outputClip;
+        options.transform = WL_OUTPUT_TRANSFORM_NORMAL;
+        options.filter_mode = WLR_SCALE_FILTER_BILINEAR;
+        options.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED;
+
+        wlr_render_pass_add_texture(pass, &options);
+        texturesToDestroy.append(texture);
+        state->overlaySucceededThisFrame = true;
+        state->directActive = true;
+        state->lastRenderedFrame = vulkanDirectSurfaceCollectionSerial;
+        ++rendered;
+    }
+
+    for (auto texture : std::as_const(texturesToDestroy))
+        wlr_texture_destroy(texture);
+
+    pixman_region32_fini(&outputClip);
+
+    if (rendered > 0 || failed > 0) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor: overlay pass for output"
+            << viewport->output()->name()
+            << "rendered" << rendered
+            << "skipped" << skipped
+            << "failed" << failed
+            << "target" << targetSize;
+    }
+}
+
+void WOutputRenderWindowPrivate::noteVulkanDirectSurfaceCommitFailed(OutputHelper *helper)
+{
+    if (!helper || vulkanDirectSurfaceLayers.isEmpty())
+        return;
+
+    auto viewport = helper->output();
+    if (!viewport || !viewport->output())
+        return;
+
+    const QRectF outputSceneRect =
+        viewport->mapRectToScene(QRectF(QPointF(), viewport->size()));
+    if (outputSceneRect.isEmpty())
+        return;
+
+    int cleared = 0;
+    for (auto it = vulkanDirectSurfaceLayers.begin(); it != vulkanDirectSurfaceLayers.end(); ++it) {
+        auto candidate = evaluateVulkanDirectSurfaceLayer(it.value(),
+                                                          vulkanDirectSurfaceCollectionSerial);
+        if (!candidate.sceneRect.intersects(outputSceneRect))
+            continue;
+
+        it.value().overlaySucceededLastFrame = false;
+        it.value().overlaySucceededThisFrame = false;
+        it.value().directActive = false;
+        if (it.value().hiddenInQt) {
+            it.value().hiddenInQt = false;
+            if (it.value().contentItem)
+                it.value().contentItem->update();
+        }
+        ++cleared;
+    }
+
+    if (cleared > 0) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan direct surface compositor: cleared overlay success after output commit failure"
+            << viewport->output()->name()
+            << "surfaces" << cleared;
+    }
+}
+#endif
 
 int OutputHelper::indexOfLayer(OutputLayer *layer) const
 {
@@ -1043,8 +1977,12 @@ WBufferRenderer *OutputHelper::compositeLayers(const QList<LayerData*> layers, b
 
         if (ok) {
             // stop primary render
-            if (bufferRenderer()->currentBuffer())
+            if (bufferRenderer()->currentBuffer()) {
+#ifdef ENABLE_VULKAN_RENDER
+                bufferRenderer()->releaseCurrentBufferForScanout();
+#endif
                 bufferRenderer()->endRender();
+            }
             render(bufferRenderer2(), 0, {}, m_output->effectiveSourceRect(), m_output->targetRect(), true);
 
             return bufferRenderer2();
@@ -1073,6 +2011,54 @@ bool OutputHelper::commit(WBufferRenderer *buffer)
         return WOutputHelper::commit();
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    const bool outputProbe = envFlagEnabledForVulkanRenderer("WAYLIB_VK_OUTPUT_PROBE")
+        && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+    const bool scanoutReady = buffer->currentBufferReadyForScanout();
+    if (outputProbe) {
+        qCInfo(lcWlBufferRenderer)
+            << "Vulkan output probe commit attempt"
+            << qwoutput()->handle()->name
+            << "bufferPtr" << quintptr(buffer->currentBuffer())
+            << "bufferSize" << QSize(buffer->currentBuffer()->handle()->width,
+                                     buffer->currentBuffer()->handle()->height)
+            << "scanoutReady" << scanoutReady
+            << "framePending" << framePending()
+            << "usesLayerCompositor" << usesVulkanOutputLayerCompositor();
+    }
+
+    if (!scanoutReady) {
+        qCWarning(lcWlBufferRenderer)
+            << "Skipping output commit because current Vulkan render target was not released for scanout"
+            << qwoutput()->handle()->name
+            << "buffer size" << buffer->currentBuffer()->handle()->width
+            << "x" << buffer->currentBuffer()->handle()->height;
+        return false;
+    }
+
+    if (usesVulkanOutputLayerCompositor()) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Committing Qt Quick layer through wlroots Vulkan render pass for output"
+            << qwoutput()->handle()->name
+            << "buffer size" << buffer->currentBuffer()->handle()->width
+            << "x" << buffer->currentBuffer()->handle()->height;
+        const bool ok = commitWithVulkanOutputLayer(buffer->currentBuffer(),
+                                                    [this](wlr_render_pass *pass, const QSize &targetSize) {
+            renderWindowD()->renderVulkanDirectSurfaceCandidates(this, pass, targetSize);
+        });
+        if (outputProbe) {
+            qCInfo(lcWlBufferRenderer)
+                << "Vulkan output probe layer commit result"
+                << qwoutput()->handle()->name
+                << "ok" << ok
+                << "bufferPtr" << quintptr(buffer->currentBuffer());
+        }
+        if (!ok)
+            renderWindowD()->noteVulkanDirectSurfaceCommitFailed(this);
+        return ok;
+    }
+#endif
+
     setBuffer(buffer->currentBuffer());
 
     if (m_lastCommitBuffer == buffer) {
@@ -1082,7 +2068,17 @@ bool OutputHelper::commit(WBufferRenderer *buffer)
 
     m_lastCommitBuffer = buffer;
 
-    return WOutputHelper::commit();
+    const bool ok = WOutputHelper::commit();
+#ifdef ENABLE_VULKAN_RENDER
+    if (outputProbe) {
+        qCInfo(lcWlBufferRenderer)
+            << "Vulkan output probe primary commit result"
+            << qwoutput()->handle()->name
+            << "ok" << ok
+            << "bufferPtr" << quintptr(buffer->currentBuffer());
+    }
+#endif
+    return ok;
 }
 
 bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
@@ -1101,6 +2097,22 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
             m_hardwareCursorRenderComplete = false;
             return true;
         }
+
+#ifdef ENABLE_VULKAN_RENDER
+        if (isVulkanRenderer()
+            && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan
+            && (vulkanSoftwareCursorRequested() || !vulkanHardwareCursorRequested())) {
+            static bool logged = false;
+            if (!logged) {
+                qCInfo(lcWlRenderer)
+                    << "Keeping cursor in Qt composition for Vulkan RHI with wlroots Vulkan renderer"
+                    << "forcedSoftware" << vulkanSoftwareCursorRequested()
+                    << "hardwareOptIn" << vulkanHardwareCursorRequested();
+                logged = true;
+            }
+            return false;
+        }
+#endif
 
         if (qwoutput()->handle()->software_cursor_locks > 0)
             break;
@@ -1169,6 +2181,11 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
             // needs render cursor again
             if (!m_cursorRenderer) {
                 m_cursorRenderer = new WBufferRenderer(renderWindow()->contentItem());
+                // The rendered cursor buffer is handed directly to the backend
+                // cursor plane. Publishing it as a Qt texture as well can make
+                // the Vulkan RHI import/sample the same small swapchain buffer
+                // while wlroots is using it as the hardware cursor.
+                m_cursorRenderer->setCacheBuffer(false);
                 if (visualizeLayers())
                     m_cursorRenderer->setClearColor(Qt::cyan);
                 m_cursorLayerProxy = new BufferRendererProxy(m_cursorRenderer);
@@ -1278,6 +2295,25 @@ void WOutputRenderWindowPrivate::init()
     Q_ASSERT(m_renderer);
     Q_Q(WOutputRenderWindow);
 
+#ifdef ENABLE_VULKAN_RENDER
+    const bool explicitLayerCompositor = WOutputHelper::isVulkanOutputLayerCompositorRequested();
+    const bool automaticLayerCompositor = !explicitLayerCompositor
+        && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+    if (!vulkanOutputLayerCompositorDisabled()
+        && (explicitLayerCompositor || automaticLayerCompositor)) {
+        if (wlr_renderer_is_vk(m_renderer->handle())) {
+            qCInfo(lcWlVulkanCompositor)
+                << "Vulkan output-layer compositor enabled: Qt Quick renders an intermediate dmabuf layer,"
+                   " then wlroots Vulkan render pass commits the output."
+                << (explicitLayerCompositor ? "mode: explicit environment request"
+                                            : "mode: automatic for Qt Quick Vulkan RHI");
+        } else {
+            qCInfo(lcWlVulkanCompositor)
+                << "Vulkan output-layer compositor requested but ignored because wlroots renderer is not Vulkan.";
+        }
+    }
+#endif
+
     if (QSGRendererInterface::isApiRhiBased(graphicsApi()))
         initRCWithRhi();
     Q_ASSERT(context);
@@ -1355,20 +2391,45 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
 // sanity check for Vulkan
 #ifdef ENABLE_VULKAN_RENDER
     if (rhiSupport->rhiBackend() == QRhi::Vulkan) {
+        if (!m_renderer || !m_renderer->handle() || !wlr_renderer_is_vk(m_renderer->handle())) {
+            qCWarning(lcWlRenderer)
+                << "Vulkan: Qt RHI requested Vulkan, but wlroots renderer is not Vulkan."
+                << "Set WLR_RENDERER=vulkan or force Qt RHI OpenGL for the legacy bridge.";
+            return false;
+        }
+
         vkInstance.reset(new QVulkanInstance());
 
         auto phdev = wlr_vk_renderer_get_physical_device(m_renderer->handle());
         auto dev = wlr_vk_renderer_get_device(m_renderer->handle());
         auto queue_family = wlr_vk_renderer_get_queue_family(m_renderer->handle());
+        if (Q_UNLIKELY(!phdev || !dev)) {
+            qCWarning(lcWlRenderer) << "Vulkan: wlroots renderer exposed null VkPhysicalDevice/VkDevice, cannot adopt into Qt RHI";
+            return false;
+        }
 
 #if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
         auto instance = wlr_vk_renderer_get_instance(m_renderer->handle());
+        if (Q_UNLIKELY(!instance)) {
+            qCWarning(lcWlRenderer)
+                << "Vulkan: wlroots renderer exposed null VkInstance, cannot adopt into Qt RHI";
+            return false;
+        }
         vkInstance->setVkInstance(instance);
 #endif
         //        vkInstance->setExtensions(fromCStyleList(vkRendererAttribs.extension_count, vkRendererAttribs.extensions));
         //        vkInstance->setLayers(fromCStyleList(vkRendererAttribs.layer_count, vkRendererAttribs.layers));
         vkInstance->setApiVersion({1, 1, 0});
-        vkInstance->create();
+        if (!vkInstance->create()) {
+            qCWarning(lcWlRenderer) << "Vulkan: QVulkanInstance::create() failed when adopting wlroots VkInstance, errorCode=" << vkInstance->errorCode();
+            return false;
+        }
+        qCInfo(lcWlRenderer)
+            << "Vulkan: adopting wlroots VkInstance/VkDevice into Qt RHI"
+            << "instance" << Qt::hex << reinterpret_cast<quintptr>(wlr_vk_renderer_get_instance(m_renderer->handle()))
+            << "physicalDevice" << reinterpret_cast<quintptr>(phdev)
+            << "device" << reinterpret_cast<quintptr>(dev)
+            << Qt::dec << "queueFamily" << queue_family;
         q->setVulkanInstance(vkInstance.data());
 
         auto gd = QQuickGraphicsDevice::fromDeviceObjects(phdev, dev, queue_family);
@@ -1376,17 +2437,56 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
     } else
 #endif
     if (rhiSupport->rhiBackend() == QRhi::OpenGLES2) {
-        Q_ASSERT(wlr_renderer_is_gles2(m_renderer->handle()));
-        auto egl = wlr_gles2_renderer_get_egl(m_renderer->handle());
-        auto display = wlr_egl_get_display(egl);
-        auto context = wlr_egl_get_context(egl);
+        if (wlr_renderer_is_gles2(m_renderer->handle())) {
+            // GL wlroots renderer: adopt its EGL context (shared GL context,
+            // textures interoperable without dmabuf import).
+            auto egl = wlr_gles2_renderer_get_egl(m_renderer->handle());
+            auto display = wlr_egl_get_display(egl);
+            auto context = wlr_egl_get_context(egl);
 
-        this->glContext = new QW::OpenGLContext(display, context, rc());
-        bool ok = this->glContext->create();
-        if (!ok)
-            return false;
+            this->glContext = new QW::OpenGLContext(display, context, rc());
+            bool ok = this->glContext->create();
+            if (!ok)
+                return false;
 
-        q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+            q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+        } else {
+            // Vulkan wlroots renderer with GL Qt RHI: the waylib platform
+            // plugin (qwlrootsintegration.cpp) only accepts QW::OpenGLContext
+            // and uses its eglDisplay()/eglContext() directly for EGLConfig
+            // lookup and makeCurrent. We cannot pass placeholder EGL handles
+            // (EGL_NO_DISPLAY causes "Cannot find EGLConfig" → QRhi creation
+            // fails → crash). Instead, create an independent wlr_egl from the
+            // renderer's drm_fd (wlr_renderer_get_drm_fd works for Vulkan
+            // renderers too), and adopt its EGL display/context into a
+            // QW::OpenGLContext. This EGL context is independent of the
+            // wlroots Vulkan renderer — it's used solely for Qt RHI GL
+            // rendering and EGL dmabuf import.
+            int drm_fd = wlr_renderer_get_drm_fd(m_renderer->handle());
+            if (drm_fd < 0) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: wlr_renderer_get_drm_fd failed";
+                return false;
+            }
+            struct wlr_egl *egl = wlr_egl_create_with_drm_fd(drm_fd);
+            if (!egl) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: wlr_egl_create_with_drm_fd failed";
+                return false;
+            }
+
+            EGLDisplay display = wlr_egl_get_display(egl);
+            EGLContext context = wlr_egl_get_context(egl);
+            this->glContext = new QW::OpenGLContext(display, context, rc());
+            bool ok = this->glContext->create();
+            if (!ok) {
+                qCWarning(lcWlRenderer) << "Vulkan+GL: failed to create QW::OpenGLContext";
+                wlr_egl_destroy(egl);
+                return false;
+            }
+
+            q->setGraphicsDevice(QQuickGraphicsDevice::fromOpenGLContext(this->glContext));
+            m_independentEgl = egl;  // destroyed when window is destroyed
+            qCInfo(lcWlRenderer) << "Vulkan wlroots renderer with GL Qt RHI: using independent EGL context for dmabuf import";
+        }
     } else {
         return false;
     }
@@ -1484,9 +2584,43 @@ WOutputRenderWindowPrivate::doRenderOutputs(qw_output *needsFrameOutput, const Q
         if (!helper->output()->depends().isEmpty())
             updateDirtyNodes();
 
+#ifdef ENABLE_VULKAN_RENDER
+        if (helper->shouldDeferVulkanRenderRetry())
+            continue;
+#endif
+
+#ifdef ENABLE_VULKAN_RENDER
+        const bool useVulkanLayerCompositor = helper->usesVulkanOutputLayerCompositor();
+        WBufferRenderer::RenderFlags renderFlags =
+            WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject;
+        if (useVulkanLayerCompositor)
+            renderFlags |= WBufferRenderer::DontConfigureSwapchain;
+        if (useVulkanLayerCompositor) {
+            qCDebug(lcWlVulkanCompositor)
+                << "Rendering Qt Quick scene to intermediate Vulkan compositor layer for output"
+                << helper->qwoutput()->handle()->name
+                << "size" << helper->output()->output()->size()
+                << "format" << Qt::hex << format << Qt::dec;
+        }
+#else
+        const WBufferRenderer::RenderFlags renderFlags =
+            WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject;
+#endif
+
         qw_buffer *buffer = helper->beginRender(helper->bufferRenderer(), helper->output()->output()->size(), format,
-                                                WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject);
+                                                renderFlags);
         Q_ASSERT(buffer == helper->bufferRenderer()->currentBuffer());
+        if (!buffer) {
+#ifdef ENABLE_VULKAN_RENDER
+            if (!helper->extraState() && helper->noteVulkanRenderFailed())
+                continue;
+#endif
+        }
+#ifdef ENABLE_VULKAN_RENDER
+        else {
+            helper->noteVulkanRenderSucceeded();
+        }
+#endif
         if (buffer) {
             helper->render(helper->bufferRenderer(), 0, renderMatrix,
                            helper->output()->effectiveSourceRect(),
@@ -1537,6 +2671,40 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
         return;
 
     inRendering = true;
+#ifdef ENABLE_VULKAN_RENDER
+    ++vulkanDirectSurfaceCollectionSerial;
+    for (auto it = vulkanDirectSurfaceLayers.begin(); it != vulkanDirectSurfaceLayers.end();) {
+        auto &state = it.value();
+        const quint64 lastActivityFrame = qMax(state.lastUpdatedFrame, state.lastRenderedFrame);
+        if (state.contentItem.isNull()
+            || state.surfaceItem.isNull()
+            || (lastActivityFrame > 0
+                && vulkanDirectSurfaceCollectionSerial - lastActivityFrame > 600)) {
+            it = vulkanDirectSurfaceLayers.erase(it);
+        } else {
+            state.overlaySucceededLastFrame = state.overlaySucceededThisFrame;
+            state.overlaySucceededThisFrame = false;
+
+            const auto candidate = evaluateVulkanDirectSurfaceLayer(
+                state, vulkanDirectSurfaceCollectionSerial);
+            const bool shouldHideInQt = vulkanDirectSurfaceHideQtContentRequested()
+                && candidate.eligible
+                && state.overlaySucceededLastFrame;
+            if (state.hiddenInQt && !shouldHideInQt) {
+                state.hiddenInQt = false;
+                state.directActive = false;
+                if (state.contentItem)
+                    state.contentItem->update();
+            } else if (!state.hiddenInQt && shouldHideInQt) {
+                state.hiddenInQt = true;
+                state.directActive = true;
+                if (state.contentItem)
+                    state.contentItem->update();
+            }
+            ++it;
+        }
+    }
+#endif
 
     W_Q(WOutputRenderWindow);
     for (OutputLayer *layer : std::as_const(layers)) {
@@ -1557,9 +2725,20 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
 
     Q_EMIT q->afterRendering();
     runAndClearJobs(&afterRenderingJobs);
+#ifdef ENABLE_VULKAN_RENDER
+    dumpVulkanDirectSurfaceCandidates();
+#endif
 
     if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
         rc()->endFrame();
+
+#ifdef ENABLE_VULKAN_RENDER
+    for (const auto &commitTarget : std::as_const(needsCommit)) {
+        WBufferRenderer *bufferRenderer = commitTarget.second;
+        if (bufferRenderer->currentBuffer())
+            bufferRenderer->releaseCurrentBufferForScanout();
+    }
+#endif
 
     // prevent gles2-render exception in wlroots.
     // wlroots may have render operations after commit, so do
@@ -1571,8 +2750,13 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     if (doCommit) {
         committedOutputs.reserve(needsCommit.size());
         for (auto i : std::as_const(needsCommit)) {
+            bool commitAttempted = false;
+            bool commitSucceeded = false;
+            const bool hadCurrentBuffer = i.second->currentBuffer();
             if (Q_UNLIKELY(!i.first->framePending())) {
-                if (Q_LIKELY(i.first->commit(i.second))) {
+                commitAttempted = true;
+                commitSucceeded = i.first->commit(i.second);
+                if (Q_LIKELY(commitSucceeded)) {
                     // Make sure the output is still valid after commit
                     auto output = i.first->output()->output();
                     if (Q_LIKELY(needsFrameOutput)) {
@@ -1585,11 +2769,17 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
                 }
             }
 
-            if (i.second->currentBuffer()) {
+            if (hadCurrentBuffer) {
                 i.second->endRender();
             }
 
             i.first->resetState();
+#ifdef ENABLE_VULKAN_RENDER
+            if (hadCurrentBuffer && commitAttempted && !commitSucceeded
+                && i.first->noteVulkanRenderFailed()) {
+                i.first->update();
+            }
+#endif
         }
     }
 

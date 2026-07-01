@@ -350,6 +350,7 @@ struct WlrAndRhiTexture {
     struct wlr_buffer *buffer = nullptr;
     qw_texture *wlrTexture = nullptr;
     QRhiTexture *rhiTexture = nullptr;
+    WRenderHelper::NativeTextureCleanup nativeCleanup;
 };
 
 class Q_DECL_HIDDEN RhiTextureManager : public DataManager<RhiTextureManager, WlrAndRhiTexture, QRhiTexture::Format, uint32_t, uint64_t, const QSize&>
@@ -382,11 +383,13 @@ class Q_DECL_HIDDEN RhiTextureManager : public DataManager<RhiTextureManager, Wl
         if (!texture.rhiTexture)
             return nullptr;
 
-        return new WlrAndRhiTexture{texture.buffer, texture.texture, texture.rhiTexture};
+        return new WlrAndRhiTexture{texture.buffer, texture.texture,
+                                    texture.rhiTexture, texture.nativeCleanup};
     }
 
     static void destroy(WlrAndRhiTexture *texture) {
         delete texture->rhiTexture;
+        WRenderHelper::releaseNativeTexture(&texture->nativeCleanup);
         delete texture->wlrTexture;
         if (texture->buffer)
             wlr_buffer_drop(texture->buffer);

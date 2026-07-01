@@ -12,6 +12,10 @@
 
 Q_MOC_INCLUDE(<wquickoutputlayout.h>)
 
+QW_BEGIN_NAMESPACE
+class qw_buffer;
+QW_END_NAMESPACE
+
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
 class WOutputViewport;
@@ -19,6 +23,8 @@ class WOutputLayer;
 class WBufferRenderer;
 class WOutputHelper;
 class WOutputRenderWindowPrivate;
+class WSurface;
+class WSurfaceItem;
 class WAYLIB_SERVER_EXPORT WOutputRenderWindow : public QQuickWindow, public QQmlParserStatus
 {
     Q_OBJECT
@@ -65,6 +71,19 @@ public:
 
     bool disableLayers() const;
     void setDisableLayers(bool newDisableLayers);
+
+#ifdef ENABLE_VULKAN_RENDER
+    bool updateVulkanDirectSurfaceLayer(QQuickItem *contentItem,
+                                        WSurface *surface,
+                                        QW_NAMESPACE::qw_buffer *buffer,
+                                        const QRectF &localRect,
+                                        const QRectF &sourceRect,
+                                        qreal devicePixelRatio,
+                                        bool live,
+                                        bool cacheLastBuffer,
+                                        WSurfaceItem *surfaceItem);
+    void removeVulkanDirectSurfaceLayer(QQuickItem *contentItem);
+#endif
 
 public Q_SLOTS:
     void render();

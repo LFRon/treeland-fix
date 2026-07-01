@@ -20,13 +20,38 @@
 
 #include <QWindow>
 #include <QQuickWindow>
+#include <QByteArray>
 #ifndef QT_NO_OPENGL
 #include <QOpenGLContext>
 #endif
 #include <private/qquickwindow_p.h>
 
+extern "C" {
+#include <wlr/render/pass.h>
+#include <wlr/render/wlr_renderer.h>
+#include <wlr/render/wlr_texture.h>
+#include <wlr/types/wlr_output.h>
+#ifdef ENABLE_VULKAN_RENDER
+#include <wlr/render/vulkan.h>
+#endif
+}
+
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+static bool envFlagEnabled(const char *name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return !value.isEmpty() && value != "0" && value != "false"
+        && value != "no" && value != "off";
+}
+
+static bool vulkanOutputLayerCompositorDisabled()
+{
+    static const bool disabled = envFlagEnabled("WAYLIB_VK_DISABLE_OUTPUT_LAYER_COMPOSITOR")
+        || envFlagEnabled("TREELAND_VK_DISABLE_OUTPUT_LAYER_COMPOSITOR");
+    return disabled;
+}
 
 class Q_DECL_HIDDEN WOutputHelperPrivate : public WObjectPrivate
 {
@@ -217,6 +242,175 @@ void WOutputHelper::setLayers(const wlr_output_layer_state_array &layers)
         d->state.layers = nullptr;
         d->state.committed &= (~WLR_OUTPUT_STATE_LAYERS);
     }
+}
+
+bool WOutputHelper::isVulkanOutputLayerCompositorRequested()
+{
+    static const bool enabled = envFlagEnabled("WAYLIB_VK_OUTPUT_LAYER_COMPOSITOR")
+        || envFlagEnabled("TREELAND_VK_OUTPUT_LAYER_COMPOSITOR");
+    return enabled;
+}
+
+bool WOutputHelper::usesVulkanOutputLayerCompositor() const
+{
+#ifdef ENABLE_VULKAN_RENDER
+    W_DC(WOutputHelper);
+    if (vulkanOutputLayerCompositorDisabled())
+        return false;
+    if (!d->renderer() || !wlr_renderer_is_vk(d->renderer()->handle()))
+        return false;
+
+    return isVulkanOutputLayerCompositorRequested()
+        || WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+#else
+    return false;
+#endif
+}
+
+bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer,
+                                                const VulkanOutputLayerRenderHook &renderHook)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    W_D(WOutputHelper);
+
+    // Execute before-commit jobs exactly like commit().
+    QList<WOutputHelperPrivate::CommitJobEntry> beforeJobs;
+    beforeJobs.swap(d->beforeCommitJobs);
+    for (const auto &entry : beforeJobs) {
+        entry.jobWithState(true, d->extraState);
+    }
+
+    wlr_output_state state = d->state;
+    wlr_output_state_init(&d->state);
+
+    auto finishCommit = [d, &state](bool ok) {
+        wlr_output_state_finish(&state);
+        ExtraState committedExtraState = d->extraState;
+
+        if (Q_UNLIKELY(d->extraState)) {
+            d->extraState.reset();
+        }
+
+        QList<WOutputHelperPrivate::CommitJobEntry> afterJobs;
+        afterJobs.swap(d->afterCommitJobs);
+        for (const auto &entry : afterJobs) {
+            entry.jobWithState(ok, committedExtraState);
+        }
+        return ok;
+    };
+
+    if (Q_UNLIKELY(d->extraState)) {
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: committing external output state only for"
+            << d->qwoutput()->handle()->name;
+        wlr_output_state_finish(&state);
+        wlr_output_state_copy(&state, d->extraState.get());
+
+        const bool ok = d->qwoutput()->commit_state(&state);
+        if (!ok) {
+            qCCritical(lcWlVulkanCompositor)
+                << "Vulkan output-layer compositor: state-only commit failed on output"
+                << d->qwoutput()->handle()->name;
+        }
+        return finishCommit(ok);
+    }
+
+    if (Q_UNLIKELY(!usesVulkanOutputLayerCompositor())) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor requested for non-Vulkan renderer on output"
+            << d->qwoutput()->handle()->name;
+        return finishCommit(false);
+    }
+
+    if (Q_UNLIKELY(!sourceBuffer)) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: missing Qt layer buffer for output"
+            << d->qwoutput()->handle()->name;
+        return finishCommit(false);
+    }
+
+    wlr_texture *sourceTexture =
+        wlr_texture_from_buffer(d->renderer()->handle(), sourceBuffer->handle());
+    if (Q_UNLIKELY(!sourceTexture)) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: failed to import Qt layer buffer as texture for output"
+            << d->qwoutput()->handle()->name
+            << "buffer size" << sourceBuffer->handle()->width << "x" << sourceBuffer->handle()->height
+            << "locks" << sourceBuffer->handle()->n_locks;
+        return finishCommit(false);
+    }
+
+    wlr_buffer_pass_options passOptions = {};
+    wlr_render_pass *pass =
+        wlr_output_begin_render_pass(d->qwoutput()->handle(), &state, &passOptions);
+    if (Q_UNLIKELY(!pass)) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: failed to begin output render pass for"
+            << d->qwoutput()->handle()->name
+            << "layer buffer size" << sourceBuffer->handle()->width << "x" << sourceBuffer->handle()->height;
+        wlr_texture_destroy(sourceTexture);
+        return finishCommit(false);
+    }
+
+    int width = 0;
+    int height = 0;
+    wlr_output_transformed_resolution(d->qwoutput()->handle(), &width, &height);
+
+    wlr_render_rect_options clearOptions = {};
+    clearOptions.box.x = 0;
+    clearOptions.box.y = 0;
+    clearOptions.box.width = width;
+    clearOptions.box.height = height;
+    clearOptions.color.r = 0.0f;
+    clearOptions.color.g = 0.0f;
+    clearOptions.color.b = 0.0f;
+    clearOptions.color.a = 1.0f;
+    clearOptions.blend_mode = WLR_RENDER_BLEND_MODE_NONE;
+    wlr_render_pass_add_rect(pass, &clearOptions);
+
+    wlr_render_texture_options textureOptions = {};
+    textureOptions.texture = sourceTexture;
+    textureOptions.dst_box.x = 0;
+    textureOptions.dst_box.y = 0;
+    textureOptions.dst_box.width = width;
+    textureOptions.dst_box.height = height;
+    textureOptions.transform = WL_OUTPUT_TRANSFORM_NORMAL;
+    textureOptions.filter_mode = WLR_SCALE_FILTER_BILINEAR;
+    textureOptions.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED;
+    wlr_render_pass_add_texture(pass, &textureOptions);
+
+    if (renderHook)
+        renderHook(pass, QSize(width, height));
+
+    const bool submitted = wlr_render_pass_submit(pass);
+    wlr_texture_destroy(sourceTexture);
+    if (Q_UNLIKELY(!submitted)) {
+        qCWarning(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: render pass submit failed for output"
+            << d->qwoutput()->handle()->name
+            << "target size" << width << "x" << height;
+        return finishCommit(false);
+    }
+
+    qCDebug(lcWlVulkanCompositor)
+        << "Vulkan output-layer compositor: committing output"
+        << d->qwoutput()->handle()->name
+        << "target" << width << "x" << height
+        << "source buffer" << sourceBuffer->handle()->width << "x" << sourceBuffer->handle()->height
+        << "source locks" << sourceBuffer->handle()->n_locks;
+
+    const bool ok = d->qwoutput()->commit_state(&state);
+    if (!ok) {
+        qCCritical(lcWlVulkanCompositor)
+            << "Vulkan output-layer compositor: commit failed on output"
+            << d->qwoutput()->handle()->name
+            << "target" << width << "x" << height;
+    }
+    return finishCommit(ok);
+#else
+    Q_UNUSED(sourceBuffer);
+    return false;
+#endif
 }
 
 bool WOutputHelper::commit()
