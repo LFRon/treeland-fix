@@ -7,6 +7,10 @@
 
 #include <QSGTextureProvider>
 
+QT_BEGIN_NAMESPACE
+class QRhiCommandBuffer;
+QT_END_NAMESPACE
+
 QW_BEGIN_NAMESPACE
 class qw_texture;
 class qw_buffer;
@@ -34,9 +38,13 @@ public:
 
     bool setBuffer(QW_NAMESPACE::qw_buffer *buffer);
     bool setBuffer(QW_NAMESPACE::qw_buffer *buffer, wlr_surface *surface);
+    bool setBuffer(QW_NAMESPACE::qw_buffer *buffer, wlr_surface *surface,
+                   QRhiCommandBuffer *commandBuffer);
     bool setTexture(QW_NAMESPACE::qw_texture *texture, QW_NAMESPACE::qw_buffer *srcBuffer);
     bool setTexture(QW_NAMESPACE::qw_texture *texture, QW_NAMESPACE::qw_buffer *srcBuffer,
                     wlr_surface *surface);
+    bool setTexture(QW_NAMESPACE::qw_texture *texture, QW_NAMESPACE::qw_buffer *srcBuffer,
+                    wlr_surface *surface, QRhiCommandBuffer *commandBuffer);
     void invalidate();
 
     QSGTexture *texture() const override;

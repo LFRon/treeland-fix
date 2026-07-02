@@ -13,18 +13,18 @@
 #include "wsurfaceitem_p.h"
 #include "wayliblogging.h"
 
-#ifdef ENABLE_VULKAN_RENDER
-extern "C" {
-#include <wlr/types/wlr_linux_drm_syncobj_v1.h>
-}
-#endif
-
 #include <private/qquickitem_p.h>
+#ifdef ENABLE_VULKAN_RENDER
+#include <private/qsgdefaultrendercontext_p.h>
+#endif
 
 #include <qwalphamodifierv1.h>
 #include <qwbox.h>
 #include <qwbuffer.h>
 #include <qwcompositor.h>
+#ifdef ENABLE_VULKAN_RENDER
+#include <qwlinuxdrmsyncobjv1.h>
+#endif
 #include <qwrenderer.h>
 #include <qwsubcompositor.h>
 #include <qwtexture.h>
@@ -37,12 +37,19 @@ extern "C" {
 #include <QSGRenderNode>
 
 #include <memory>
+#include <vector>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
 #ifdef ENABLE_VULKAN_RENDER
 static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer);
+
+static QRhiCommandBuffer *currentFrameCommandBuffer(QSGRenderContext *context)
+{
+    auto *defaultContext = qobject_cast<QSGDefaultRenderContext *>(context);
+    return defaultContext ? defaultContext->currentFrameCommandBuffer() : nullptr;
+}
 #endif
 
 class Q_DECL_HIDDEN SubsurfaceContainer : public QQuickItem
@@ -239,6 +246,9 @@ public:
 #ifdef ENABLE_VULKAN_RENDER
         textureRetryBackoffFrames = 0;
         textureRetryDelayFrames = 0;
+        releaseDeferredDirectBuffers();
+        directBuffer.reset();
+        pendingDirectBuffer.reset();
 #endif
 
         if (frameDoneConnection)
@@ -248,6 +258,10 @@ public:
 
         if (dontCacheLastBuffer) {
             buffer.reset();
+#ifdef ENABLE_VULKAN_RENDER
+            releaseDeferredDirectBuffers();
+            directBuffer.reset();
+#endif
             cleanTextureProvider();
             q->update();
         }
@@ -273,15 +287,22 @@ public:
                 // Get the new buffer pointer from surface
                 auto newBuffer = surface->buffer();
 #ifdef ENABLE_VULKAN_RENDER
-                registerSurfaceBufferExplicitRelease(surface.data(), newBuffer);
+                auto newDirectBuffer = surface->committedBuffer();
+                registerSurfaceBufferExplicitRelease(surface.data(), newDirectBuffer);
 #endif
 
                 if (!live) {
                     // Non-live mode: defer to pendingBuffer
                     pendingBuffer.reset(newBuffer);
+#ifdef ENABLE_VULKAN_RENDER
+                    pendingDirectBuffer.reset(newDirectBuffer);
+#endif
                 } else {
                     // Live mode: update buffer immediately
                     buffer.reset(newBuffer);
+#ifdef ENABLE_VULKAN_RENDER
+                    directBuffer.reset(newDirectBuffer);
+#endif
                     q->update();
                 }
             }
@@ -309,6 +330,9 @@ public:
             // wayland protocol job should not run in rendering thread, so set context qobject to contentItem
             frameDoneConnection = QObject::connect(rw, &WOutputRenderWindow::renderEnd,
                                                    q, [this, q] (const QList<QPointer<WOutput>> committedOutputs) {
+#ifdef ENABLE_VULKAN_RENDER
+                                                       releaseDeferredDirectBuffers();
+#endif
                                                        lastRendered = rendered;
                                                        if (Q_LIKELY((rendered || q->isVisible()) && live)
                                                            && surface &&
@@ -382,14 +406,54 @@ public:
             : 1;
         textureRetryDelayFrames = textureRetryBackoffFrames;
     }
+
+    inline void deferDirectBufferReleaseAfterRender() const {
+        if (!directBuffer)
+            return;
+
+        if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
+            qCDebug(lcWlSurface)
+                << "Deferring direct client buffer release until render end"
+                << "surface" << surface
+                << "buffer" << directBuffer.get()
+                << "deferredCount" << deferredDirectBufferReleases.size() + 1;
+        }
+        deferredDirectBufferReleases.emplace_back(std::move(directBuffer));
+    }
+
+    inline void releaseDeferredDirectBuffers() const {
+        if (deferredDirectBufferReleases.empty())
+            return;
+
+        if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
+            qCDebug(lcWlSurface)
+                << "Releasing deferred direct client buffers after render"
+                << "surface" << surface
+                << "count" << deferredDirectBufferReleases.size();
+        }
+        deferredDirectBufferReleases.clear();
+    }
 #endif
 
     inline void swapBufferIfNeeded() {
         if (pendingBuffer) {
             buffer = std::move(pendingBuffer);
+#ifdef ENABLE_VULKAN_RENDER
+            directBuffer = std::move(pendingDirectBuffer);
+            pendingDirectBuffer.reset();
+#endif
             textureDirty = true;
         }
     }
+
+#ifdef ENABLE_VULKAN_RENDER
+    inline qw_buffer *textureBufferForPreferredPath(WOutputRenderWindow *renderWindow) const {
+        if (directBuffer && WSGTextureProvider::prefersDirectBufferImport(renderWindow))
+            return directBuffer.get();
+
+        return buffer.get();
+    }
+#endif
 
     inline void setDevicePixelRatio(qreal dpr) {
         if (dpr == devicePixelRatio)
@@ -429,6 +493,9 @@ public:
     bool lastRendered = false;
     QAtomicInteger<bool> rendered = false;
 #ifdef ENABLE_VULKAN_RENDER
+    mutable BufferRef directBuffer;
+    mutable std::vector<BufferRef> deferredDirectBufferReleases;
+    BufferRef pendingDirectBuffer;
     int textureRetryBackoffFrames = 0;
     int textureRetryDelayFrames = 0;
 #endif
@@ -531,11 +598,14 @@ WSGTextureProvider *WSurfaceItemContent::wTextureProvider() const
                 : nullptr;
 #ifdef ENABLE_VULKAN_RENDER
             if (WSGTextureProvider::prefersDirectBufferImport(w)) {
-                textureUpdated = d->textureProvider->setBuffer(d->buffer.get(), surfaceHandle);
+                auto *preferredBuffer = d->textureBufferForPreferredPath(w);
+                textureUpdated = d->textureProvider->setBuffer(preferredBuffer, surfaceHandle);
                 qCDebug(lcWlSurface)
                     << "Initialized surface texture provider through preferred direct client dmabuf path"
                     << "surface" << d->surface
-                    << "buffer" << d->buffer.get()
+                    << "buffer" << preferredBuffer
+                    << "legacyBuffer" << d->buffer.get()
+                    << "directBuffer" << d->directBuffer.get()
                     << "updated" << textureUpdated;
             }
 #endif
@@ -548,8 +618,12 @@ WSGTextureProvider *WSurfaceItemContent::wTextureProvider() const
                     textureUpdated = d->textureProvider->setBuffer(d->buffer.get(), surfaceHandle);
                 }
             }
-            if (textureUpdated && d->textureProvider->texture())
+            if (textureUpdated && d->textureProvider->texture()) {
                 d->textureDirty = false;
+#ifdef ENABLE_VULKAN_RENDER
+                d->deferDirectBufferReleaseAfterRender();
+#endif
+            }
         }
     }
     return d->textureProvider;
@@ -705,12 +779,11 @@ static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *b
     }
 
     auto *syncState =
-        wlr_linux_drm_syncobj_v1_get_surface_state(surface->handle()->handle());
-    if (!syncState || !syncState->release_timeline)
+        qw_linux_drm_syncobj_surface_v1_state::get_surface_state(surface->handle()->handle());
+    if (!syncState || !syncState->has_release_timeline())
         return;
 
-    auto *wlrBuffer = buffer->handle();
-    if (wlrBuffer->n_locks == 0) {
+    if (buffer->lock_count() == 0) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan surface explicit release skipped: buffer has no locks"
             << "surface" << surface
@@ -718,12 +791,12 @@ static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *b
         return;
     }
 
-    if (!wlr_linux_drm_syncobj_v1_state_signal_release_with_buffer(syncState, wlrBuffer)) {
+    if (!syncState->signal_release_with_buffer(buffer)) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan surface explicit release registration failed"
             << "surface" << surface
             << "buffer" << buffer
-            << "releasePoint" << syncState->release_point;
+            << "releasePoint" << syncState->release_point();
         return;
     }
 
@@ -731,7 +804,7 @@ static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *b
         << "Vulkan surface explicit release registered"
         << "surface" << surface
         << "buffer" << buffer
-        << "releasePoint" << syncState->release_point;
+        << "releasePoint" << syncState->release_point();
 }
 #endif
 
@@ -742,6 +815,10 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
     const QRectF targetGeometry(d->ignoreBufferOffset ? QPointF() : d->bufferOffset, size());
 
     auto tp = wTextureProvider();
+    QRhiCommandBuffer *commandBuffer = nullptr;
+#ifdef ENABLE_VULKAN_RENDER
+    commandBuffer = currentFrameCommandBuffer(d->sceneGraphRenderContext());
+#endif
     wlr_surface *surfaceHandle = d->surface && d->surface->handle()
         ? d->surface->handle()->handle()
         : nullptr;
@@ -754,25 +831,33 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
         bool textureUpdated = false;
 #ifdef ENABLE_VULKAN_RENDER
         if (WSGTextureProvider::prefersDirectBufferImport(tp->window())) {
-            textureUpdated = tp->setBuffer(d->buffer.get(), surfaceHandle);
+            auto *preferredBuffer = d->textureBufferForPreferredPath(tp->window());
+            textureUpdated = tp->setBuffer(preferredBuffer, surfaceHandle, commandBuffer);
             qCDebug(lcWlSurface)
                 << "Updated surface texture through preferred direct client dmabuf path"
                 << "surface" << d->surface
-                << "buffer" << d->buffer.get()
-                << "updated" << textureUpdated;
+                << "buffer" << preferredBuffer
+                << "legacyBuffer" << d->buffer.get()
+                << "directBuffer" << d->directBuffer.get()
+                << "updated" << textureUpdated
+                << "commandBuffer" << quintptr(commandBuffer);
         }
 #endif
         auto texture = !textureUpdated && d->surface ? d->surface->handle()->get_texture() : nullptr;
         if (texture) {
-            textureUpdated = tp->setTexture(qw_texture::from(texture), d->buffer.get(), surfaceHandle);
+            textureUpdated = tp->setTexture(qw_texture::from(texture), d->buffer.get(),
+                                            surfaceHandle, commandBuffer);
         } else if (!textureUpdated) {
-            textureUpdated = tp->setBuffer(d->buffer.get(), surfaceHandle);
+            textureUpdated = tp->setBuffer(d->buffer.get(), surfaceHandle, commandBuffer);
         }
 #ifdef ENABLE_VULKAN_RENDER
         d->noteTextureUpdateResult(textureUpdated);
 #endif
         if (textureUpdated) {
             d->textureDirty = false;
+#ifdef ENABLE_VULKAN_RENDER
+            d->deferDirectBufferReleaseAfterRender();
+#endif
         }
     }
 
@@ -783,6 +868,7 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
                 << "Surface texture node skipped"
                 << "surfacePtr" << quintptr(d->surface.data())
                 << "bufferPtr" << quintptr(d->buffer.get())
+                << "directBufferPtr" << quintptr(d->directBuffer.get())
                 << "hasTexture" << bool(tp->texture())
                 << "itemSize" << size()
                 << "targetRect" << targetGeometry
@@ -821,6 +907,7 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
             << "Surface texture node updated"
             << "surfacePtr" << quintptr(d->surface.data())
             << "bufferPtr" << quintptr(d->buffer.get())
+            << "directBufferPtr" << quintptr(d->directBuffer.get())
             << "texturePtr" << quintptr(texture)
             << "textureSize" << texture->textureSize()
             << "textureHasAlpha" << texture->hasAlphaChannel()

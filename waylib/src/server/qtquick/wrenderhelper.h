@@ -18,6 +18,7 @@ class QRhiTexture;
 class QSGTexture;
 class QSGPlainTexture;
 class QRhi;
+class QRhiCommandBuffer;
 QT_END_NAMESPACE
 
 QW_BEGIN_NAMESPACE
@@ -96,13 +97,18 @@ public:
     static bool importVulkanTextureFromBuffer(QRhi *rhi, QW_NAMESPACE::qw_buffer *buffer,
                                               wlr_surface *surface,
                                               ImportedVulkanTexture *importedTexture);
+    static bool acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
+                                                       QW_NAMESPACE::qw_buffer *buffer,
+                                                       wlr_surface *surface,
+                                                       NativeTextureCleanup *nativeCleanup);
     static void releaseImportedVulkanTexture(ImportedVulkanTexture *importedTexture);
 
     static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle,
                             QSGPlainTexture *texture, QW_NAMESPACE::qw_buffer *buffer = nullptr,
                             NativeTextureCleanup *nativeCleanup = nullptr,
                             bool allowBufferDirectImport = true,
-                            wlr_surface *surface = nullptr);
+                            wlr_surface *surface = nullptr,
+                            QRhiCommandBuffer *commandBuffer = nullptr);
     static bool makeOpenGLTextureFromBuffer(QRhi *rhi, QW_NAMESPACE::qw_buffer *buffer,
                                             QSGPlainTexture *texture,
                                             NativeTextureCleanup *nativeCleanup);

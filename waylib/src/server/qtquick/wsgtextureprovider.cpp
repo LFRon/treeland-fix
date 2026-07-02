@@ -16,6 +16,8 @@
 #include <rhi/qrhi.h>
 #include <private/qsgplaintexture_p.h>
 
+#include <limits>
+
 #ifdef ENABLE_VULKAN_RENDER
 extern "C" {
 #include <wlr/render/dmabuf.h>
@@ -43,6 +45,7 @@ static int bufferLocks(qw_buffer *buffer)
 
 #ifdef ENABLE_VULKAN_RENDER
 static constexpr int s_deferredVulkanTextureReleaseFrames = 3;
+static constexpr int s_vulkanDmabufTextureCacheCapacity = 8;
 
 static bool envFlagExplicitlyDisabled(const char *name)
 {
@@ -105,6 +108,17 @@ public:
         int framesLeft = 0;
     };
 
+    struct VulkanDmabufTextureCacheEntry {
+        QPointer<qw_buffer> buffer;
+        QRhiTexture *rhiTexture = nullptr;
+        WRenderHelper::NativeTextureCleanup nativeCleanup;
+        QSize size;
+        uint32_t drmFormat = 0;
+        uint64_t drmModifier = 0;
+        bool hasAlpha = false;
+        quint64 lastUsed = 0;
+    };
+
     void ensureDeferredVulkanTextureReleaseConnection()
     {
         if (deferredVulkanTextureReleaseConnection || !window)
@@ -159,6 +173,117 @@ public:
         *cleanup = {};
         ensureDeferredVulkanTextureReleaseConnection();
     }
+
+    int findVulkanDmabufTextureCacheEntry(qw_buffer *newBuffer) const
+    {
+        if (!newBuffer)
+            return -1;
+
+        for (int i = 0; i < vulkanDmabufTextureCache.size(); ++i) {
+            if (vulkanDmabufTextureCache[i].buffer == newBuffer)
+                return i;
+        }
+
+        return -1;
+    }
+
+    void releaseVulkanDmabufTextureCacheEntry(int index)
+    {
+        if (index < 0 || index >= vulkanDmabufTextureCache.size())
+            return;
+
+        auto entry = vulkanDmabufTextureCache.takeAt(index);
+        if (entry.rhiTexture == rhiTexture) {
+            qtTexture.setTexture(nullptr);
+            rhiTexture = nullptr;
+            nativeCleanup = {};
+            if (buffer == entry.buffer)
+                buffer = nullptr;
+        }
+
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan renderer dmabuf texture cache evicted"
+            << "buffer" << pointerAddress(entry.buffer.data())
+            << "rhiTexture" << entry.rhiTexture
+            << "size" << entry.size
+            << "format" << Qt::hex << entry.drmFormat << Qt::dec
+            << "modifier" << Qt::hex << entry.drmModifier << Qt::dec
+            << "remaining" << vulkanDmabufTextureCache.size();
+
+        releaseDetachedTexture(nullptr, false, entry.rhiTexture, entry.nativeCleanup);
+    }
+
+    void trimVulkanDmabufTextureCache()
+    {
+        for (int i = vulkanDmabufTextureCache.size() - 1; i >= 0; --i) {
+            const auto &entry = vulkanDmabufTextureCache[i];
+            if (!entry.buffer && entry.rhiTexture != rhiTexture)
+                releaseVulkanDmabufTextureCacheEntry(i);
+        }
+
+        while (vulkanDmabufTextureCache.size() > s_vulkanDmabufTextureCacheCapacity) {
+            int evictIndex = -1;
+            quint64 oldestUse = std::numeric_limits<quint64>::max();
+            for (int i = 0; i < vulkanDmabufTextureCache.size(); ++i) {
+                const auto &entry = vulkanDmabufTextureCache[i];
+                if (entry.rhiTexture == rhiTexture)
+                    continue;
+
+                if (entry.lastUsed < oldestUse) {
+                    oldestUse = entry.lastUsed;
+                    evictIndex = i;
+                }
+            }
+
+            if (evictIndex < 0)
+                break;
+
+            releaseVulkanDmabufTextureCacheEntry(evictIndex);
+        }
+    }
+
+    void clearVulkanDmabufTextureCache()
+    {
+        while (!vulkanDmabufTextureCache.isEmpty())
+            releaseVulkanDmabufTextureCacheEntry(vulkanDmabufTextureCache.size() - 1);
+    }
+
+    void activateVulkanDmabufTextureCacheEntry(int index, qw_buffer *newBuffer,
+                                               const char *backendName, bool cacheHit)
+    {
+        auto &entry = vulkanDmabufTextureCache[index];
+        entry.lastUsed = ++vulkanDmabufTextureUseSerial;
+
+        auto oldTexture = texture;
+        const bool oldOwnsTexture = ownsTexture;
+        auto oldRhiTexture = rhiTexture;
+        auto oldNativeCleanup = nativeCleanup;
+
+        texture = nullptr;
+        ownsTexture = false;
+        buffer = newBuffer;
+        qtTexture.setOwnsTexture(false);
+        qtTexture.setTexture(entry.rhiTexture);
+        qtTexture.setHasAlphaChannel(entry.hasAlpha);
+        qtTexture.setTextureSize(entry.size);
+        rhiTexture = entry.rhiTexture;
+        nativeCleanup = {};
+
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan renderer dmabuf texture import path"
+            << "qtBackend" << backendName
+            << "cacheHit" << cacheHit
+            << "buffer" << pointerAddress(newBuffer)
+            << "rhiTexture" << rhiTexture
+            << "size" << entry.size
+            << "format" << Qt::hex << entry.drmFormat << Qt::dec
+            << "modifier" << Qt::hex << entry.drmModifier << Qt::dec
+            << "locks" << bufferLocks(newBuffer)
+            << "alpha" << qtTexture.hasAlphaChannel()
+            << "cacheSize" << vulkanDmabufTextureCache.size();
+
+        releaseDetachedTexture(oldTexture, oldOwnsTexture, oldRhiTexture, oldNativeCleanup);
+    }
 #endif
 
     void releaseDetachedTexture(qw_texture *texture, bool ownsTexture,
@@ -201,16 +326,20 @@ public:
         texture = nullptr;
         ownsTexture = false;
         buffer = nullptr;
+#ifdef ENABLE_VULKAN_RENDER
+        clearVulkanDmabufTextureCache();
+#endif
     }
 
     bool replaceTexture(qw_texture *newTexture, bool newOwnsTexture, qw_buffer *newBuffer,
-                        bool allowBufferDirectImport = true, wlr_surface *surface = nullptr) {
+                        bool allowBufferDirectImport = true, wlr_surface *surface = nullptr,
+                        QRhiCommandBuffer *commandBuffer = nullptr) {
         Q_ASSERT(newTexture);
 
         WRenderHelper::NativeTextureCleanup newCleanup;
         if (!WRenderHelper::makeTexture(window->rhi(), newTexture, &qtTexture,
                                         newBuffer, &newCleanup, allowBufferDirectImport,
-                                        surface)) {
+                                        surface, commandBuffer)) {
             WRenderHelper::releaseNativeTexture(&newCleanup);
 #ifdef ENABLE_VULKAN_RENDER
             if (newBuffer && !allowBufferDirectImport && window && window->rhi()
@@ -270,9 +399,51 @@ public:
                                                                   &qtTexture, &newCleanup);
         } else if (backend == QRhi::Vulkan) {
             backendName = "Vulkan RHI";
-            imported = WRenderHelper::makeVulkanTextureFromBuffer(window->rhi(), newBuffer,
-                                                                  &qtTexture, &newCleanup,
-                                                                  surface);
+            trimVulkanDmabufTextureCache();
+
+            int cacheIndex = findVulkanDmabufTextureCacheEntry(newBuffer);
+            if (cacheIndex >= 0) {
+                auto &entry = vulkanDmabufTextureCache[cacheIndex];
+                if (WRenderHelper::acquireImportedVulkanTextureFromBuffer(window->rhi(),
+                                                                          newBuffer,
+                                                                          surface,
+                                                                          &entry.nativeCleanup)) {
+                    activateVulkanDmabufTextureCacheEntry(cacheIndex, newBuffer,
+                                                          backendName, true);
+                    return true;
+                }
+
+                qCDebug(lcWlQtQuickTexture)
+                    << "Vulkan renderer dmabuf texture cache entry could not be reacquired,"
+                       " evicting and reimporting"
+                    << "buffer" << pointerAddress(newBuffer)
+                    << "rhiTexture" << entry.rhiTexture
+                    << "size" << entry.size;
+                releaseVulkanDmabufTextureCacheEntry(cacheIndex);
+            }
+
+            WRenderHelper::ImportedVulkanTexture importedTexture;
+            imported = WRenderHelper::importVulkanTextureFromBuffer(window->rhi(), newBuffer,
+                                                                    surface, &importedTexture);
+            if (imported) {
+                VulkanDmabufTextureCacheEntry entry;
+                entry.buffer = newBuffer;
+                entry.rhiTexture = importedTexture.texture;
+                entry.nativeCleanup = importedTexture.nativeCleanup;
+                entry.size = importedTexture.size;
+                entry.drmFormat = importedTexture.drmFormat;
+                entry.drmModifier = importedTexture.drmModifier;
+                entry.hasAlpha = importedTexture.hasAlpha;
+                importedTexture.texture = nullptr;
+                importedTexture.nativeCleanup = {};
+
+                vulkanDmabufTextureCache.append(entry);
+                cacheIndex = vulkanDmabufTextureCache.size() - 1;
+                activateVulkanDmabufTextureCacheEntry(cacheIndex, newBuffer,
+                                                      backendName, false);
+                trimVulkanDmabufTextureCache();
+                return true;
+            }
         }
 
         if (!imported) {
@@ -311,7 +482,7 @@ public:
         return texture || rhiTexture;
     }
 
-    void updateRhiTexture() {
+    void updateRhiTexture(QRhiCommandBuffer *commandBuffer = nullptr) {
         Q_ASSERT(texture);
         // NOTE: We cannot cache by wlr_texture* alone: wlroots may reuse the
         // same texture object (via wlr_client_buffer_apply_damage) while updating
@@ -319,7 +490,8 @@ public:
         // but reuse the provider texture for pure scene graph animation frames.
         WRenderHelper::NativeTextureCleanup newCleanup;
         bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture,
-                                             buffer, &newCleanup);
+                                             buffer, &newCleanup, true, nullptr,
+                                             commandBuffer);
         if (Q_UNLIKELY(!ok)) {
             WRenderHelper::releaseNativeTexture(&newCleanup);
             qCWarning(lcWlQtQuickTexture)
@@ -350,6 +522,8 @@ public:
     bool directBufferImportAllowed = false;
 #ifdef ENABLE_VULKAN_RENDER
     QVector<DeferredVulkanTextureRelease> deferredVulkanTextureReleases;
+    QVector<VulkanDmabufTextureCacheEntry> vulkanDmabufTextureCache;
+    quint64 vulkanDmabufTextureUseSerial = 0;
     QMetaObject::Connection deferredVulkanTextureReleaseConnection;
 #endif
 };
@@ -412,6 +586,12 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer)
 
 bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface)
 {
+    return setBuffer(buffer, surface, nullptr);
+}
+
+bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface,
+                                   QRhiCommandBuffer *commandBuffer)
+{
     W_D(WSGTextureProvider);
 
     const bool sameBuffer = buffer == d->buffer;
@@ -452,6 +632,7 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface)
             << "bufferHasDmabuf" << bufferHasNativeDmabuf
             << "hasExistingTexture" << d->hasTexture()
             << "currentBuffer" << pointerAddress(d->buffer)
+            << "commandBuffer" << pointerAddress(commandBuffer)
             << "size" << bufferSize(buffer);
 
         if (!buffer) {
@@ -498,7 +679,7 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface)
 
         if (d->replaceTexture(texture, ownsTexture, buffer,
                               directImportEligible && !triedDirectBufferImport,
-                              surface)) {
+                              surface, commandBuffer)) {
             Q_EMIT textureChanged();
             return true;
         }
@@ -544,6 +725,13 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
 bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
                                     wlr_surface *surface)
 {
+    return setTexture(texture, srcBuffer, surface, nullptr);
+}
+
+bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
+                                    wlr_surface *surface,
+                                    QRhiCommandBuffer *commandBuffer)
+{
     W_D(WSGTextureProvider);
     if (d->isVulkanRenderer()) {
 #ifdef ENABLE_VULKAN_RENDER
@@ -559,6 +747,7 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
             << "sourceBufferHasDmabuf" << sourceBufferHasDmabuf
             << "hasExistingTexture" << d->hasTexture()
             << "currentBuffer" << pointerAddress(d->buffer)
+            << "commandBuffer" << pointerAddress(commandBuffer)
             << "sourceSize" << bufferSize(srcBuffer);
 
         if (!texture) {
@@ -588,7 +777,7 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
 
         if (d->replaceTexture(texture, false, srcBuffer,
                               directImportEligible && !triedDirectBufferImport,
-                              surface)) {
+                              surface, commandBuffer)) {
             Q_EMIT textureChanged();
             return true;
         }
@@ -600,7 +789,7 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
     d->buffer = srcBuffer;
     d->ownsTexture = false;
     if (texture)
-        d->updateRhiTexture();
+        d->updateRhiTexture(commandBuffer);
 
     Q_EMIT textureChanged();
     return true;
