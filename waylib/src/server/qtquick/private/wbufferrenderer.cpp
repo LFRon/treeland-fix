@@ -37,6 +37,14 @@
 #include <pixman.h>
 #include <drm_fourcc.h>
 #include <xf86drm.h>
+#include <dlfcn.h>
+
+#include <cstdlib>
+#include <cstring>
+
+extern "C" {
+#include <wlr/render/wlr_renderer.h>
+}
 
 using QSGAbsSoftRenderer_NodesMap = QHash<QSGNode*, QSGSoftwareRenderableNode*>;
 W_DECLARE_PRIVATE_MEMBER(QSGAbsSoftRenderer_m_nodes_tag, QSGAbstractSoftwareRenderer, m_nodes, QSGAbsSoftRenderer_NodesMap);
@@ -55,6 +63,35 @@ inline static WImageRenderTarget *getImageFrom(const QQuickRenderTarget &rt)
     return static_cast<WImageRenderTarget*>(d->u.paintDevice);
 }
 
+inline static QRhiTexture *getColorTextureFrom(QRhiRenderTarget *rt)
+{
+    if (!rt)
+        return nullptr;
+
+    auto textureRT = static_cast<QRhiTextureRenderTarget *>(rt);
+    auto colorAttachment = textureRT->description().colorAttachmentAt(0);
+    return colorAttachment ? colorAttachment->texture() : nullptr;
+}
+
+#ifdef ENABLE_VULKAN_RENDER
+static bool vulkanOutputProbeEnabled()
+{
+    static const bool enabled = [] {
+        bool ok = false;
+        const int value = qEnvironmentVariableIntValue("WAYLIB_VK_OUTPUT_PROBE", &ok);
+        return ok ? value != 0 : !qEnvironmentVariableIsEmpty("WAYLIB_VK_OUTPUT_PROBE");
+    }();
+    return enabled;
+}
+
+static PFN_vkGetDeviceProcAddr resolveVkGetDeviceProcAddrForProbe()
+{
+    static PFN_vkGetDeviceProcAddr proc =
+        reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(RTLD_DEFAULT, "vkGetDeviceProcAddr"));
+    return proc;
+}
+#endif
+
 static const wlr_drm_format *pickFormat(qw_renderer *renderer, uint32_t format)
 {
     auto r = renderer->handle();
@@ -66,6 +103,120 @@ static const wlr_drm_format *pickFormat(qw_renderer *renderer, uint32_t format)
         return nullptr;
 
     return wlr_drm_format_set_get(format_set, format);
+}
+
+static QByteArray drmFormatNameForLog(uint32_t format)
+{
+    char *name = drmGetFormatName(format);
+    QByteArray result = name ? QByteArray(name) : QByteArray::number(format, 16);
+    free(name);
+    return result;
+}
+
+static QByteArray drmModifierNameForLog(uint64_t modifier)
+{
+    if (modifier == DRM_FORMAT_MOD_INVALID)
+        return QByteArrayLiteral("INVALID");
+
+    char *name = drmGetFormatModifierName(modifier);
+    QByteArray result = name ? QByteArray(name) : QByteArray::number(modifier, 16);
+    free(name);
+    return result;
+}
+
+static bool drmFormatHasModifier(const wlr_drm_format *format, uint64_t modifier)
+{
+    if (!format)
+        return false;
+
+    for (size_t i = 0; i < format->len; ++i) {
+        if (format->modifiers[i] == modifier)
+            return true;
+    }
+
+    return false;
+}
+
+static bool drmFormatsEqual(const wlr_drm_format *a, const wlr_drm_format *b)
+{
+    if (!a || !b || a->format != b->format || a->len != b->len)
+        return false;
+
+    for (size_t i = 0; i < a->len; ++i) {
+        if (a->modifiers[i] != b->modifiers[i])
+            return false;
+    }
+
+    return true;
+}
+
+static bool copyDrmFormat(wlr_drm_format *dst, const wlr_drm_format *src)
+{
+    if (!dst || !src || src->len == 0)
+        return false;
+
+    auto *modifiers = static_cast<uint64_t *>(malloc(sizeof(uint64_t) * src->len));
+    if (!modifiers)
+        return false;
+
+    memcpy(modifiers, src->modifiers, sizeof(uint64_t) * src->len);
+    wlr_drm_format_finish(dst);
+    dst->format = src->format;
+    dst->len = src->len;
+    dst->capacity = src->len;
+    dst->modifiers = modifiers;
+    return true;
+}
+
+static bool copyDrmFormatWithSingleModifier(wlr_drm_format *dst, uint32_t format, uint64_t modifier)
+{
+    if (!dst)
+        return false;
+
+    auto *modifiers = static_cast<uint64_t *>(malloc(sizeof(uint64_t)));
+    if (!modifiers)
+        return false;
+
+    modifiers[0] = modifier;
+    wlr_drm_format_finish(dst);
+    dst->format = format;
+    dst->len = 1;
+    dst->capacity = 1;
+    dst->modifiers = modifiers;
+    return true;
+}
+
+static bool pickTextureInteropFormat(qw_renderer *renderer, uint32_t format, wlr_drm_format *out)
+{
+    if (!renderer || !renderer->handle() || !out)
+        return false;
+
+    auto *r = renderer->handle();
+    const wlr_drm_format_set *renderFormats =
+        r->impl->get_render_formats ? r->impl->get_render_formats(r) : nullptr;
+    const wlr_drm_format_set *textureFormats =
+        wlr_renderer_get_texture_formats(r, WLR_BUFFER_CAP_DMABUF);
+    if (!renderFormats || !textureFormats)
+        return false;
+
+    wlr_drm_format_set intersection = {};
+    if (!wlr_drm_format_set_intersect(&intersection, textureFormats, renderFormats))
+        return false;
+
+    const wlr_drm_format *interopFormat = wlr_drm_format_set_get(&intersection, format);
+    bool ok = false;
+    if (interopFormat && interopFormat->len > 0) {
+        if (drmFormatHasModifier(interopFormat, DRM_FORMAT_MOD_LINEAR)) {
+            ok = copyDrmFormatWithSingleModifier(out, format, DRM_FORMAT_MOD_LINEAR);
+        } else if (drmFormatHasModifier(interopFormat, DRM_FORMAT_MOD_INVALID)) {
+            ok = copyDrmFormatWithSingleModifier(out, format, DRM_FORMAT_MOD_INVALID);
+        } else {
+            ok = copyDrmFormat(out, interopFormat);
+        }
+    }
+
+    wlr_drm_format_set_finish(&intersection);
+    return ok;
 }
 
 static void applyTransform(QSGSoftwareRenderer *renderer, const QTransform &t)
@@ -256,15 +407,14 @@ qw_buffer *WBufferRenderer::lastBuffer() const
     return m_lastBuffer;
 }
 
+bool WBufferRenderer::currentBufferReadyForScanout() const
+{
+    return state.scanoutReady;
+}
+
 QRhiTexture *WBufferRenderer::currentRenderTarget() const
 {
-    if (!state.sgRenderTarget.rt)
-        return nullptr;
-    auto textureRT = static_cast<QRhiTextureRenderTarget*>(state.sgRenderTarget.rt);
-    auto colorAttachment = textureRT->description().colorAttachmentAt(0);
-    if (!colorAttachment)
-        return nullptr;
-    return colorAttachment->texture();
+    return getColorTextureFrom(state.sgRenderTarget.rt);
 }
 
 const qw_damage_ring *WBufferRenderer::damageRing() const
@@ -298,7 +448,20 @@ WSGTextureProvider *WBufferRenderer::wTextureProvider() const
 
     if (!m_textureProvider) {
         m_textureProvider.reset(new WSGTextureProvider(w));
-        m_textureProvider->setBuffer(m_lastBuffer);
+        // WBufferRenderer cache/output buffers are wlroots buffers too. The
+        // provider decides whether direct dmabuf import is safe for the active
+        // Qt RHI; otherwise it falls back to a Qt-owned texture.
+        m_textureProvider->setDirectBufferImportAllowed(true);
+        bool publishInitialBuffer = shouldCacheBuffer() && m_lastBuffer;
+#ifdef ENABLE_VULKAN_RENDER
+        auto wd = QQuickWindowPrivate::get(window());
+        if (publishInitialBuffer && wd && wd->rhi && wd->rhi->backend() == QRhi::Vulkan
+            && m_cacheBufferLocker.isEmpty()) {
+            publishInitialBuffer = false;
+        }
+#endif
+        if (publishInitialBuffer)
+            m_textureProvider->setBuffer(m_lastBuffer);
     }
 
     return m_textureProvider.get();
@@ -343,18 +506,47 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 
     // configure swapchain
     if (flags.testFlag(RenderFlag::DontConfigureSwapchain)) {
-        auto renderFormat = pickFormat(m_output->renderer(), format);
+        wlr_drm_format interopFormat = {};
+        const bool pickedInteropFormat =
+            pickTextureInteropFormat(m_output->renderer(), format, &interopFormat);
+        const wlr_drm_format *renderFormat =
+            pickedInteropFormat ? &interopFormat : pickFormat(m_output->renderer(), format);
         if (!renderFormat) {
-            qCWarning(lcWlBufferRenderer, "wlr_renderer doesn't support format 0x%s", drmGetFormatName(format));
+            qCWarning(lcWlBufferRenderer)
+                << "wlr_renderer doesn't support format"
+                << drmFormatNameForLog(format);
+            wlr_drm_format_finish(&interopFormat);
             return nullptr;
         }
 
-        if (!m_swapchain || QSize(m_swapchain->handle()->width, m_swapchain->handle()->height) != pixelSize
-            || m_swapchain->handle()->format.format != renderFormat->format) {
+        if (!m_swapchain
+            || QSize(m_swapchain->handle()->width, m_swapchain->handle()->height) != pixelSize
+            || !drmFormatsEqual(&m_swapchain->handle()->format, renderFormat)) {
             if (m_swapchain)
                 delete m_swapchain;
             m_swapchain = qw_swapchain::create(m_output->allocator()->handle(), pixelSize.width(), pixelSize.height(), renderFormat);
         }
+        if (!m_swapchain) {
+            qCWarning(lcWlBufferRenderer)
+                << "Failed to create output swapchain"
+                << "size" << pixelSize
+                << "format" << drmFormatNameForLog(renderFormat->format)
+                << "pickedTextureInteropFormat" << pickedInteropFormat
+                << "modifiers" << renderFormat->len
+                << "preferredModifier"
+                << (renderFormat->len > 0 ? drmModifierNameForLog(renderFormat->modifiers[0]) : QByteArrayLiteral("<none>"));
+            wlr_drm_format_finish(&interopFormat);
+            return nullptr;
+        }
+        if (pickedInteropFormat) {
+            qCDebug(lcWlBufferRenderer)
+                << "Vulkan intermediate compositor layer picked texture-compatible format"
+                << "format" << drmFormatNameForLog(renderFormat->format)
+                << "modifiers" << renderFormat->len
+                << "preferredModifier"
+                << (renderFormat->len > 0 ? drmModifierNameForLog(renderFormat->modifiers[0]) : QByteArrayLiteral("<none>"));
+        }
+        wlr_drm_format_finish(&interopFormat);
     } else if (flags.testFlag(RenderFlag::UseCursorFormats)) {
         bool ok = m_output->configureCursorSwapchain(pixelSize, format, &m_swapchain);
         if (!ok)
@@ -371,6 +563,16 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
     if (!wbuffer)
         return nullptr;
     auto buffer = qw_buffer::from(wbuffer);
+
+#ifdef ENABLE_VULKAN_RENDER
+    if (m_textureProvider && m_textureProvider->qwBuffer() == buffer) {
+        qCDebug(lcWlBufferRenderer)
+            << "Vulkan RHI output cache import released before rendering into the same buffer"
+            << "buffer" << buffer
+            << "size" << buffer->handle()->width << "x" << buffer->handle()->height;
+        m_textureProvider->setBuffer(nullptr);
+    }
+#endif
 
     if (!m_renderHelper)
         m_renderHelper = new WRenderHelper(m_output->renderer());
@@ -392,6 +594,7 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 
     auto rtd = QQuickRenderTargetPrivate::get(&rt);
     QSGRenderTarget sgRT;
+    bool scanoutReady = true;
 
     if (rtd->type == QQuickRenderTargetPrivate::Type::PaintDevice) {
         sgRT.paintDevice = rtd->u.paintDevice;
@@ -417,6 +620,20 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
             QOpenGLContextPrivate::get(glContext)->defaultFboRedirect = glRT->framebuffer;
         }
 #endif
+
+#ifdef ENABLE_VULKAN_RENDER
+        if (wd->rhi && wd->rhi->backend() == QRhi::Vulkan) {
+            QRhiTexture *targetTexture = getColorTextureFrom(sgRT.rt);
+            if (!m_renderHelper->prepareVulkanRenderTargetForQt(wd->rhi, targetTexture, buffer)) {
+                qCWarning(lcWlBufferRenderer)
+                    << "Failed to acquire Vulkan output render target for Qt rendering"
+                    << "buffer size" << buffer->handle()->width << "x" << buffer->handle()->height;
+                buffer->unlock();
+                return nullptr;
+            }
+            scanoutReady = false;
+        }
+#endif
     }
 
     state.flags = flags;
@@ -426,6 +643,7 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
     state.buffer.reset(buffer);
     state.renderTarget = rt;
     state.sgRenderTarget = sgRT;
+    state.scanoutReady = scanoutReady;
 
     return buffer;
 }
@@ -433,6 +651,153 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 inline static QRect scaleToRect(const QRectF &s, qreal scale) {
     return QRect((s.topLeft() * scale).toPoint(),
                  (s.size() * scale).toSize());
+}
+
+bool WBufferRenderer::recordVulkanOutputProbe(const char *phase, int sourceIndex,
+                                              const QColor &color,
+                                              bool preserveColorContents)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!vulkanOutputProbeEnabled())
+        return false;
+    if (!state.flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject))
+        return false;
+
+    auto wd = QQuickWindowPrivate::get(window());
+    if (!wd || !wd->rhi || wd->rhi->backend() != QRhi::Vulkan)
+        return false;
+    if (!state.sgRenderTarget.rt || !state.sgRenderTarget.cb || state.pixelSize.isEmpty())
+        return false;
+
+    QSGRenderTarget probeTarget = state.sgRenderTarget;
+    if (preserveColorContents && m_renderHelper) {
+        QQuickRenderTarget preserveTarget =
+            m_renderHelper->renderTargetForBuffer(state.buffer.get(), true);
+        if (preserveTarget.isNull()) {
+            qCWarning(lcWlBufferRenderer)
+                << "Vulkan output probe skipped: preserve render target unavailable"
+                << "phase" << phase
+                << "sourceIndex" << sourceIndex
+                << "bufferPtr" << quintptr(state.buffer.get());
+            return false;
+        }
+
+        const auto *preserveData = QQuickRenderTargetPrivate::get(&preserveTarget);
+        Q_ASSERT(preserveData->type == QQuickRenderTargetPrivate::Type::RhiRenderTarget);
+        probeTarget.rt = preserveData->u.rhiRt;
+        probeTarget.rpDesc = preserveData->u.rhiRt->renderPassDescriptor();
+    }
+
+    auto *textureRT = static_cast<QRhiTextureRenderTarget *>(probeTarget.rt);
+    QRhiTexture *targetTexture = getColorTextureFrom(probeTarget.rt);
+    if (!targetTexture) {
+        qCWarning(lcWlBufferRenderer)
+            << "Vulkan output probe skipped: current render target has no color texture"
+            << "phase" << phase
+            << "sourceIndex" << sourceIndex
+            << "bufferPtr" << quintptr(state.buffer.get());
+        return false;
+    }
+
+    auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddrForProbe();
+    const auto *rhiHandles = static_cast<const QRhiVulkanNativeHandles *>(wd->rhi->nativeHandles());
+    if (!vkGetDeviceProcAddr || !rhiHandles || rhiHandles->dev == VK_NULL_HANDLE) {
+        qCWarning(lcWlBufferRenderer)
+            << "Vulkan output probe skipped: Vulkan device entry points unavailable"
+            << "phase" << phase
+            << "sourceIndex" << sourceIndex
+            << "hasGetDeviceProcAddr" << bool(vkGetDeviceProcAddr)
+            << "hasNativeHandles" << bool(rhiHandles);
+        return false;
+    }
+
+    auto vkCmdClearAttachments = reinterpret_cast<PFN_vkCmdClearAttachments>(
+        vkGetDeviceProcAddr(rhiHandles->dev, "vkCmdClearAttachments"));
+    if (!vkCmdClearAttachments) {
+        qCWarning(lcWlBufferRenderer)
+            << "Vulkan output probe skipped: vkCmdClearAttachments unavailable"
+            << "phase" << phase
+            << "sourceIndex" << sourceIndex;
+        return false;
+    }
+
+    QRhiCommandBuffer *cb = probeTarget.cb;
+    const QRhiDepthStencilClearValue depthStencilClear(1.0f, 0);
+    cb->beginPass(textureRT, Qt::transparent, depthStencilClear, nullptr,
+                  QRhiCommandBuffer::ExternalContent);
+    cb->beginExternal();
+
+    const auto *cbHandles =
+        static_cast<const QRhiVulkanCommandBufferNativeHandles *>(cb->nativeHandles());
+    const VkCommandBuffer commandBuffer = cbHandles ? cbHandles->commandBuffer : VK_NULL_HANDLE;
+    bool recorded = commandBuffer != VK_NULL_HANDLE;
+    QRect probeRect;
+    if (recorded) {
+        const int markerSize = qMax(48, qMin(state.pixelSize.width(), state.pixelSize.height()) / 12);
+        const bool postProbe = qstrcmp(phase, "post-scene") == 0;
+        probeRect = QRect(postProbe ? state.pixelSize.width() - markerSize : 0,
+                          0,
+                          markerSize,
+                          markerSize);
+
+        VkClearAttachment attachment = {};
+        attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        attachment.colorAttachment = 0;
+        attachment.clearValue.color.float32[0] = float(color.redF());
+        attachment.clearValue.color.float32[1] = float(color.greenF());
+        attachment.clearValue.color.float32[2] = float(color.blueF());
+        attachment.clearValue.color.float32[3] = float(color.alphaF());
+
+        VkClearRect clearRect = {};
+        clearRect.rect.offset = { probeRect.x(), probeRect.y() };
+        clearRect.rect.extent = { uint32_t(probeRect.width()), uint32_t(probeRect.height()) };
+        clearRect.baseArrayLayer = 0;
+        clearRect.layerCount = 1;
+
+        vkCmdClearAttachments(commandBuffer, 1, &attachment, 1, &clearRect);
+    }
+
+    cb->endExternal();
+    cb->endPass();
+
+    if (recorded) {
+        qCInfo(lcWlBufferRenderer)
+            << "Vulkan output probe marker recorded"
+            << "phase" << phase
+            << "sourceIndex" << sourceIndex
+            << "sourceCount" << m_sourceList.size()
+            << "preserveColorContents" << preserveColorContents
+            << "bufferPtr" << quintptr(state.buffer.get())
+            << "bufferSize" << (state.buffer
+                                 ? QSize(state.buffer->handle()->width,
+                                         state.buffer->handle()->height)
+                                 : QSize())
+            << "pixelSize" << state.pixelSize
+            << "rect" << probeRect
+            << "color" << color
+            << "commandBuffer" << Qt::hex << quintptr(commandBuffer) << Qt::dec
+            << "targetTexturePtr" << quintptr(targetTexture)
+            << "targetTextureSize" << targetTexture->pixelSize()
+            << "nativeTextureObject" << Qt::hex
+            << quintptr(targetTexture->nativeTexture().object)
+            << Qt::dec
+            << "nativeLayout" << targetTexture->nativeTexture().layout;
+    } else {
+        qCWarning(lcWlBufferRenderer)
+            << "Vulkan output probe marker failed: command buffer unavailable"
+            << "phase" << phase
+            << "sourceIndex" << sourceIndex
+            << "bufferPtr" << quintptr(state.buffer.get());
+    }
+
+    return recorded;
+#else
+    Q_UNUSED(phase);
+    Q_UNUSED(sourceIndex);
+    Q_UNUSED(color);
+    Q_UNUSED(preserveColorContents);
+    return false;
+#endif
 }
 
 void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
@@ -469,12 +834,31 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
     // how Shape fills the QSGTexture provided by fillItem. Therefore, we need to ensure
     // that QSGRenderer::devicePixelRatio and QQuickWindow::effectiveDevicePixelRatio
     // are always consistent. Otherwise, some Items might render incorrectly.
+    auto softwareRenderer = dynamic_cast<QSGSoftwareRenderer*>(renderer);
+#ifdef ENABLE_VULKAN_RENDER
+    if (!softwareRenderer && wd->rhi && wd->rhi->backend() == QRhi::Vulkan && m_renderHelper) {
+        QQuickRenderTarget passRenderTarget =
+            m_renderHelper->renderTargetForBuffer(state.buffer.get(), preserveColorContents);
+        if (!passRenderTarget.isNull()) {
+            const auto *passRtData = QQuickRenderTargetPrivate::get(&passRenderTarget);
+            Q_ASSERT(passRtData->type == QQuickRenderTargetPrivate::Type::RhiRenderTarget);
+            state.renderTarget = passRenderTarget;
+            state.sgRenderTarget.rt = passRtData->u.rhiRt;
+            state.sgRenderTarget.rpDesc = passRtData->u.rhiRt->renderPassDescriptor();
+        } else {
+            qCWarning(lcWlBufferRenderer)
+                << "Vulkan buffer renderer could not select render target for pass"
+                << "sourceIndex" << sourceIndex
+                << "preserveColorContents" << preserveColorContents
+                << "bufferPtr" << quintptr(state.buffer.get());
+        }
+    }
+#endif
     renderer->setDevicePixelRatio(window()->effectiveDevicePixelRatio());
     renderer->setDeviceRect(QRect(QPoint(0, 0), state.pixelSize));
     renderer->setRenderTarget(state.sgRenderTarget);
     const auto viewportRect = scaleToRect(targetRect, devicePixelRatio);
 
-    auto softwareRenderer = dynamic_cast<QSGSoftwareRenderer*>(renderer);
     { // before render
         if (softwareRenderer) {
             // Avoid do clear before paint, for the software renderer this
@@ -526,13 +910,17 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             if (state.renderTarget.mirrorVertically())
                 flipY = !flipY;
 
+            QRect usedViewportRect;
             if (viewportRect.isValid()) {
-                QRect vr = viewportRect;
+                usedViewportRect = viewportRect;
                 if (flipY)
-                    vr.moveTop(-vr.y() + state.pixelSize.height() - vr.height());
-                renderer->setViewportRect(vr);
+                    usedViewportRect.moveTop(-usedViewportRect.y()
+                                             + state.pixelSize.height()
+                                             - usedViewportRect.height());
+                renderer->setViewportRect(usedViewportRect);
             } else {
-                renderer->setViewportRect(QRect(QPoint(0, 0), state.pixelSize));
+                usedViewportRect = QRect(QPoint(0, 0), state.pixelSize);
+                renderer->setViewportRect(usedViewportRect);
             }
 
             QRectF rect = sourceRect;
@@ -564,16 +952,64 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             renderer->setProjectionMatrix(projectionMatrix);
             renderer->setProjectionMatrixWithNativeNDC(projectionMatrixWithNativeNDC);
 
-            auto textureRT = static_cast<QRhiTextureRenderTarget*>(state.sgRenderTarget.rt);
-            if (preserveColorContents) {
-                textureRT->setFlags(textureRT->flags() | QRhiTextureRenderTarget::PreserveColorContents);
-            } else {
-                textureRT->setFlags(textureRT->flags() & ~QRhiTextureRenderTarget::PreserveColorContents);
+            if (!wd->rhi || wd->rhi->backend() != QRhi::Vulkan) {
+                auto textureRT = static_cast<QRhiTextureRenderTarget*>(state.sgRenderTarget.rt);
+                if (preserveColorContents) {
+                    textureRT->setFlags(textureRT->flags() | QRhiTextureRenderTarget::PreserveColorContents);
+                } else {
+                    textureRT->setFlags(textureRT->flags() & ~QRhiTextureRenderTarget::PreserveColorContents);
+                }
             }
+
+#ifdef ENABLE_VULKAN_RENDER
+            if (Q_UNLIKELY(wd->rhi && wd->rhi->backend() == QRhi::Vulkan
+                           && lcWlBufferRenderer().isDebugEnabled())) {
+                QRhiTexture *targetTexture = currentRenderTarget();
+                const auto *sourceItem = source.source ? source.source : wd->contentItem;
+                qCDebug(lcWlBufferRenderer)
+                    << "Vulkan buffer renderer projection configured"
+                    << "sourceIndex" << sourceIndex
+                    << "rootSource" << isRootItem(source.source)
+                    << "sourceItemPtr" << quintptr(sourceItem)
+                    << "rendererItemSize" << size()
+                    << "bufferPtr" << quintptr(state.buffer.get())
+                    << "bufferSize" << (state.buffer
+                                         ? QSize(state.buffer->handle()->width,
+                                                 state.buffer->handle()->height)
+                                         : QSize())
+                    << "pixelSize" << state.pixelSize
+                    << "devicePixelRatio" << devicePixelRatio
+                    << "windowDevicePixelRatio" << window()->effectiveDevicePixelRatio()
+                    << "sourceRectInput" << sourceRect
+                    << "sourceRectUsed" << rect
+                    << "targetRect" << targetRect
+                    << "targetRectValid" << targetRect.isValid()
+                    << "viewportInput" << viewportRect
+                    << "viewportUsed" << usedViewportRect
+                    << "flipY" << flipY
+                    << "rhiYUpInNDC" << wd->rhi->isYUpInNDC()
+                    << "mirrorVertically" << state.renderTarget.mirrorVertically()
+                    << "preserveColorContents" << preserveColorContents
+                    << "renderFlags" << int(state.flags)
+                    << "clearColor" << m_clearColor
+                    << "rhiRenderTargetPtr" << quintptr(state.sgRenderTarget.rt)
+                    << "targetTexturePtr" << quintptr(targetTexture)
+                    << "targetTextureSize" << (targetTexture ? targetTexture->pixelSize() : QSize())
+                    << "worldTransform" << state.worldTransform
+                    << "projectionMatrix" << projectionMatrix
+                    << "nativeProjectionMatrix" << projectionMatrixWithNativeNDC;
+            }
+#endif
         }
     }
 
+    if (sourceIndex == 0)
+        recordVulkanOutputProbe("pre-scene", sourceIndex, QColor(255, 0, 0, 255), false);
+
     state.context->renderNextFrame(renderer);
+
+    if (sourceIndex == m_sourceList.size() - 1)
+        recordVulkanOutputProbe("post-scene", sourceIndex, QColor(0, 255, 0, 255), true);
 
     { // after render
         if (!softwareRenderer) {
@@ -588,6 +1024,17 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             // complete the results of this drawing here to ensure the current
             // drawing result is available for use.
             wd->rhi->finish();
+#ifdef ENABLE_VULKAN_RENDER
+            // The primary/output render target must stay Qt-owned until
+            // QQuickRenderControl::endFrame() submits the complete offscreen frame.
+            // Smaller wlroots layer/cursor targets are committed outside the primary
+            // output path and still need the legacy immediate release before their
+            // current buffer is ended.
+            if (wd->rhi->backend() == QRhi::Vulkan && m_renderHelper
+                && !state.flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject)) {
+                releaseCurrentBufferForScanout();
+            }
+#endif
         } else {
             state.dirty = softwareRenderer->flushRegion();
 
@@ -627,8 +1074,56 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
         dr->currentFrameCommandBuffer()->resourceUpdate(resourceUpdates);
     }
 
-    if (shouldCacheBuffer())
+#ifdef ENABLE_VULKAN_RENDER
+    const bool deferCacheBuffer = wd->rhi && wd->rhi->backend() == QRhi::Vulkan;
+#else
+    const bool deferCacheBuffer = false;
+#endif
+    if (shouldCacheBuffer() && !deferCacheBuffer)
         wTextureProvider()->setBuffer(state.buffer.get());
+}
+
+bool WBufferRenderer::releaseCurrentBufferForScanout()
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!state.buffer) {
+        state.scanoutReady = true;
+        return true;
+    }
+
+    auto wd = QQuickWindowPrivate::get(window());
+    if (!wd || !wd->rhi || wd->rhi->backend() != QRhi::Vulkan || !m_renderHelper) {
+        state.scanoutReady = true;
+        return true;
+    }
+
+    QRhiTexture *targetTexture = currentRenderTarget();
+    if (!targetTexture) {
+        state.scanoutReady = false;
+        qCWarning(lcWlBufferRenderer)
+            << "Failed to release Vulkan output render target for scanout:"
+            << "current render target has no color texture"
+            << "buffer size" << state.buffer->handle()->width
+            << "x" << state.buffer->handle()->height;
+        return false;
+    }
+
+    state.scanoutReady =
+        m_renderHelper->releaseVulkanRenderTargetToScanout(wd->rhi,
+                                                            targetTexture,
+                                                            state.buffer.get());
+    if (!state.scanoutReady) {
+        qCWarning(lcWlBufferRenderer)
+            << "Failed to release Vulkan output render target for scanout"
+            << "buffer size" << state.buffer->handle()->width
+            << "x" << state.buffer->handle()->height;
+    }
+
+    return state.scanoutReady;
+#else
+    state.scanoutReady = true;
+    return true;
+#endif
 }
 
 void WBufferRenderer::endRender()
@@ -642,6 +1137,30 @@ void WBufferRenderer::endRender()
 
         m_lastBuffer = buffer.get();
     }
+
+#ifdef ENABLE_VULKAN_RENDER
+    auto windowPrivate = QQuickWindowPrivate::get(window());
+    if (windowPrivate && windowPrivate->rhi && windowPrivate->rhi->backend() == QRhi::Vulkan) {
+        if (!m_cacheBufferLocker.isEmpty()) {
+            qCDebug(lcWlBufferRenderer)
+                << "Vulkan RHI output cache buffer published after rendering"
+                << "buffer" << m_lastBuffer
+                << "size" << m_lastBuffer->handle()->width << "x" << m_lastBuffer->handle()->height
+                << "cacheBuffer" << m_cacheBuffer
+                << "cacheLockers" << m_cacheBufferLocker.size()
+                << "renderFlags" << int(state.flags)
+                << "scanoutReady" << state.scanoutReady;
+            wTextureProvider()->setBuffer(m_lastBuffer);
+        } else if (m_textureProvider && m_textureProvider->qwBuffer()) {
+            qCDebug(lcWlBufferRenderer)
+                << "Vulkan RHI output cache buffer cleared after rendering without consumers"
+                << "cacheBuffer" << m_cacheBuffer
+                << "renderFlags" << int(state.flags)
+                << "scanoutReady" << state.scanoutReady;
+            m_textureProvider->setBuffer(nullptr);
+        }
+    }
+#endif
 
 #ifndef QT_NO_OPENGL
     auto wd = QQuickWindowPrivate::get(window());
@@ -666,34 +1185,70 @@ void WBufferRenderer::updateTextureProvider()
     if (!m_textureProvider)
         return;
 
-    if (shouldCacheBuffer()) {
+    bool publishCache = shouldCacheBuffer();
+#ifdef ENABLE_VULKAN_RENDER
+    auto wd = QQuickWindowPrivate::get(window());
+    if (publishCache && wd && wd->rhi && wd->rhi->backend() == QRhi::Vulkan
+        && m_cacheBufferLocker.isEmpty()) {
+        publishCache = false;
+    }
+#endif
+
+    if (publishCache) {
         const bool hasCachedBuffer = m_textureProvider->qwBuffer();
         // Ensure only update the buffer when the "shouldCacheBuffer" state is changed.
         // If the state is not changed, the buffer is update in the WBufferRenderer::render.
-        if (!hasCachedBuffer && m_lastBuffer)
+        if (!hasCachedBuffer && m_lastBuffer) {
+            qCDebug(lcWlBufferRenderer)
+                << "Output cache texture provider restored last buffer"
+                << "buffer" << m_lastBuffer
+                << "size" << m_lastBuffer->handle()->width << "x" << m_lastBuffer->handle()->height
+                << "cacheBuffer" << m_cacheBuffer
+                << "cacheLockers" << m_cacheBufferLocker.size();
             m_textureProvider->setBuffer(m_lastBuffer);
+        }
     } else {
+        qCDebug(lcWlBufferRenderer)
+            << "Output cache texture provider cleared"
+            << "cacheBuffer" << m_cacheBuffer
+            << "cacheLockers" << m_cacheBufferLocker.size();
         m_textureProvider->setBuffer(nullptr);
     }
 }
 
 QSGNode *WBufferRenderer::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *)
 {
+    auto provider = wTextureProvider();
+    QSGTexture *texture = provider ? provider->texture() : nullptr;
+    if (!texture || width() <= 0 || height() <= 0) {
+        delete oldNode;
+        return nullptr;
+    }
+
     auto node = static_cast<QSGImageNode*>(oldNode);
     if (Q_UNLIKELY(!node)) {
         node = window()->createImageNode();
         node->setOwnsTexture(false);
-        node->setTexture(m_textureProvider->texture());
     } else {
         node->markDirty(QSGNode::DirtyMaterial);
     }
 
-    const QRectF textureGeometry = QRectF(QPointF(0, 0), node->texture()->textureSize());
+    node->setTexture(texture);
+    const QRectF textureGeometry = QRectF(QPointF(0, 0), texture->textureSize());
     node->setSourceRect(textureGeometry);
     const QRectF targetGeometry(QPointF(0, 0), size());
     node->setRect(targetGeometry);
     node->setFiltering(QSGTexture::Linear);
     node->setMipmapFiltering(QSGTexture::None);
+
+    qCDebug(lcWlBufferRenderer)
+        << "Output cache texture node updated"
+        << "providerBufferPtr" << quintptr(provider->qwBuffer())
+        << "textureSize" << texture->textureSize()
+        << "textureHasAlpha" << texture->hasAlphaChannel()
+        << "itemSize" << size()
+        << "sourceRect" << textureGeometry
+        << "targetRect" << targetGeometry;
 
     return node;
 }
