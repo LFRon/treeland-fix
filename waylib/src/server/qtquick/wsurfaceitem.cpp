@@ -356,7 +356,7 @@ public:
 #ifdef ENABLE_VULKAN_RENDER
     inline bool isVulkanRenderer() const {
         auto rw = qobject_cast<WOutputRenderWindow *>(window);
-        return rw && rw->renderer() && wlr_renderer_is_vk(rw->renderer()->handle());
+        return rw && rw->renderer() && rw->renderer()->is_vk();
     }
 
     inline bool shouldDeferTextureRetry(bool hasCachedTexture) {

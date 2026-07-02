@@ -10,9 +10,11 @@
 
 #include <qwoutput.h>
 #include <qwrenderer.h>
+#include <qwrenderpass.h>
 #include <qwswapchain.h>
 #include <qwbuffer.h>
 #include <qwoutputlayer.h>
+#include <qwtexture.h>
 
 #include <platformplugin/qwlrootswindow.h>
 #include <platformplugin/qwlrootsintegration.h>
@@ -27,7 +29,6 @@
 #include <private/qquickwindow_p.h>
 
 extern "C" {
-#include <wlr/render/pass.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/render/wlr_texture.h>
 #include <wlr/types/wlr_output.h>
@@ -257,7 +258,7 @@ bool WOutputHelper::usesVulkanOutputLayerCompositor() const
     W_DC(WOutputHelper);
     if (vulkanOutputLayerCompositorDisabled())
         return false;
-    if (!d->renderer() || !wlr_renderer_is_vk(d->renderer()->handle()))
+    if (!d->renderer() || !d->renderer()->is_vk())
         return false;
 
     return isVulkanOutputLayerCompositorRequested()
@@ -328,8 +329,8 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
         return finishCommit(false);
     }
 
-    wlr_texture *sourceTexture =
-        wlr_texture_from_buffer(d->renderer()->handle(), sourceBuffer->handle());
+    qw_texture *sourceTexture =
+        qw_texture::from_buffer(*d->renderer(), *sourceBuffer);
     if (Q_UNLIKELY(!sourceTexture)) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan output-layer compositor: failed to import Qt layer buffer as texture for output"
@@ -340,20 +341,20 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
     }
 
     wlr_buffer_pass_options passOptions = {};
-    wlr_render_pass *pass =
-        wlr_output_begin_render_pass(d->qwoutput()->handle(), &state, &passOptions);
+    qw_render_pass *pass = qw_render_pass::from(
+        d->qwoutput()->begin_render_pass(&state, &passOptions));
     if (Q_UNLIKELY(!pass)) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan output-layer compositor: failed to begin output render pass for"
             << d->qwoutput()->handle()->name
             << "layer buffer size" << sourceBuffer->handle()->width << "x" << sourceBuffer->handle()->height;
-        wlr_texture_destroy(sourceTexture);
+        delete sourceTexture;
         return finishCommit(false);
     }
 
     int width = 0;
     int height = 0;
-    wlr_output_transformed_resolution(d->qwoutput()->handle(), &width, &height);
+    d->qwoutput()->transformed_resolution(&width, &height);
 
     wlr_render_rect_options clearOptions = {};
     clearOptions.box.x = 0;
@@ -365,10 +366,10 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
     clearOptions.color.b = 0.0f;
     clearOptions.color.a = 1.0f;
     clearOptions.blend_mode = WLR_RENDER_BLEND_MODE_NONE;
-    wlr_render_pass_add_rect(pass, &clearOptions);
+    pass->add_rect(&clearOptions);
 
     wlr_render_texture_options textureOptions = {};
-    textureOptions.texture = sourceTexture;
+    textureOptions.texture = sourceTexture->handle();
     textureOptions.dst_box.x = 0;
     textureOptions.dst_box.y = 0;
     textureOptions.dst_box.width = width;
@@ -376,10 +377,10 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
     textureOptions.transform = WL_OUTPUT_TRANSFORM_NORMAL;
     textureOptions.filter_mode = WLR_SCALE_FILTER_BILINEAR;
     textureOptions.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED;
-    wlr_render_pass_add_texture(pass, &textureOptions);
+    pass->add_texture(&textureOptions);
 
-    const bool submitted = wlr_render_pass_submit(pass);
-    wlr_texture_destroy(sourceTexture);
+    const bool submitted = pass->submit();
+    delete sourceTexture;
     if (Q_UNLIKELY(!submitted)) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan output-layer compositor: render pass submit failed for output"
@@ -550,7 +551,7 @@ void WOutputHelper::resetState()
 
     // reset output state
     if (d->state.committed & WLR_OUTPUT_STATE_BUFFER) {
-        wlr_buffer_unlock(d->state.buffer);
+        qw_buffer::from(d->state.buffer)->unlock();
         d->state.buffer = nullptr;
     }
 

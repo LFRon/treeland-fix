@@ -157,7 +157,7 @@ public:
 private:
     bool isVulkanRenderer() const {
         return window() && window()->renderer()
-            && wlr_renderer_is_vk(window()->renderer()->handle());
+            && window()->renderer()->is_vk();
     }
 
     bool isCachedImage(const QImage &image) const {

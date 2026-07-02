@@ -11,6 +11,10 @@ extern "C" {
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/render/pass.h>
 #undef static
+#if WLR_HAVE_GLES2_RENDERER
+#include <wlr/render/gles2.h>
+#endif
+#include <wlr/render/pixman.h>
 #include <wlr/util/box.h>
 #if WLR_HAVE_VULKAN_RENDERER
 #include <wlr/render/vulkan.h>
@@ -40,7 +44,12 @@ public:
     QW_FUNC_MEMBER(renderer, init_wl_shm, bool, wl_display *wl_display)
     QW_FUNC_MEMBER(renderer, get_drm_fd, int)
     QW_FUNC_MEMBER(renderer, get_texture_formats, const wlr_drm_format_set *, uint32_t buffer_caps)
+#if WLR_HAVE_GLES2_RENDERER
+    QW_FUNC_MEMBER(renderer, is_gles2, bool)
+#endif
+    QW_FUNC_MEMBER(renderer, is_pixman, bool)
 #if WLR_HAVE_VULKAN_RENDERER
+    QW_FUNC_MEMBER(renderer, is_vk, bool)
     // Access the wlroots-adopted Vulkan device handles. Used by compositors
     // (e.g. waylib) that adopt the wlroots VkDevice into Qt RHI.
     QW_FUNC_MEMBER(vk_renderer, get_instance, VkInstance)

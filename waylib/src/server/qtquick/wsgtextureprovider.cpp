@@ -12,6 +12,7 @@
 #include <qwrenderer.h>
 
 #include <QByteArray>
+#include <QVector>
 #include <rhi/qrhi.h>
 #include <private/qsgplaintexture_p.h>
 
@@ -41,6 +42,8 @@ static int bufferLocks(qw_buffer *buffer)
 }
 
 #ifdef ENABLE_VULKAN_RENDER
+static constexpr int s_deferredVulkanTextureReleaseFrames = 3;
+
 static bool envFlagExplicitlyDisabled(const char *name)
 {
     const QByteArray value = qgetenv(name).trimmed().toLower();
@@ -53,7 +56,7 @@ static bool bufferHasDmabuf(qw_buffer *buffer)
         return false;
 
     wlr_dmabuf_attributes dmabuf = {};
-    return wlr_buffer_get_dmabuf(buffer->handle(), &dmabuf);
+    return buffer->get_dmabuf(&dmabuf);
 }
 
 static bool directDmabufImportEnabled()
@@ -82,24 +85,96 @@ public:
 
     ~WSGTextureProviderPrivate() {
         cleanTexture();
+#ifdef ENABLE_VULKAN_RENDER
+        processDeferredVulkanTextureReleases(true);
+#endif
     }
 
     bool isVulkanRenderer() const {
 #ifdef ENABLE_VULKAN_RENDER
         return window && window->renderer()
-            && wlr_renderer_is_vk(window->renderer()->handle());
+            && window->renderer()->is_vk();
 #else
         return false;
 #endif
     }
 
-    static void releaseDetachedTexture(qw_texture *texture, bool ownsTexture,
-                                       QRhiTexture *rhiTexture,
-                                       WRenderHelper::NativeTextureCleanup nativeCleanup)
+#ifdef ENABLE_VULKAN_RENDER
+    struct DeferredVulkanTextureRelease {
+        WRenderHelper::NativeTextureCleanup nativeCleanup;
+        int framesLeft = 0;
+    };
+
+    void ensureDeferredVulkanTextureReleaseConnection()
     {
-        if (nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None)
-            delete rhiTexture;
-        WRenderHelper::releaseNativeTexture(&nativeCleanup);
+        if (deferredVulkanTextureReleaseConnection || !window)
+            return;
+
+        W_Q(WSGTextureProvider);
+        deferredVulkanTextureReleaseConnection =
+            QObject::connect(window, &WOutputRenderWindow::renderEnd,
+                             q, [this] {
+                                 processDeferredVulkanTextureReleases(false);
+                             });
+    }
+
+    void processDeferredVulkanTextureReleases(bool force)
+    {
+        if (deferredVulkanTextureReleases.isEmpty())
+            return;
+
+        if (force && window && window->rhi())
+            window->rhi()->finish();
+
+        for (int i = deferredVulkanTextureReleases.size() - 1; i >= 0; --i) {
+            auto &release = deferredVulkanTextureReleases[i];
+            if (!force && --release.framesLeft > 0)
+                continue;
+
+            auto cleanup = release.nativeCleanup;
+            deferredVulkanTextureReleases.removeAt(i);
+            WRenderHelper::releaseNativeTexture(&cleanup);
+        }
+    }
+
+    void deferVulkanNativeTextureRelease(WRenderHelper::NativeTextureCleanup *cleanup,
+                                         QRhiTexture *rhiTexture)
+    {
+        if (!cleanup || cleanup->type != WRenderHelper::NativeTextureCleanup::Type::VulkanTexture)
+            return;
+
+        if (rhiTexture)
+            rhiTexture->deleteLater();
+
+        deferredVulkanTextureReleases.append({
+            *cleanup,
+            s_deferredVulkanTextureReleaseFrames,
+        });
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan renderer deferred old client texture native release"
+            << "rhiTexture" << rhiTexture
+            << "frames" << s_deferredVulkanTextureReleaseFrames
+            << "pending" << deferredVulkanTextureReleases.size();
+
+        *cleanup = {};
+        ensureDeferredVulkanTextureReleaseConnection();
+    }
+#endif
+
+    void releaseDetachedTexture(qw_texture *texture, bool ownsTexture,
+                                QRhiTexture *rhiTexture,
+                                WRenderHelper::NativeTextureCleanup nativeCleanup)
+    {
+#ifdef ENABLE_VULKAN_RENDER
+        if (nativeCleanup.type == WRenderHelper::NativeTextureCleanup::Type::VulkanTexture) {
+            deferVulkanNativeTextureRelease(&nativeCleanup, rhiTexture);
+        } else
+#endif
+        {
+            if (nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None)
+                delete rhiTexture;
+            WRenderHelper::releaseNativeTexture(&nativeCleanup);
+        }
 
         if (ownsTexture && texture)
             delete texture;
@@ -118,8 +193,8 @@ public:
             qtTexture.setTexture(nullptr);
             rhiTexture = nullptr;
         }
-        delete importedWrapper;
-        WRenderHelper::releaseNativeTexture(&nativeCleanup);
+        releaseDetachedTexture(nullptr, false, importedWrapper, nativeCleanup);
+        nativeCleanup = {};
 
         if (ownsTexture && texture)
             delete texture;
@@ -273,6 +348,10 @@ public:
     WRenderHelper::NativeTextureCleanup nativeCleanup;
     bool smooth = true;
     bool directBufferImportAllowed = false;
+#ifdef ENABLE_VULKAN_RENDER
+    QVector<DeferredVulkanTextureRelease> deferredVulkanTextureReleases;
+    QMetaObject::Connection deferredVulkanTextureReleaseConnection;
+#endif
 };
 
 WSGTextureProvider::WSGTextureProvider(WOutputRenderWindow *window)
@@ -293,7 +372,7 @@ bool WSGTextureProvider::prefersDirectBufferImport(WOutputRenderWindow *window)
     if (!directDmabufImportEnabled()
         || !window
         || !window->renderer()
-        || !wlr_renderer_is_vk(window->renderer()->handle())) {
+        || !window->renderer()->is_vk()) {
         return false;
     }
 
@@ -359,12 +438,18 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface)
     }
 
     if (d->isVulkanRenderer()) {
+#ifdef ENABLE_VULKAN_RENDER
+        const bool bufferHasNativeDmabuf = bufferHasDmabuf(buffer);
+#else
+        const bool bufferHasNativeDmabuf = false;
+#endif
         qCDebug(lcWlQtQuickTexture)
             << "Vulkan texture provider setBuffer"
             << "buffer" << pointerAddress(buffer)
             << "sameBuffer" << sameBuffer
             << "allowDirectBufferImport" << allowDirectBufferImport
             << "directBufferImportAllowed" << d->directBufferImportAllowed
+            << "bufferHasDmabuf" << bufferHasNativeDmabuf
             << "hasExistingTexture" << d->hasTexture()
             << "currentBuffer" << pointerAddress(d->buffer)
             << "size" << bufferSize(buffer);
@@ -375,7 +460,7 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface)
             return true;
         }
 
-        const bool directImportEligible = allowDirectBufferImport && bufferHasDmabuf(buffer);
+        const bool directImportEligible = allowDirectBufferImport && bufferHasNativeDmabuf;
         bool triedDirectBufferImport = false;
         if (directImportEligible) {
             triedDirectBufferImport = true;
@@ -461,11 +546,17 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
 {
     W_D(WSGTextureProvider);
     if (d->isVulkanRenderer()) {
+#ifdef ENABLE_VULKAN_RENDER
+        const bool sourceBufferHasDmabuf = bufferHasDmabuf(srcBuffer);
+#else
+        const bool sourceBufferHasDmabuf = false;
+#endif
         qCDebug(lcWlQtQuickTexture)
             << "Vulkan texture provider setTexture"
             << "texture" << pointerAddress(texture)
             << "sourceBuffer" << pointerAddress(srcBuffer)
             << "directBufferImportAllowed" << d->directBufferImportAllowed
+            << "sourceBufferHasDmabuf" << sourceBufferHasDmabuf
             << "hasExistingTexture" << d->hasTexture()
             << "currentBuffer" << pointerAddress(d->buffer)
             << "sourceSize" << bufferSize(srcBuffer);
@@ -479,7 +570,7 @@ bool WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer,
         const bool allowDirectBufferImport =
             d->directBufferImportAllowed && prefersDirectBufferImport(d->window);
         const bool directImportEligible =
-            allowDirectBufferImport && bufferHasDmabuf(srcBuffer);
+            allowDirectBufferImport && sourceBufferHasDmabuf;
         bool triedDirectBufferImport = false;
         if (srcBuffer && directImportEligible) {
             triedDirectBufferImport = true;

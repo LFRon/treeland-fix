@@ -238,7 +238,7 @@ public:
 #ifdef ENABLE_VULKAN_RENDER
     inline bool isVulkanRenderer() const {
         return m_output && m_output->output() && m_output->output()->renderer()
-            && wlr_renderer_is_vk(m_output->output()->renderer()->handle());
+            && m_output->output()->renderer()->is_vk();
     }
 
     inline bool shouldDeferVulkanRenderRetry() {
@@ -1449,7 +1449,7 @@ void WOutputRenderWindowPrivate::init()
         && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
     if (!vulkanOutputLayerCompositorDisabled()
         && (explicitLayerCompositor || automaticLayerCompositor)) {
-        if (wlr_renderer_is_vk(m_renderer->handle())) {
+        if (m_renderer->is_vk()) {
             qCInfo(lcWlVulkanCompositor)
                 << "Vulkan output-layer compositor enabled: Qt Quick renders an intermediate dmabuf layer,"
                    " then wlroots Vulkan render pass commits the output."
@@ -1539,25 +1539,25 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
 // sanity check for Vulkan
 #ifdef ENABLE_VULKAN_RENDER
     if (rhiSupport->rhiBackend() == QRhi::Vulkan) {
-        if (!m_renderer || !m_renderer->handle() || !wlr_renderer_is_vk(m_renderer->handle())) {
+        if (!m_renderer || !m_renderer->handle() || !m_renderer->is_vk()) {
             qCWarning(lcWlRenderer)
                 << "Vulkan: Qt RHI requested Vulkan, but wlroots renderer is not Vulkan."
-                << "Set WLR_RENDERER=vulkan or force Qt RHI OpenGL for the legacy bridge.";
+                << "Set WLR_RENDERER=vulkan before initializing the Qt scene graph.";
             return false;
         }
 
         vkInstance.reset(new QVulkanInstance());
 
-        auto phdev = wlr_vk_renderer_get_physical_device(m_renderer->handle());
-        auto dev = wlr_vk_renderer_get_device(m_renderer->handle());
-        auto queue_family = wlr_vk_renderer_get_queue_family(m_renderer->handle());
+        auto phdev = m_renderer->get_physical_device();
+        auto dev = m_renderer->get_device();
+        auto queue_family = m_renderer->get_queue_family();
         if (Q_UNLIKELY(!phdev || !dev)) {
             qCWarning(lcWlRenderer) << "Vulkan: wlroots renderer exposed null VkPhysicalDevice/VkDevice, cannot adopt into Qt RHI";
             return false;
         }
 
 #if QT_VERSION > QT_VERSION_CHECK(6, 6, 0)
-        auto instance = wlr_vk_renderer_get_instance(m_renderer->handle());
+        auto instance = m_renderer->get_instance();
         if (Q_UNLIKELY(!instance)) {
             qCWarning(lcWlRenderer)
                 << "Vulkan: wlroots renderer exposed null VkInstance, cannot adopt into Qt RHI";
@@ -1574,7 +1574,7 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
         }
         qCInfo(lcWlRenderer)
             << "Vulkan: adopting wlroots VkInstance/VkDevice into Qt RHI"
-            << "instance" << Qt::hex << reinterpret_cast<quintptr>(wlr_vk_renderer_get_instance(m_renderer->handle()))
+            << "instance" << Qt::hex << reinterpret_cast<quintptr>(m_renderer->get_instance())
             << "physicalDevice" << reinterpret_cast<quintptr>(phdev)
             << "device" << reinterpret_cast<quintptr>(dev)
             << Qt::dec << "queueFamily" << queue_family;
@@ -1585,7 +1585,7 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
     } else
 #endif
     if (rhiSupport->rhiBackend() == QRhi::OpenGLES2) {
-        if (wlr_renderer_is_gles2(m_renderer->handle())) {
+        if (m_renderer->is_gles2()) {
             // GL wlroots renderer: adopt its EGL context (shared GL context,
             // textures interoperable without dmabuf import).
             auto egl = wlr_gles2_renderer_get_egl(m_renderer->handle());
@@ -1605,14 +1605,14 @@ bool WOutputRenderWindowPrivate::initRCWithRhi()
             // lookup and makeCurrent. We cannot pass placeholder EGL handles
             // (EGL_NO_DISPLAY causes "Cannot find EGLConfig" → QRhi creation
             // fails → crash). Instead, create an independent wlr_egl from the
-            // renderer's drm_fd (wlr_renderer_get_drm_fd works for Vulkan
+            // renderer's drm_fd (qw_renderer::get_drm_fd works for Vulkan
             // renderers too), and adopt its EGL display/context into a
             // QW::OpenGLContext. This EGL context is independent of the
             // wlroots Vulkan renderer — it's used solely for Qt RHI GL
             // rendering and EGL dmabuf import.
-            int drm_fd = wlr_renderer_get_drm_fd(m_renderer->handle());
+            int drm_fd = m_renderer->get_drm_fd();
             if (drm_fd < 0) {
-                qCWarning(lcWlRenderer) << "Vulkan+GL: wlr_renderer_get_drm_fd failed";
+                qCWarning(lcWlRenderer) << "Vulkan+GL: qw_renderer::get_drm_fd failed";
                 return false;
             }
             struct wlr_egl *egl = wlr_egl_create_with_drm_fd(drm_fd);

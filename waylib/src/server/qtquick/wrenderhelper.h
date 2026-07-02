@@ -70,6 +70,7 @@ public:
             None,
             OpenGLTexture,
             VulkanTexture,
+            VulkanRenderTarget,
         };
 
         Type type = Type::None;
