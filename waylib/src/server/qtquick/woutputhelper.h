@@ -12,7 +12,7 @@
 #include <QSGRendererInterface>
 #include <QSize>
 
-#include <functional>
+#include <memory>
 
 QT_BEGIN_NAMESPACE
 class QOpenGLContext;
@@ -27,7 +27,6 @@ class qw_buffer;
 QW_END_NAMESPACE
 
 struct wlr_swapchain;
-struct wlr_render_pass;
 struct pixman_region32;
 struct wlr_output_layer_state;
 typedef QVarLengthArray<wlr_output_layer_state> wlr_output_layer_state_array;
@@ -66,9 +65,7 @@ public:
     bool commit();
     static bool isVulkanOutputLayerCompositorRequested();
     bool usesVulkanOutputLayerCompositor() const;
-    using VulkanOutputLayerRenderHook = std::function<void(wlr_render_pass *pass, const QSize &targetSize)>;
-    bool commitWithVulkanOutputLayer(QW_NAMESPACE::qw_buffer *sourceBuffer,
-                                     const VulkanOutputLayerRenderHook &renderHook = {});
+    bool commitWithVulkanOutputLayer(QW_NAMESPACE::qw_buffer *sourceBuffer);
     bool testCommit();
     bool testCommit(QW_NAMESPACE::qw_buffer *buffer, const wlr_output_layer_state_array &layers);
 

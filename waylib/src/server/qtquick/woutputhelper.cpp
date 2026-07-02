@@ -267,8 +267,7 @@ bool WOutputHelper::usesVulkanOutputLayerCompositor() const
 #endif
 }
 
-bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer,
-                                                const VulkanOutputLayerRenderHook &renderHook)
+bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
 {
 #ifdef ENABLE_VULKAN_RENDER
     W_D(WOutputHelper);
@@ -378,9 +377,6 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer,
     textureOptions.filter_mode = WLR_SCALE_FILTER_BILINEAR;
     textureOptions.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED;
     wlr_render_pass_add_texture(pass, &textureOptions);
-
-    if (renderHook)
-        renderHook(pass, QSize(width, height));
 
     const bool submitted = wlr_render_pass_submit(pass);
     wlr_texture_destroy(sourceTexture);

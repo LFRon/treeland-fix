@@ -84,27 +84,17 @@ public:
     struct ImportedVulkanTexture {
         QRhiTexture *texture = nullptr;
         NativeTextureCleanup nativeCleanup;
-        quint64 nativeImage = 0;
-        int nativeLayout = 0;
-        int nativeViewFormat = 0;
         QSize size;
         uint32_t drmFormat = 0;
         uint64_t drmModifier = 0;
         bool hasAlpha = false;
 
-        bool hasNativeImage() const {
-            return nativeImage != 0 && nativeViewFormat != 0 && !size.isEmpty();
-        }
-
-        bool isValid() const { return (texture || hasNativeImage()) && !size.isEmpty(); }
+        bool isValid() const { return texture && !size.isEmpty(); }
     };
 
     static bool importVulkanTextureFromBuffer(QRhi *rhi, QW_NAMESPACE::qw_buffer *buffer,
                                               wlr_surface *surface,
                                               ImportedVulkanTexture *importedTexture);
-    static bool importVulkanNativeTextureFromBuffer(QRhi *rhi, QW_NAMESPACE::qw_buffer *buffer,
-                                                    wlr_surface *surface,
-                                                    ImportedVulkanTexture *importedTexture);
     static void releaseImportedVulkanTexture(ImportedVulkanTexture *importedTexture);
 
     static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle,

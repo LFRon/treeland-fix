@@ -151,7 +151,6 @@ set(SOURCES
     qtquick/private/wqmlhelper.cpp
     qtquick/private/wbufferrenderer.cpp
     qtquick/private/wrenderbuffernode.cpp
-    qtquick/private/wvulkansurfacerendernode.cpp
 
     ${WAYLAND_PROTOCOLS_OUTPUTDIR}/text-input-unstable-v1-protocol.c
     ${WAYLAND_PROTOCOLS_OUTPUTDIR}/text-input-unstable-v2-protocol.c
@@ -330,7 +329,6 @@ set(PRIVATE_HEADERS
     qtquick/private/wquicktextureproxy_p.h
     qtquick/private/wbufferrenderer_p.h
     qtquick/private/wrenderbuffernode_p.h
-    qtquick/private/wvulkansurfacerendernode_p.h
     qtquick/private/wsurfaceitem_p.h
 
     ${WAYLAND_PROTOCOLS_OUTPUTDIR}/text-input-unstable-v1-protocol.h
@@ -371,18 +369,6 @@ qt_add_qml_module(${TARGET}
     SOURCES
         ${HEADERS}
         ${PRIVATE_HEADERS}
-)
-
-qt_add_shaders(${TARGET} "waylib_vulkan_surface_shaders"
-    BATCHABLE
-    PRECOMPILE
-    PREFIX
-        "/waylib/shaders"
-    BASE
-        ${CMAKE_CURRENT_SOURCE_DIR}/qtquick/shaders
-    FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/qtquick/shaders/vulkansurface.vert
-        ${CMAKE_CURRENT_SOURCE_DIR}/qtquick/shaders/vulkansurface.frag
 )
 
 target_compile_definitions(${TARGET}

@@ -80,7 +80,6 @@ public:
     qreal surfaceSizeRatio = 1.0;
     bool live = true;
     bool subsurfacesVisible = true;
-    bool vulkanDirectSurfaceAllowed = false;
 
     uint32_t beforeRequestResizeSurfaceStateSeq = 0;
     QRectF boundingRect;

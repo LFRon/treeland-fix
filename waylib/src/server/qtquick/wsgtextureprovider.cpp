@@ -301,12 +301,11 @@ bool WSGTextureProvider::prefersDirectBufferImport(WOutputRenderWindow *window)
     if (api == QSGRendererInterface::OpenGL)
         return true;
 
-    // Vulkan client dmabufs need compositor-grade import/sampling semantics.
-    // QSGTextureProvider exposes a normal QSGTexture to Qt's batch renderer, so
-    // let Vulkan RHI use the synchronized Qt-owned fallback here. Zero-copy
-    // Vulkan client composition is handled by WVulkanSurfaceRenderNode instead.
+    // Keep client surfaces inside the Qt Quick scene graph. The Vulkan path
+    // first tries a conservative dmabuf -> QRhiTexture import and falls back
+    // to synchronized upload/readback when import is not safe.
     if (api == QSGRendererInterface::Vulkan)
-        return false;
+        return true;
 
     return false;
 #else

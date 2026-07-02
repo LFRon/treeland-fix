@@ -4190,13 +4190,6 @@ static bool envFlagExplicitlyEnabled(const char *name)
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
-static bool vulkanNativeImageWrapperFallbackEnabled()
-{
-    static const bool enabled = envFlagExplicitlyEnabled("WAYLIB_VK_ALLOW_NATIVE_IMAGE_WRAPPER")
-        || envFlagExplicitlyEnabled("TREELAND_VK_ALLOW_NATIVE_IMAGE_WRAPPER");
-    return enabled;
-}
-
 static bool vulkanNonDmabufDiagnosticsEnabled()
 {
     static const bool enabled = envFlagExplicitlyEnabled("WAYLIB_VK_NON_DMABUF_DIAGNOSTICS")
@@ -4692,14 +4685,13 @@ bool WRenderHelper::makeTexture(QRhi *rhi, qw_texture *handle,
     }
 
     if (isVulkanRhiVkTexture && buffer) {
-        if (dmabufBackedBuffer && !vulkanNativeImageWrapperFallbackEnabled()) {
+        if (dmabufBackedBuffer) {
             qCDebug(lcWlRenderHelper)
                 << "Vulkan RHI skipped unsafe wlroots native VkImage wrapper for dmabuf-backed texture"
                 << "buffer" << buffer
                 << "texture" << handle
                 << "size" << handle->handle()->width << "x" << handle->handle()->height
-                << "allowBufferDirectImport" << allowBufferDirectImport
-                << "restoreWith" << "WAYLIB_VK_ALLOW_NATIVE_IMAGE_WRAPPER=1";
+                << "allowBufferDirectImport" << allowBufferDirectImport;
             return false;
         }
 
@@ -4812,136 +4804,6 @@ void WRenderHelper::releaseImportedVulkanTexture(ImportedVulkanTexture *imported
     importedTexture->texture = nullptr;
     releaseNativeTexture(&importedTexture->nativeCleanup);
     *importedTexture = {};
-}
-
-bool WRenderHelper::importVulkanNativeTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
-                                                        wlr_surface *surface,
-                                                        ImportedVulkanTexture *importedTexture)
-{
-#ifdef ENABLE_VULKAN_RENDER
-    if (!rhi || !buffer || !importedTexture)
-        return false;
-
-    releaseImportedVulkanTexture(importedTexture);
-
-    if (rhi->backend() != QRhi::Vulkan)
-        return false;
-
-    auto *handle = buffer->handle();
-    if (!handle || handle->width <= 0 || handle->height <= 0)
-        return false;
-
-    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi->nativeHandles());
-    if (!handles || !handles->inst || handles->inst->vkInstance() == VK_NULL_HANDLE
-        || handles->physDev == VK_NULL_HANDLE || handles->dev == VK_NULL_HANDLE) {
-        qCWarning(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import rejected: QRhi Vulkan native handles unavailable"
-            << buffer << "size" << handle->width << "x" << handle->height;
-        return false;
-    }
-
-    wlr_dmabuf_attributes dmabuf;
-    if (!wlr_buffer_get_dmabuf(handle, &dmabuf)) {
-        qCDebug(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import skipped: buffer has no dmabuf"
-            << buffer << "size" << handle->width << "x" << handle->height;
-        return false;
-    }
-
-    bool usedExplicitAcquire = false;
-    if (!waitSurfaceExplicitAcquireFence(surface,
-                                         "Vulkan RHI dmabuf native texture",
-                                         &usedExplicitAcquire)) {
-        qCWarning(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import rejected: explicit acquire wait failed"
-            << buffer
-            << "size" << QSize(dmabuf.width, dmabuf.height)
-            << "format" << drmFormatToName(dmabuf.format)
-            << "modifier" << drmModifierToName(dmabuf.modifier)
-            << "planes" << dmabuf.n_planes;
-        return false;
-    }
-
-    if (!usedExplicitAcquire
-        && !waitDmabufImplicitFence(buffer, DMA_BUF_SYNC_READ,
-                                    "Vulkan RHI dmabuf native texture", "implicit acquire")) {
-        qCWarning(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import rejected: implicit producer fence wait failed"
-            << buffer
-            << "size" << QSize(dmabuf.width, dmabuf.height)
-            << "format" << drmFormatToName(dmabuf.format)
-            << "modifier" << drmModifierToName(dmabuf.modifier)
-            << "planes" << dmabuf.n_planes;
-        return false;
-    }
-
-    auto imported = std::make_unique<VulkanImportedNativeTexture>();
-    if (!importDmabufAsVulkanNativeTexture(handles->inst->vkInstance(),
-                                           handles->physDev,
-                                           handles->dev,
-                                           &dmabuf,
-                                           imported.get())) {
-        qCWarning(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import failed: cannot create sampled VkImage"
-            << buffer
-            << "size" << QSize(dmabuf.width, dmabuf.height)
-            << "format" << drmFormatToName(dmabuf.format)
-            << "modifier" << drmModifierToName(dmabuf.modifier)
-            << "planes" << dmabuf.n_planes;
-        return false;
-    }
-
-    if (!acquireVulkanNativeTextureForSampling(rhi, imported.get())) {
-        qCWarning(lcWlRenderHelper)
-            << "Vulkan RHI dmabuf native texture import failed: cannot acquire image for Qt sampling"
-            << buffer
-            << "image" << Qt::hex << vulkanHandleToInteger(imported->image) << Qt::dec
-            << "size" << imported->size
-            << "format" << drmFormatToName(imported->drmFormat)
-            << "modifier" << drmModifierToName(imported->drmModifier);
-        destroyVulkanImportedNativeTexture(imported.get());
-        return false;
-    }
-
-    VulkanImportedNativeTexture *ownedImport = imported.release();
-    importedTexture->texture = nullptr;
-    importedTexture->nativeCleanup = {
-        NativeTextureCleanup::Type::VulkanTexture,
-        vulkanHandleToInteger(ownedImport->image),
-        nullptr,
-        nullptr,
-        ownedImport,
-    };
-    importedTexture->nativeImage = vulkanHandleToInteger(ownedImport->image);
-    importedTexture->nativeLayout = ownedImport->layout;
-    importedTexture->nativeViewFormat = ownedImport->format;
-    importedTexture->size = ownedImport->size;
-    importedTexture->drmFormat = ownedImport->drmFormat;
-    importedTexture->drmModifier = ownedImport->drmModifier;
-    importedTexture->hasAlpha = drmFormatLikelyHasAlpha(dmabuf.format)
-        && !surfaceOpaqueRegionCoversBuffer(surface, buffer);
-
-    qCDebug(lcWlRenderHelper)
-        << "Vulkan RHI dmabuf native texture import ready"
-        << buffer
-        << "image" << Qt::hex << vulkanHandleToInteger(ownedImport->image) << Qt::dec
-        << "size" << ownedImport->size
-        << "format" << drmFormatToName(ownedImport->drmFormat)
-        << "modifier" << drmModifierToName(ownedImport->drmModifier)
-        << "viewVkFormat" << ownedImport->format
-        << "layout" << vkImageLayoutName(ownedImport->layout)
-        << "planes" << dmabuf.n_planes
-        << "usedExplicitAcquire" << usedExplicitAcquire
-        << "usedImplicitAcquire" << !usedExplicitAcquire
-        << "alpha" << importedTexture->hasAlpha;
-    return true;
-#else
-    Q_UNUSED(rhi);
-    Q_UNUSED(buffer);
-    Q_UNUSED(surface);
-    Q_UNUSED(importedTexture);
-    return false;
-#endif
 }
 
 bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
@@ -5086,9 +4948,6 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
         nullptr,
         ownedImport,
     };
-    importedTexture->nativeImage = vulkanHandleToInteger(ownedImport->image);
-    importedTexture->nativeLayout = ownedImport->layout;
-    importedTexture->nativeViewFormat = ownedImport->format;
     importedTexture->size = ownedImport->size;
     importedTexture->drmFormat = ownedImport->drmFormat;
     importedTexture->drmModifier = ownedImport->drmModifier;

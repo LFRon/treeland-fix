@@ -117,7 +117,6 @@ class WAYLIB_SERVER_EXPORT WSurfaceItem : public QQuickItem
     Q_PROPERTY(QRectF boundingRect READ boundingRect NOTIFY boundingRectChanged)
     Q_PROPERTY(bool subsurfacesVisible READ subsurfacesVisible WRITE setSubsurfacesVisible NOTIFY subsurfacesVisibleChanged FINAL)
     Q_PROPERTY(bool ready READ isReady NOTIFY readyChanged FINAL)
-    Q_PROPERTY(bool vulkanDirectSurfaceAllowed READ vulkanDirectSurfaceAllowed WRITE setVulkanDirectSurfaceAllowed NOTIFY vulkanDirectSurfaceAllowedChanged FINAL)
     QML_NAMED_ELEMENT(SurfaceItem)
 
 public:
@@ -197,9 +196,6 @@ public:
 
     bool isReady() const;
 
-    bool vulkanDirectSurfaceAllowed() const;
-    void setVulkanDirectSurfaceAllowed(bool allowed);
-
     // Find WSurfaceItemContent in child items
     WSurfaceItemContent *findItemContent() const;
 
@@ -225,7 +221,6 @@ Q_SIGNALS:
     void boundingRectChanged();
     void subsurfacesVisibleChanged();
     void readyChanged();
-    void vulkanDirectSurfaceAllowedChanged();
 
 protected:
     explicit WSurfaceItem(WSurfaceItemPrivate &dd, QQuickItem *parent = nullptr);
