@@ -12,6 +12,8 @@
 #include <qwrenderer.h>
 
 #include <QByteArray>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QVector>
 #include <rhi/qrhi.h>
 #include <private/qsgplaintexture_p.h>
@@ -22,6 +24,7 @@
 extern "C" {
 #include <wlr/render/dmabuf.h>
 }
+#include <drm_fourcc.h>
 #endif
 
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -45,7 +48,6 @@ static int bufferLocks(qw_buffer *buffer)
 
 #ifdef ENABLE_VULKAN_RENDER
 static constexpr int s_deferredVulkanTextureReleaseFrames = 3;
-static constexpr int s_vulkanDmabufTextureCacheCapacity = 8;
 
 static bool envFlagExplicitlyDisabled(const char *name)
 {
@@ -62,6 +64,82 @@ static bool bufferHasDmabuf(qw_buffer *buffer)
     return buffer->get_dmabuf(&dmabuf);
 }
 
+static qsizetype envMiBValue(const char *waylibName, const char *treelandName,
+                             qsizetype defaultMiB)
+{
+    const char *names[] = { waylibName, treelandName };
+    for (const char *name : names) {
+        const QByteArray value = qgetenv(name).trimmed();
+        if (value.isEmpty())
+            continue;
+
+        bool ok = false;
+        const qlonglong mib = value.toLongLong(&ok);
+        if (ok && mib > 0)
+            return qsizetype(mib) * 1024 * 1024;
+    }
+
+    return defaultMiB * 1024 * 1024;
+}
+
+static int envIntValue(const char *waylibName, const char *treelandName,
+                       int defaultValue)
+{
+    const char *names[] = { waylibName, treelandName };
+    for (const char *name : names) {
+        const QByteArray value = qgetenv(name).trimmed();
+        if (value.isEmpty())
+            continue;
+
+        bool ok = false;
+        const int parsed = value.toInt(&ok);
+        if (ok && parsed > 0)
+            return parsed;
+    }
+
+    return defaultValue;
+}
+
+static qsizetype drmFormatEstimatedBytesPerPixel(uint32_t format)
+{
+    switch (format) {
+    case DRM_FORMAT_R8:
+        return 1;
+    case DRM_FORMAT_GR88:
+    case DRM_FORMAT_RG88:
+    case DRM_FORMAT_RGB565:
+    case DRM_FORMAT_BGR565:
+        return 2;
+    case DRM_FORMAT_XRGB8888:
+    case DRM_FORMAT_ARGB8888:
+    case DRM_FORMAT_XBGR8888:
+    case DRM_FORMAT_ABGR8888:
+    case DRM_FORMAT_RGBX8888:
+    case DRM_FORMAT_RGBA8888:
+    case DRM_FORMAT_BGRX8888:
+    case DRM_FORMAT_BGRA8888:
+    case DRM_FORMAT_XRGB2101010:
+    case DRM_FORMAT_ARGB2101010:
+    case DRM_FORMAT_XBGR2101010:
+    case DRM_FORMAT_ABGR2101010:
+        return 4;
+    default:
+        // Most desktop client buffers are 32-bit ARGB/XRGB. Prefer a
+        // conservative estimate so the cache trims earlier for uncommon formats.
+        return 4;
+    }
+}
+
+static qsizetype estimatedDmabufCost(const wlr_dmabuf_attributes &dmabuf)
+{
+    if (dmabuf.width <= 0 || dmabuf.height <= 0)
+        return 0;
+
+    return qsizetype(dmabuf.width)
+        * qsizetype(dmabuf.height)
+        * drmFormatEstimatedBytesPerPixel(dmabuf.format);
+}
+
 static bool directDmabufImportEnabled()
 {
     static const bool enabled = !envFlagExplicitlyDisabled("WAYLIB_VK_DIRECT_DMABUF")
@@ -69,6 +147,504 @@ static bool directDmabufImportEnabled()
         && !envFlagExplicitlyDisabled("WAYLIB_VK_DIRECT_CLIENT_DMABUF")
         && !envFlagExplicitlyDisabled("TREELAND_VK_DIRECT_CLIENT_DMABUF");
     return enabled;
+}
+
+struct VulkanDmabufTextureCacheStats {
+    qsizetype cachedBytes = 0;
+    qsizetype budgetBytes = 0;
+    int entries = 0;
+    int maxEntries = 0;
+    int activeRefs = 0;
+    int deferredReleases = 0;
+};
+
+struct VulkanSharedDmabufTexture {
+    QRhi *rhi = nullptr;
+    QPointer<WOutputRenderWindow> window;
+    QPointer<qw_buffer> buffer;
+    QRhiTexture *rhiTexture = nullptr;
+    WRenderHelper::NativeTextureCleanup nativeCleanup;
+    QSize size;
+    uint32_t drmFormat = 0;
+    uint64_t drmModifier = 0;
+    bool hasAlpha = false;
+    quint32 lastContentSerial = 0;
+    bool lastAcquireCacheHit = false;
+    bool lastAcquireReacquired = false;
+    qsizetype costBytes = 0;
+    int refCount = 0;
+    quint64 lastUsed = 0;
+};
+
+class Q_DECL_HIDDEN VulkanDmabufTextureCache
+{
+public:
+    ~VulkanDmabufTextureCache()
+    {
+        QVector<WRenderHelper::NativeTextureCleanup> cleanups;
+        {
+            QMutexLocker locker(&m_mutex);
+            for (auto *entry : std::as_const(m_entries)) {
+                if (entry->rhiTexture)
+                    entry->rhiTexture->deleteLater();
+                if (entry->nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None)
+                    cleanups.append(entry->nativeCleanup);
+                delete entry;
+            }
+            m_entries.clear();
+            for (const auto &release : std::as_const(m_deferredReleases)) {
+                if (release.nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None)
+                    cleanups.append(release.nativeCleanup);
+            }
+            m_deferredReleases.clear();
+            m_cachedBytes = 0;
+        }
+
+        for (auto cleanup : cleanups)
+            WRenderHelper::releaseNativeTexture(&cleanup);
+    }
+
+    VulkanSharedDmabufTexture *acquire(QRhi *rhi, WOutputRenderWindow *window,
+                                       qw_buffer *buffer, wlr_surface *surface,
+                                       quint32 contentSerial,
+                                       bool allowOverBudgetImport)
+    {
+        if (!rhi || !window || !buffer)
+            return nullptr;
+
+        wlr_dmabuf_attributes dmabuf = {};
+        if (!buffer->get_dmabuf(&dmabuf))
+            return nullptr;
+
+        ensureRenderEndConnection(window);
+
+        if (auto *entry = acquireExisting(rhi, buffer, dmabuf, surface, contentSerial))
+            return entry;
+
+        const qsizetype costBytes = estimatedDmabufCost(dmabuf);
+        if (!prepareForImport(costBytes, allowOverBudgetImport, buffer, dmabuf))
+            return nullptr;
+
+        WRenderHelper::ImportedVulkanTexture importedTexture;
+        if (!WRenderHelper::importVulkanTextureFromBuffer(rhi, buffer, surface,
+                                                          &importedTexture)) {
+            return nullptr;
+        }
+
+        auto *entry = new VulkanSharedDmabufTexture;
+        entry->rhi = rhi;
+        entry->window = window;
+        entry->buffer = buffer;
+        entry->rhiTexture = importedTexture.texture;
+        entry->nativeCleanup = importedTexture.nativeCleanup;
+        entry->size = importedTexture.size;
+        entry->drmFormat = importedTexture.drmFormat;
+        entry->drmModifier = importedTexture.drmModifier;
+        entry->hasAlpha = importedTexture.hasAlpha;
+        entry->lastContentSerial = contentSerial;
+        entry->lastAcquireCacheHit = false;
+        entry->lastAcquireReacquired = true;
+        entry->costBytes = costBytes;
+        entry->refCount = 1;
+        importedTexture.texture = nullptr;
+        importedTexture.nativeCleanup = {};
+
+        VulkanDmabufTextureCacheStats stats;
+        {
+            QMutexLocker locker(&m_mutex);
+            pruneInvalidLocked();
+
+            if (auto *existing = findEntryLocked(rhi, buffer, dmabuf)) {
+                ++existing->refCount;
+                existing->lastUsed = ++m_useSerial;
+                stats = statsLocked();
+                locker.unlock();
+                WRenderHelper::releaseImportedVulkanTexture(&importedTexture);
+                deleteImportedEntry(entry);
+                if (acquireImportedEntry(existing, rhi, buffer, surface, contentSerial))
+                    return existing;
+                release(existing);
+                return nullptr;
+            }
+
+            entry->lastUsed = ++m_useSerial;
+            m_entries.append(entry);
+            m_cachedBytes += entry->costBytes;
+            pruneOverBudgetLocked(0);
+            stats = statsLocked();
+        }
+
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan client dmabuf texture cached"
+            << "buffer" << pointerAddress(buffer)
+            << "rhiTexture" << entry->rhiTexture
+            << "size" << entry->size
+            << "format" << Qt::hex << entry->drmFormat << Qt::dec
+            << "modifier" << Qt::hex << entry->drmModifier << Qt::dec
+            << "entryBytes" << entry->costBytes
+            << "cacheBytes" << stats.cachedBytes
+            << "budgetBytes" << stats.budgetBytes
+            << "entries" << stats.entries
+            << "activeRefs" << stats.activeRefs;
+
+        return entry;
+    }
+
+    void release(VulkanSharedDmabufTexture *entry)
+    {
+        if (!entry)
+            return;
+
+        QMutexLocker locker(&m_mutex);
+        if (entry->refCount > 0)
+            --entry->refCount;
+        entry->lastUsed = ++m_useSerial;
+        pruneInvalidLocked();
+        pruneOverBudgetLocked(0);
+    }
+
+    void processRenderEnd(WOutputRenderWindow *window)
+    {
+        processDeferredReleases(window, false);
+
+        QMutexLocker locker(&m_mutex);
+        pruneInvalidLocked();
+        pruneOverBudgetLocked(0);
+    }
+
+    void forceProcessDeferredReleases(WOutputRenderWindow *window)
+    {
+        processDeferredReleases(window, true);
+    }
+
+    void releaseWindow(WOutputRenderWindow *window)
+    {
+        QVector<WRenderHelper::NativeTextureCleanup> cleanups;
+        {
+            QMutexLocker locker(&m_mutex);
+            for (int i = m_entries.size() - 1; i >= 0; --i) {
+                auto *entry = m_entries[i];
+                if (entry->window && entry->window != window)
+                    continue;
+
+                if (entry->refCount > 0) {
+                    qCWarning(lcWlQtQuickTexture)
+                        << "Vulkan client dmabuf cache kept active entry for destroyed window"
+                        << "window" << pointerAddress(window)
+                        << "buffer" << pointerAddress(entry->buffer.data())
+                        << "rhiTexture" << entry->rhiTexture
+                        << "refs" << entry->refCount;
+                    continue;
+                }
+
+                queueDestroyEntryLocked(i, "window-destroyed", 0);
+            }
+
+            for (int i = m_deferredReleases.size() - 1; i >= 0; --i) {
+                const auto &release = m_deferredReleases[i];
+                if (release.window && release.window != window)
+                    continue;
+                cleanups.append(release.nativeCleanup);
+                m_deferredReleases.removeAt(i);
+            }
+
+            for (int i = m_connectedWindows.size() - 1; i >= 0; --i) {
+                if (!m_connectedWindows[i] || m_connectedWindows[i] == window)
+                    m_connectedWindows.removeAt(i);
+            }
+        }
+
+        for (auto cleanup : cleanups)
+            WRenderHelper::releaseNativeTexture(&cleanup);
+    }
+
+    VulkanDmabufTextureCacheStats stats() const
+    {
+        QMutexLocker locker(&m_mutex);
+        return statsLocked();
+    }
+
+    void ensureRenderEndConnection(WOutputRenderWindow *window);
+
+private:
+    struct DeferredRelease {
+        QPointer<WOutputRenderWindow> window;
+        WRenderHelper::NativeTextureCleanup nativeCleanup;
+        int framesLeft = 0;
+        qsizetype costBytes = 0;
+    };
+
+    VulkanSharedDmabufTexture *acquireExisting(QRhi *rhi, qw_buffer *buffer,
+                                               const wlr_dmabuf_attributes &dmabuf,
+                                               wlr_surface *surface,
+                                               quint32 contentSerial)
+    {
+        VulkanSharedDmabufTexture *entry = nullptr;
+        {
+            QMutexLocker locker(&m_mutex);
+            pruneInvalidLocked();
+            entry = findEntryLocked(rhi, buffer, dmabuf);
+            if (!entry)
+                return nullptr;
+
+            ++entry->refCount;
+            entry->lastUsed = ++m_useSerial;
+        }
+
+        if (!acquireImportedEntry(entry, rhi, buffer, surface, contentSerial)) {
+            release(entry);
+            return nullptr;
+        }
+
+        return entry;
+    }
+
+    bool acquireImportedEntry(VulkanSharedDmabufTexture *entry, QRhi *rhi,
+                              qw_buffer *buffer, wlr_surface *surface,
+                              quint32 contentSerial)
+    {
+        if (!entry)
+            return false;
+
+        entry->lastAcquireCacheHit = true;
+        entry->lastAcquireReacquired = false;
+
+        if (contentSerial != 0 && entry->lastContentSerial == contentSerial)
+            return true;
+
+        if (!WRenderHelper::acquireImportedVulkanTextureFromBuffer(rhi, buffer,
+                                                                   surface,
+                                                                   &entry->nativeCleanup)) {
+            return false;
+        }
+
+        entry->lastContentSerial = contentSerial;
+        entry->lastAcquireReacquired = true;
+        return true;
+    }
+
+    VulkanSharedDmabufTexture *findEntryLocked(QRhi *rhi, qw_buffer *buffer,
+                                               const wlr_dmabuf_attributes &dmabuf) const
+    {
+        const QSize size(dmabuf.width, dmabuf.height);
+        for (auto *entry : m_entries) {
+            if (entry->rhi == rhi
+                && entry->buffer == buffer
+                && entry->size == size
+                && entry->drmFormat == dmabuf.format
+                && entry->drmModifier == dmabuf.modifier) {
+                return entry;
+            }
+        }
+
+        return nullptr;
+    }
+
+    bool prepareForImport(qsizetype costBytes, bool allowOverBudgetImport,
+                          qw_buffer *buffer, const wlr_dmabuf_attributes &dmabuf)
+    {
+        QMutexLocker locker(&m_mutex);
+        pruneInvalidLocked();
+        pruneOverBudgetLocked(costBytes);
+
+        const bool entryLimitReached = m_maxEntries > 0
+            && m_entries.size() + 1 > m_maxEntries;
+        const bool budgetReached = m_budgetBytes > 0
+            && m_cachedBytes + costBytes > m_budgetBytes;
+
+        if (entryLimitReached || (budgetReached && !allowOverBudgetImport)) {
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan client dmabuf texture import throttled by cache budget"
+                << "buffer" << pointerAddress(buffer)
+                << "size" << QSize(dmabuf.width, dmabuf.height)
+                << "format" << Qt::hex << dmabuf.format << Qt::dec
+                << "modifier" << Qt::hex << dmabuf.modifier << Qt::dec
+                << "entryBytes" << costBytes
+                << "cacheBytes" << m_cachedBytes
+                << "budgetBytes" << m_budgetBytes
+                << "entries" << m_entries.size()
+                << "maxEntries" << m_maxEntries
+                << "allowOverBudgetImport" << allowOverBudgetImport;
+            return false;
+        }
+
+        return true;
+    }
+
+    void pruneInvalidLocked()
+    {
+        for (int i = m_entries.size() - 1; i >= 0; --i) {
+            const auto *entry = m_entries[i];
+            if (entry->refCount == 0 && !entry->buffer)
+                queueDestroyEntryLocked(i, "buffer-destroyed");
+        }
+    }
+
+    void pruneOverBudgetLocked(qsizetype incomingCost)
+    {
+        while (true) {
+            const bool overEntryLimit = m_maxEntries > 0
+                && m_entries.size() + (incomingCost > 0 ? 1 : 0) > m_maxEntries;
+            const bool overBudget = m_budgetBytes > 0
+                && m_cachedBytes + incomingCost > m_budgetBytes;
+            if (!overEntryLimit && !overBudget)
+                return;
+
+            int evictIndex = -1;
+            quint64 oldestUse = std::numeric_limits<quint64>::max();
+            for (int i = 0; i < m_entries.size(); ++i) {
+                const auto *entry = m_entries[i];
+                if (entry->refCount > 0)
+                    continue;
+
+                if (entry->lastUsed < oldestUse) {
+                    oldestUse = entry->lastUsed;
+                    evictIndex = i;
+                }
+            }
+
+            if (evictIndex < 0)
+                return;
+
+            queueDestroyEntryLocked(evictIndex, "over-budget");
+        }
+    }
+
+    void queueDestroyEntryLocked(int index, const char *reason,
+                                 int framesLeft = s_deferredVulkanTextureReleaseFrames)
+    {
+        if (index < 0 || index >= m_entries.size())
+            return;
+
+        auto *entry = m_entries.takeAt(index);
+        m_cachedBytes -= entry->costBytes;
+
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan client dmabuf texture cache evicted"
+            << "reason" << reason
+            << "buffer" << pointerAddress(entry->buffer.data())
+            << "rhiTexture" << entry->rhiTexture
+            << "size" << entry->size
+            << "format" << Qt::hex << entry->drmFormat << Qt::dec
+            << "modifier" << Qt::hex << entry->drmModifier << Qt::dec
+            << "entryBytes" << entry->costBytes
+            << "remainingBytes" << m_cachedBytes
+            << "remainingEntries" << m_entries.size();
+
+        if (entry->rhiTexture)
+            entry->rhiTexture->deleteLater();
+
+        if (entry->nativeCleanup.type != WRenderHelper::NativeTextureCleanup::Type::None) {
+            m_deferredReleases.append({
+                entry->window,
+                entry->nativeCleanup,
+                framesLeft,
+                entry->costBytes,
+            });
+            entry->nativeCleanup = {};
+        }
+
+        delete entry;
+    }
+
+    void deleteImportedEntry(VulkanSharedDmabufTexture *entry)
+    {
+        if (!entry)
+            return;
+
+        WRenderHelper::ImportedVulkanTexture imported;
+        imported.texture = entry->rhiTexture;
+        imported.nativeCleanup = entry->nativeCleanup;
+        WRenderHelper::releaseImportedVulkanTexture(&imported);
+        delete entry;
+    }
+
+    void processDeferredReleases(WOutputRenderWindow *window, bool force)
+    {
+        QVector<WRenderHelper::NativeTextureCleanup> cleanups;
+        {
+            QMutexLocker locker(&m_mutex);
+            for (int i = m_deferredReleases.size() - 1; i >= 0; --i) {
+                auto &release = m_deferredReleases[i];
+                if (window && release.window != window)
+                    continue;
+
+                if (!force && --release.framesLeft > 0)
+                    continue;
+
+                cleanups.append(release.nativeCleanup);
+                m_deferredReleases.removeAt(i);
+            }
+        }
+
+        for (auto cleanup : cleanups)
+            WRenderHelper::releaseNativeTexture(&cleanup);
+    }
+
+    VulkanDmabufTextureCacheStats statsLocked() const
+    {
+        VulkanDmabufTextureCacheStats stats;
+        stats.cachedBytes = m_cachedBytes;
+        stats.budgetBytes = m_budgetBytes;
+        stats.entries = m_entries.size();
+        stats.maxEntries = m_maxEntries;
+        stats.deferredReleases = m_deferredReleases.size();
+        for (const auto *entry : m_entries)
+            stats.activeRefs += entry->refCount;
+        return stats;
+    }
+
+    mutable QMutex m_mutex;
+    QVector<VulkanSharedDmabufTexture *> m_entries;
+    QVector<DeferredRelease> m_deferredReleases;
+    QVector<QPointer<WOutputRenderWindow>> m_connectedWindows;
+    qsizetype m_cachedBytes = 0;
+    quint64 m_useSerial = 0;
+    const qsizetype m_budgetBytes =
+        envMiBValue("WAYLIB_VK_CLIENT_DMABUF_CACHE_MB",
+                    "TREELAND_VK_CLIENT_DMABUF_CACHE_MB",
+                    512);
+    const int m_maxEntries =
+        envIntValue("WAYLIB_VK_CLIENT_DMABUF_CACHE_ENTRIES",
+                    "TREELAND_VK_CLIENT_DMABUF_CACHE_ENTRIES",
+                    128);
+};
+
+Q_GLOBAL_STATIC(VulkanDmabufTextureCache, s_vulkanDmabufTextureCache)
+
+void VulkanDmabufTextureCache::ensureRenderEndConnection(WOutputRenderWindow *window)
+{
+    if (!window)
+        return;
+
+    bool needsConnection = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        for (int i = m_connectedWindows.size() - 1; i >= 0; --i) {
+            if (!m_connectedWindows[i]) {
+                m_connectedWindows.removeAt(i);
+                continue;
+            }
+
+            if (m_connectedWindows[i] == window)
+                return;
+        }
+
+        m_connectedWindows.append(window);
+        needsConnection = true;
+    }
+
+    if (!needsConnection)
+        return;
+
+    QObject::connect(window, &WOutputRenderWindow::renderEnd,
+                     window, [window] {
+                         s_vulkanDmabufTextureCache->processRenderEnd(window);
+                     });
+    QObject::connect(window, &QObject::destroyed,
+                     window, [window] {
+                         s_vulkanDmabufTextureCache->releaseWindow(window);
+                     });
 }
 #endif
 
@@ -108,18 +684,6 @@ public:
         int framesLeft = 0;
     };
 
-    struct VulkanDmabufTextureCacheEntry {
-        QPointer<qw_buffer> buffer;
-        QRhiTexture *rhiTexture = nullptr;
-        WRenderHelper::NativeTextureCleanup nativeCleanup;
-        QSize size;
-        uint32_t drmFormat = 0;
-        uint64_t drmModifier = 0;
-        bool hasAlpha = false;
-        quint32 contentSerial = 0;
-        quint64 lastUsed = 0;
-    };
-
     void ensureDeferredVulkanTextureReleaseConnection()
     {
         if (deferredVulkanTextureReleaseConnection || !window)
@@ -135,9 +699,6 @@ public:
 
     void processDeferredVulkanTextureReleases(bool force)
     {
-        if (deferredVulkanTextureReleases.isEmpty())
-            return;
-
         if (force && window && window->rhi())
             window->rhi()->finish();
 
@@ -150,6 +711,9 @@ public:
             deferredVulkanTextureReleases.removeAt(i);
             WRenderHelper::releaseNativeTexture(&cleanup);
         }
+
+        if (force)
+            s_vulkanDmabufTextureCache->forceProcessDeferredReleases(window);
     }
 
     void deferVulkanNativeTextureRelease(WRenderHelper::NativeTextureCleanup *cleanup,
@@ -175,106 +739,48 @@ public:
         ensureDeferredVulkanTextureReleaseConnection();
     }
 
-    int findVulkanDmabufTextureCacheEntry(qw_buffer *newBuffer) const
+    void releaseActiveVulkanDmabufTexture()
     {
-        if (!newBuffer)
-            return -1;
-
-        for (int i = 0; i < vulkanDmabufTextureCache.size(); ++i) {
-            if (vulkanDmabufTextureCache[i].buffer == newBuffer)
-                return i;
-        }
-
-        return -1;
-    }
-
-    void releaseVulkanDmabufTextureCacheEntry(int index)
-    {
-        if (index < 0 || index >= vulkanDmabufTextureCache.size())
+        if (!activeVulkanDmabufTexture)
             return;
 
-        auto entry = vulkanDmabufTextureCache.takeAt(index);
-        if (entry.rhiTexture == rhiTexture) {
-            qtTexture.setTexture(nullptr);
-            rhiTexture = nullptr;
-            nativeCleanup = {};
-            if (buffer == entry.buffer)
-                buffer = nullptr;
-            bufferContentSerial = 0;
-        }
-
-        qCDebug(lcWlQtQuickTexture)
-            << "Vulkan renderer dmabuf texture cache evicted"
-            << "buffer" << pointerAddress(entry.buffer.data())
-            << "rhiTexture" << entry.rhiTexture
-            << "size" << entry.size
-            << "format" << Qt::hex << entry.drmFormat << Qt::dec
-            << "modifier" << Qt::hex << entry.drmModifier << Qt::dec
-            << "remaining" << vulkanDmabufTextureCache.size();
-
-        releaseDetachedTexture(nullptr, false, entry.rhiTexture, entry.nativeCleanup);
+        s_vulkanDmabufTextureCache->release(activeVulkanDmabufTexture);
+        activeVulkanDmabufTexture = nullptr;
     }
 
-    void trimVulkanDmabufTextureCache()
+    void activateSharedVulkanDmabufTexture(VulkanSharedDmabufTexture *entry,
+                                           qw_buffer *newBuffer,
+                                           quint32 newBufferContentSerial,
+                                           const char *backendName,
+                                           bool cacheHit,
+                                           bool reacquired)
     {
-        for (int i = vulkanDmabufTextureCache.size() - 1; i >= 0; --i) {
-            const auto &entry = vulkanDmabufTextureCache[i];
-            if (!entry.buffer && entry.rhiTexture != rhiTexture)
-                releaseVulkanDmabufTextureCacheEntry(i);
-        }
-
-        while (vulkanDmabufTextureCache.size() > s_vulkanDmabufTextureCacheCapacity) {
-            int evictIndex = -1;
-            quint64 oldestUse = std::numeric_limits<quint64>::max();
-            for (int i = 0; i < vulkanDmabufTextureCache.size(); ++i) {
-                const auto &entry = vulkanDmabufTextureCache[i];
-                if (entry.rhiTexture == rhiTexture)
-                    continue;
-
-                if (entry.lastUsed < oldestUse) {
-                    oldestUse = entry.lastUsed;
-                    evictIndex = i;
-                }
-            }
-
-            if (evictIndex < 0)
-                break;
-
-            releaseVulkanDmabufTextureCacheEntry(evictIndex);
-        }
-    }
-
-    void clearVulkanDmabufTextureCache()
-    {
-        while (!vulkanDmabufTextureCache.isEmpty())
-            releaseVulkanDmabufTextureCacheEntry(vulkanDmabufTextureCache.size() - 1);
-    }
-
-    void activateVulkanDmabufTextureCacheEntry(int index, qw_buffer *newBuffer,
-                                               quint32 newBufferContentSerial,
-                                               const char *backendName, bool cacheHit,
-                                               bool reacquired)
-    {
-        auto &entry = vulkanDmabufTextureCache[index];
-        entry.lastUsed = ++vulkanDmabufTextureUseSerial;
-        if (newBufferContentSerial != 0)
-            entry.contentSerial = newBufferContentSerial;
-
         auto oldTexture = texture;
         const bool oldOwnsTexture = ownsTexture;
-        auto oldRhiTexture = rhiTexture;
-        auto oldNativeCleanup = nativeCleanup;
+        auto oldRhiTexture = activeVulkanDmabufTexture ? nullptr : rhiTexture;
+        auto oldNativeCleanup = activeVulkanDmabufTexture
+            ? WRenderHelper::NativeTextureCleanup{}
+            : nativeCleanup;
+        auto *oldActiveVulkanDmabufTexture = activeVulkanDmabufTexture;
 
         texture = nullptr;
         ownsTexture = false;
         buffer = newBuffer;
         bufferContentSerial = newBufferContentSerial;
         qtTexture.setOwnsTexture(false);
-        qtTexture.setTexture(entry.rhiTexture);
-        qtTexture.setHasAlphaChannel(entry.hasAlpha);
-        qtTexture.setTextureSize(entry.size);
-        rhiTexture = entry.rhiTexture;
+        qtTexture.setTexture(entry->rhiTexture);
+        qtTexture.setHasAlphaChannel(entry->hasAlpha);
+        qtTexture.setTextureSize(entry->size);
+        rhiTexture = entry->rhiTexture;
+        hasPendingImageTexture = false;
         nativeCleanup = {};
+        if (entry == oldActiveVulkanDmabufTexture) {
+            s_vulkanDmabufTextureCache->release(entry);
+        } else {
+            activeVulkanDmabufTexture = entry;
+        }
+
+        const auto stats = s_vulkanDmabufTextureCache->stats();
 
         qCDebug(lcWlQtQuickTexture)
             << "Vulkan renderer dmabuf texture import path"
@@ -284,14 +790,22 @@ public:
             << "buffer" << pointerAddress(newBuffer)
             << "contentSerial" << newBufferContentSerial
             << "rhiTexture" << rhiTexture
-            << "size" << entry.size
-            << "format" << Qt::hex << entry.drmFormat << Qt::dec
-            << "modifier" << Qt::hex << entry.drmModifier << Qt::dec
+            << "size" << entry->size
+            << "format" << Qt::hex << entry->drmFormat << Qt::dec
+            << "modifier" << Qt::hex << entry->drmModifier << Qt::dec
             << "locks" << bufferLocks(newBuffer)
             << "alpha" << qtTexture.hasAlphaChannel()
-            << "cacheSize" << vulkanDmabufTextureCache.size();
+            << "entryBytes" << entry->costBytes
+            << "cacheBytes" << stats.cachedBytes
+            << "budgetBytes" << stats.budgetBytes
+            << "cacheEntries" << stats.entries
+            << "activeRefs" << stats.activeRefs
+            << "deferredReleases" << stats.deferredReleases;
 
         releaseDetachedTexture(oldTexture, oldOwnsTexture, oldRhiTexture, oldNativeCleanup);
+        if (oldActiveVulkanDmabufTexture && oldActiveVulkanDmabufTexture != entry)
+            s_vulkanDmabufTextureCache->release(oldActiveVulkanDmabufTexture);
+        ensureDeferredVulkanTextureReleaseConnection();
     }
 #endif
 
@@ -323,10 +837,11 @@ public:
         // together with their import objects. QImage fallbacks switch the
         // QSGPlainTexture back to owned mode, so setTexture(nullptr) deletes
         // those Qt-created textures normally.
-        if (rhiTexture) {
+        if (rhiTexture || hasPendingImageTexture) {
             qtTexture.setTexture(nullptr);
             rhiTexture = nullptr;
         }
+        hasPendingImageTexture = false;
         releaseDetachedTexture(nullptr, false, importedWrapper, nativeCleanup);
         nativeCleanup = {};
 
@@ -337,7 +852,7 @@ public:
         buffer = nullptr;
         bufferContentSerial = 0;
 #ifdef ENABLE_VULKAN_RENDER
-        clearVulkanDmabufTextureCache();
+        releaseActiveVulkanDmabufTexture();
 #endif
     }
 
@@ -378,20 +893,36 @@ public:
 
         auto oldTexture = texture;
         const bool oldOwnsTexture = ownsTexture;
+#ifdef ENABLE_VULKAN_RENDER
+        auto oldRhiTexture = activeVulkanDmabufTexture ? nullptr : rhiTexture;
+        auto oldNativeCleanup = activeVulkanDmabufTexture
+            ? WRenderHelper::NativeTextureCleanup{}
+            : nativeCleanup;
+        auto *oldActiveVulkanDmabufTexture = activeVulkanDmabufTexture;
+#else
         auto oldRhiTexture = rhiTexture;
         auto oldNativeCleanup = nativeCleanup;
+#endif
 
         texture = newTexture;
         ownsTexture = newOwnsTexture;
         buffer = newBuffer;
         bufferContentSerial = newBufferContentSerial;
         rhiTexture = qtTexture.rhiTexture();
+        hasPendingImageTexture = !rhiTexture && !qtTexture.textureSize().isEmpty();
         nativeCleanup = newCleanup;
+#ifdef ENABLE_VULKAN_RENDER
+        activeVulkanDmabufTexture = nullptr;
+#endif
 
         releaseDetachedTexture(oldTexture == newTexture ? nullptr : oldTexture,
                                oldTexture == newTexture ? false : oldOwnsTexture,
                                oldRhiTexture,
                                oldNativeCleanup);
+#ifdef ENABLE_VULKAN_RENDER
+        if (oldActiveVulkanDmabufTexture)
+            s_vulkanDmabufTextureCache->release(oldActiveVulkanDmabufTexture);
+#endif
         return true;
     }
 
@@ -412,61 +943,17 @@ public:
                                                                   &qtTexture, &newCleanup);
         } else if (backend == QRhi::Vulkan) {
             backendName = "Vulkan RHI";
-            trimVulkanDmabufTextureCache();
-
-            int cacheIndex = findVulkanDmabufTextureCacheEntry(newBuffer);
-            if (cacheIndex >= 0) {
-                auto &entry = vulkanDmabufTextureCache[cacheIndex];
-                if (newBufferContentSerial != 0
-                    && entry.contentSerial == newBufferContentSerial
-                    && entry.rhiTexture) {
-                    activateVulkanDmabufTextureCacheEntry(cacheIndex, newBuffer,
-                                                          newBufferContentSerial,
-                                                          backendName, true, false);
-                    return true;
-                }
-
-                if (WRenderHelper::acquireImportedVulkanTextureFromBuffer(window->rhi(),
-                                                                          newBuffer,
-                                                                          surface,
-                                                                          &entry.nativeCleanup)) {
-                    activateVulkanDmabufTextureCacheEntry(cacheIndex, newBuffer,
-                                                          newBufferContentSerial,
-                                                          backendName, true, true);
-                    return true;
-                }
-
-                qCDebug(lcWlQtQuickTexture)
-                    << "Vulkan renderer dmabuf texture cache entry could not be reacquired,"
-                       " evicting and reimporting"
-                    << "buffer" << pointerAddress(newBuffer)
-                    << "rhiTexture" << entry.rhiTexture
-                    << "size" << entry.size;
-                releaseVulkanDmabufTextureCacheEntry(cacheIndex);
-            }
-
-            WRenderHelper::ImportedVulkanTexture importedTexture;
-            imported = WRenderHelper::importVulkanTextureFromBuffer(window->rhi(), newBuffer,
-                                                                    surface, &importedTexture);
-            if (imported) {
-                VulkanDmabufTextureCacheEntry entry;
-                entry.buffer = newBuffer;
-                entry.rhiTexture = importedTexture.texture;
-                entry.nativeCleanup = importedTexture.nativeCleanup;
-                entry.size = importedTexture.size;
-                entry.drmFormat = importedTexture.drmFormat;
-                entry.drmModifier = importedTexture.drmModifier;
-                entry.hasAlpha = importedTexture.hasAlpha;
-                entry.contentSerial = newBufferContentSerial;
-                importedTexture.texture = nullptr;
-                importedTexture.nativeCleanup = {};
-
-                vulkanDmabufTextureCache.append(entry);
-                cacheIndex = vulkanDmabufTextureCache.size() - 1;
-                activateVulkanDmabufTextureCacheEntry(cacheIndex, newBuffer,
-                                                      newBufferContentSerial,
-                                                      backendName, false, true);
-                trimVulkanDmabufTextureCache();
+            const bool allowOverBudgetImport = !hasTexture();
+            auto *entry = s_vulkanDmabufTextureCache->acquire(window->rhi(), window,
+                                                              newBuffer, surface,
+                                                              newBufferContentSerial,
+                                                              allowOverBudgetImport);
+            if (entry) {
+                activateSharedVulkanDmabufTexture(entry, newBuffer,
+                                                  newBufferContentSerial,
+                                                  backendName,
+                                                  entry->lastAcquireCacheHit,
+                                                  entry->lastAcquireReacquired);
                 return true;
             }
         }
@@ -477,15 +964,20 @@ public:
 
         auto oldTexture = texture;
         const bool oldOwnsTexture = ownsTexture;
-        auto oldRhiTexture = rhiTexture;
-        auto oldNativeCleanup = nativeCleanup;
+        auto oldRhiTexture = activeVulkanDmabufTexture ? nullptr : rhiTexture;
+        auto oldNativeCleanup = activeVulkanDmabufTexture
+            ? WRenderHelper::NativeTextureCleanup{}
+            : nativeCleanup;
+        auto *oldActiveVulkanDmabufTexture = activeVulkanDmabufTexture;
 
         texture = nullptr;
         ownsTexture = false;
         buffer = newBuffer;
         bufferContentSerial = newBufferContentSerial;
         rhiTexture = qtTexture.rhiTexture();
+        hasPendingImageTexture = false;
         nativeCleanup = newCleanup;
+        activeVulkanDmabufTexture = nullptr;
 
         qCDebug(lcWlQtQuickTexture)
             << "Vulkan renderer dmabuf texture import path"
@@ -496,16 +988,80 @@ public:
             << "alpha" << qtTexture.hasAlphaChannel();
 
         releaseDetachedTexture(oldTexture, oldOwnsTexture, oldRhiTexture, oldNativeCleanup);
+        if (oldActiveVulkanDmabufTexture)
+            s_vulkanDmabufTextureCache->release(oldActiveVulkanDmabufTexture);
         return true;
 #else
         Q_UNUSED(newBuffer);
+        Q_UNUSED(surface);
+        Q_UNUSED(newBufferContentSerial);
+        return false;
+#endif
+    }
+
+    bool replaceBufferWithNonDmabufUpload(qw_buffer *newBuffer,
+                                          wlr_surface *surface,
+                                          QRhiCommandBuffer *commandBuffer,
+                                          quint32 newBufferContentSerial)
+    {
+#ifdef ENABLE_VULKAN_RENDER
+        if (!newBuffer || !window || !window->rhi()
+            || window->rhi()->backend() != QRhi::Vulkan
+            || bufferHasDmabuf(newBuffer)) {
+            return false;
+        }
+
+        if (!WRenderHelper::makeVulkanTextureFromNonDmabufBuffer(window->rhi(),
+                                                                 newBuffer,
+                                                                 &qtTexture,
+                                                                 surface,
+                                                                 commandBuffer)) {
+            return false;
+        }
+
+        auto oldTexture = texture;
+        const bool oldOwnsTexture = ownsTexture;
+        auto oldRhiTexture = activeVulkanDmabufTexture ? nullptr : rhiTexture;
+        auto oldNativeCleanup = activeVulkanDmabufTexture
+            ? WRenderHelper::NativeTextureCleanup{}
+            : nativeCleanup;
+        auto *oldActiveVulkanDmabufTexture = activeVulkanDmabufTexture;
+
+        texture = nullptr;
+        ownsTexture = false;
+        buffer = newBuffer;
+        bufferContentSerial = newBufferContentSerial;
+        rhiTexture = qtTexture.rhiTexture();
+        hasPendingImageTexture = !rhiTexture && !qtTexture.textureSize().isEmpty();
+        nativeCleanup = {};
+        activeVulkanDmabufTexture = nullptr;
+
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan renderer non-dmabuf buffer uploaded without wlroots texture wrapper"
+            << "buffer" << pointerAddress(newBuffer)
+            << "contentSerial" << newBufferContentSerial
+            << "size" << bufferSize(newBuffer)
+            << "locks" << bufferLocks(newBuffer)
+            << "rhiTexture" << rhiTexture
+            << "alpha" << qtTexture.hasAlphaChannel()
+            << "commandBuffer" << pointerAddress(commandBuffer);
+
+        releaseDetachedTexture(oldTexture, oldOwnsTexture, oldRhiTexture, oldNativeCleanup);
+        if (oldActiveVulkanDmabufTexture)
+            s_vulkanDmabufTextureCache->release(oldActiveVulkanDmabufTexture);
+        return true;
+#else
+        Q_UNUSED(newBuffer);
+        Q_UNUSED(surface);
+        Q_UNUSED(commandBuffer);
+        Q_UNUSED(newBufferContentSerial);
         return false;
 #endif
     }
 
     bool hasTexture() const
     {
-        return texture || rhiTexture;
+        return texture || rhiTexture || hasPendingImageTexture;
     }
 
     void updateRhiTexture(QRhiCommandBuffer *commandBuffer = nullptr) {
@@ -528,6 +1084,7 @@ public:
         }
 
         rhiTexture = qtTexture.rhiTexture();
+        hasPendingImageTexture = !rhiTexture && !qtTexture.textureSize().isEmpty();
         nativeCleanup = newCleanup;
     }
 
@@ -544,13 +1101,13 @@ public:
     QSGPlainTexture qtTexture;
     QRhiTexture *rhiTexture = nullptr;
     WRenderHelper::NativeTextureCleanup nativeCleanup;
+    bool hasPendingImageTexture = false;
     bool smooth = true;
     bool directBufferImportAllowed = false;
     quint32 bufferContentSerial = 0;
 #ifdef ENABLE_VULKAN_RENDER
     QVector<DeferredVulkanTextureRelease> deferredVulkanTextureReleases;
-    QVector<VulkanDmabufTextureCacheEntry> vulkanDmabufTextureCache;
-    quint64 vulkanDmabufTextureUseSerial = 0;
+    VulkanSharedDmabufTexture *activeVulkanDmabufTexture = nullptr;
     QMetaObject::Connection deferredVulkanTextureReleaseConnection;
 #endif
 };
@@ -695,6 +1252,24 @@ bool WSGTextureProvider::setBuffer(qw_buffer *buffer, wlr_surface *surface,
                 << "sameBuffer" << sameBuffer
                 << "size" << bufferSize(buffer)
                 << "locks" << bufferLocks(buffer);
+        }
+
+        if (!bufferHasNativeDmabuf
+            && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan) {
+            if (d->replaceBufferWithNonDmabufUpload(buffer, surface, commandBuffer,
+                                                    bufferContentSerial)) {
+                Q_EMIT textureChanged();
+                return true;
+            }
+
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan renderer direct non-dmabuf upload unavailable,"
+                   " falling back to wlroots texture path"
+                << "buffer" << pointerAddress(buffer)
+                << "sameBuffer" << sameBuffer
+                << "size" << bufferSize(buffer)
+                << "locks" << bufferLocks(buffer)
+                << "commandBuffer" << pointerAddress(commandBuffer);
         }
 
         bool ownsTexture = false;

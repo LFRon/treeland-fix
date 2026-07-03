@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include <QDebug>
+#include <QByteArray>
 
 #include "wrenderhelper.h"
 #include "wayliblogging.h"
@@ -289,12 +290,21 @@ protected:
             tmp.swap(manager->dataList);
             manager->dataList.reserve(tmp.size());
 
+            qsizetype retainedCost = 0;
             for (const auto &data : std::as_const(tmp)) {
-                if (data->released > 2) {
+                if (data->released <= 0)
+                    retainedCost += manager->get()->dataCost(data->data);
+            }
+
+            for (const auto &data : std::as_const(tmp)) {
+                const qsizetype dataCost = manager->get()->dataCost(data->data);
+                if (manager->get()->shouldDestroyData(*data, retainedCost, dataCost)) {
                     // Collect items to destroy instead of destroying immediately
                     itemsToDestroy.append(data->data);
                 } else {
                     manager->dataList << data;
+                    if (data->released > 0)
+                        retainedCost += dataCost;
 
                     if (data->released > 0)
                         ++data->released;
@@ -333,6 +343,14 @@ protected:
         }
     }
 
+    qsizetype dataCost(DataType *) const {
+        return 0;
+    }
+
+    bool shouldDestroyData(const Data &data, qsizetype, qsizetype) const {
+        return data.released > 2;
+    }
+
 private:
     friend Derive;
 
@@ -352,6 +370,9 @@ struct WlrAndRhiTexture {
     qw_texture *wlrTexture = nullptr;
     QRhiTexture *rhiTexture = nullptr;
     WRenderHelper::NativeTextureCleanup nativeCleanup;
+    QRhiTexture::Format rhiFormat = QRhiTexture::UnknownFormat;
+    uint32_t drmFormat = 0;
+    uint64_t drmModifier = 0;
 };
 
 class Q_DECL_HIDDEN RhiTextureManager : public DataManager<RhiTextureManager, WlrAndRhiTexture, QRhiTexture::Format, uint32_t, uint64_t, const QSize&>
@@ -365,36 +386,185 @@ class Q_DECL_HIDDEN RhiTextureManager : public DataManager<RhiTextureManager, Wl
         Q_ASSERT(owner->findChildren<RhiTextureManager*>(Qt::FindDirectChildrenOnly).size() == 1);
     }
 
-    static bool check(WlrAndRhiTexture *texture, QRhiTexture::Format, uint32_t drmFormat, uint64_t drmModifier, const QSize &size) {
-        auto buffer = qw_buffer::from(texture->buffer);
-        wlr_dmabuf_attributes attribs;
-        if (!buffer->get_dmabuf(&attribs)) {
-                qCWarning(lcWlRenderBuffer) << "Failed to get dmabuf attributes for texture" << texture << "with buffer" << buffer
-                       << ", Can't check texture without dmabuf attributes";
+    static bool check(WlrAndRhiTexture *texture, QRhiTexture::Format format, uint32_t drmFormat, uint64_t drmModifier, const QSize &size) {
+        if (!texture || !texture->rhiTexture)
             return false;
+
+        if (texture->buffer) {
+            auto buffer = qw_buffer::from(texture->buffer);
+            wlr_dmabuf_attributes attribs;
+            if (!buffer->get_dmabuf(&attribs)) {
+                qCWarning(lcWlRenderBuffer) << "Failed to get dmabuf attributes for texture" << texture << "with buffer" << buffer
+                                            << ", Can't check texture without dmabuf attributes";
+                return false;
+            }
+            if (attribs.format != drmFormat || attribs.modifier != drmModifier)
+                return false;
         }
-        return attribs.format == drmFormat && attribs.modifier == drmModifier && texture->rhiTexture->pixelSize() == size;
+
+        return texture->rhiFormat == format
+            && texture->drmFormat == drmFormat
+            && texture->drmModifier == drmModifier
+            && texture->rhiTexture->pixelSize() == size;
     }
 
     WlrAndRhiTexture *create(QRhiTexture::Format format, uint32_t drmFormat, uint64_t drmModifier, const QSize &size) {
+        auto rhi = owner()->rhi();
+        if (!rhi) {
+            qCWarning(lcWlRenderBuffer)
+                << "Failed to create render-buffer texture: window has no QRhi"
+                << "size" << size
+                << "format" << format;
+            return nullptr;
+        }
+
+        if (rhi->backend() == QRhi::Vulkan) {
+            std::unique_ptr<QRhiTexture> rhiTexture(rhi->newTexture(format, size, 1, QRhiTexture::RenderTarget));
+            if (!rhiTexture) {
+                qCWarning(lcWlRenderBuffer)
+                    << "Failed to allocate Qt-native Vulkan render-buffer texture object"
+                    << "size" << size
+                    << "format" << format;
+                return nullptr;
+            }
+            rhiTexture->setName(QByteArrayLiteral("WaylibRenderBufferTexture"));
+            if (!rhiTexture->create()) {
+                qCWarning(lcWlRenderBuffer)
+                    << "Failed to create Qt-native Vulkan render-buffer texture"
+                    << "size" << size
+                    << "format" << format
+                    << "drmFormat" << Qt::hex << drmFormat
+                    << "modifier" << drmModifier << Qt::dec;
+                return nullptr;
+            }
+
+            auto result = new WlrAndRhiTexture;
+            result->rhiTexture = rhiTexture.release();
+            result->rhiFormat = format;
+            result->drmFormat = drmFormat;
+            result->drmModifier = drmModifier;
+
+            qCDebug(lcWlRenderBuffer)
+                << "Created Qt-native Vulkan render-buffer texture"
+                << "texture" << result->rhiTexture
+                << "size" << size
+                << "bytes" << dataCost(result)
+                << "format" << format
+                << "drmFormat" << Qt::hex << drmFormat
+                << "modifier" << drmModifier << Qt::dec;
+            return result;
+        }
+
         auto ow = qobject_cast<WOutputRenderWindow*>(owner());
+        if (!ow || !ow->allocator() || !ow->renderer()) {
+            qCWarning(lcWlRenderBuffer)
+                << "Failed to create wlroots render-buffer texture: output window renderer state is incomplete"
+                << "window" << owner()
+                << "size" << size
+                << "format" << format;
+            return nullptr;
+        }
+
         auto texture = WRenderHelper::newTexture(ow->allocator(), ow->renderer(),
-                                                 drmFormat, drmModifier, owner()->rhi(),
+                                                 drmFormat, drmModifier, rhi,
                                                  size, format, QRhiTexture::RenderTarget);
         if (!texture.rhiTexture)
             return nullptr;
 
         return new WlrAndRhiTexture{texture.buffer, texture.texture,
-                                    texture.rhiTexture, texture.nativeCleanup};
+                                    texture.rhiTexture, texture.nativeCleanup,
+                                    format, drmFormat, drmModifier};
     }
 
     static void destroy(WlrAndRhiTexture *texture) {
+        if (!texture)
+            return;
+
+        qCDebug(lcWlRenderBuffer)
+            << "Destroying render-buffer texture"
+            << "texture" << texture->rhiTexture
+            << "buffer" << texture->buffer
+            << "size" << (texture->rhiTexture ? texture->rhiTexture->pixelSize() : QSize())
+            << "bytes" << dataCost(texture)
+            << "format" << texture->rhiFormat
+            << "drmFormat" << Qt::hex << texture->drmFormat
+            << "modifier" << texture->drmModifier << Qt::dec;
         delete texture->rhiTexture;
         WRenderHelper::releaseNativeTexture(&texture->nativeCleanup);
         delete texture->wlrTexture;
         if (texture->buffer)
             qw_buffer::from(texture->buffer)->drop();
         delete texture;
+    }
+
+    static qsizetype dataCost(WlrAndRhiTexture *texture) {
+        if (!texture || !texture->rhiTexture)
+            return 0;
+
+        return textureCost(texture->rhiTexture);
+    }
+
+    bool shouldDestroyData(const Data &data, qsizetype retainedCost, qsizetype dataCost) const {
+        if (data.released > 2)
+            return true;
+
+        const qsizetype budget = cacheBudget();
+        if (data.released > 0 && budget >= 0 && retainedCost + dataCost > budget) {
+            qCDebug(lcWlRenderBuffer)
+                << "Evicting released render-buffer texture over cache budget"
+                << "texture" << (data.data ? data.data->rhiTexture : nullptr)
+                << "released" << data.released
+                << "retainedBytes" << retainedCost
+                << "entryBytes" << dataCost
+                << "budgetBytes" << budget;
+            return true;
+        }
+
+        return false;
+    }
+
+    static qsizetype cacheBudget() {
+        static const qsizetype budget = []() -> qsizetype {
+            const QByteArray value = qgetenv("WAYLIB_RENDER_BUFFER_CACHE_MB").trimmed();
+            if (!value.isEmpty()) {
+                bool ok = false;
+                const qlonglong mib = value.toLongLong(&ok);
+                if (ok && mib >= 0)
+                    return qsizetype(mib) * 1024 * 1024;
+            }
+
+            return qsizetype(256) * 1024 * 1024;
+        }();
+        return budget;
+    }
+
+    static qsizetype textureCost(const QRhiTexture *texture) {
+        if (!texture)
+            return 0;
+
+        const QSize size = texture->pixelSize();
+        if (!size.isValid() || size.isEmpty())
+            return 0;
+
+        return qsizetype(size.width()) * qsizetype(size.height()) * bytesPerPixel(texture->format());
+    }
+
+    static qsizetype bytesPerPixel(QRhiTexture::Format format) {
+        switch (format) {
+        case QRhiTexture::R8:
+        case QRhiTexture::RED_OR_ALPHA8:
+            return 1;
+        case QRhiTexture::RG8:
+        case QRhiTexture::R16:
+        case QRhiTexture::R16F:
+            return 2;
+        case QRhiTexture::RGBA16F:
+            return 8;
+        case QRhiTexture::RGBA32F:
+            return 16;
+        default:
+            return 4;
+        }
     }
 };
 

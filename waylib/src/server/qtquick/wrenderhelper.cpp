@@ -2631,7 +2631,8 @@ void WRenderHelper::releaseNativeTexture(NativeTextureCleanup *cleanup)
         return;
 
 #ifdef ENABLE_VULKAN_RENDER
-    if (cleanup->type == NativeTextureCleanup::Type::VulkanTexture) {
+    if (cleanup->type == NativeTextureCleanup::Type::VulkanTexture
+        || cleanup->type == NativeTextureCleanup::Type::VulkanRenderTarget) {
         releaseNativeTextureNow(cleanup);
         return;
     }
@@ -4177,12 +4178,6 @@ static bool envFlagExplicitlyEnabled(const char *name)
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
-static bool envFlagExplicitlyDisabled(const char *name)
-{
-    const QByteArray value = qgetenv(name).trimmed().toLower();
-    return value == "0" || value == "false" || value == "no" || value == "off";
-}
-
 static bool vulkanNonDmabufDiagnosticsEnabled()
 {
     static const bool enabled = envFlagExplicitlyEnabled("WAYLIB_VK_NON_DMABUF_DIAGNOSTICS")
@@ -4209,6 +4204,30 @@ static bool vulkanNonDmabufPartialUploadEnabled()
     static const bool enabled = envFlagExplicitlyEnabled("WAYLIB_VK_NON_DMABUF_PARTIAL_UPLOAD")
         || envFlagExplicitlyEnabled("TREELAND_VK_NON_DMABUF_PARTIAL_UPLOAD");
     return enabled;
+}
+
+static qsizetype vulkanNonDmabufFullUploadMaxBytes()
+{
+    static const qsizetype maxBytes = [] {
+        const char *names[] = {
+            "WAYLIB_VK_NON_DMABUF_FULL_UPLOAD_MAX_MIB",
+            "TREELAND_VK_NON_DMABUF_FULL_UPLOAD_MAX_MIB",
+        };
+
+        for (const char *name : names) {
+            const QByteArray value = qgetenv(name).trimmed();
+            if (value.isEmpty())
+                continue;
+
+            bool ok = false;
+            const qlonglong mib = value.toLongLong(&ok);
+            if (ok && mib >= 0)
+                return qsizetype(mib) * 1024 * 1024;
+        }
+
+        return qsizetype(2) * 1024 * 1024;
+    }();
+    return maxBytes;
 }
 
 static bool vulkanUnsafeReadbackEnabled()
@@ -4340,7 +4359,8 @@ struct Q_DECL_HIDDEN VulkanBufferUploadRegions {
 
 static VulkanBufferUploadRegions vulkanUploadRegionsFromSurfaceDamage(wlr_surface *surface,
                                                                       const QSize &bufferSize,
-                                                                      bool forceFullBuffer)
+                                                                      bool forceFullBuffer,
+                                                                      qsizetype bufferBytes)
 {
     VulkanBufferUploadRegions result;
     const QRect bufferRect(QPoint(0, 0), bufferSize);
@@ -4360,6 +4380,12 @@ static VulkanBufferUploadRegions vulkanUploadRegionsFromSurfaceDamage(wlr_surfac
 
     if (forceFullBuffer) {
         useFullBuffer("new-or-resized-upload-texture");
+        return result;
+    }
+
+    const qsizetype fullUploadMaxBytes = vulkanNonDmabufFullUploadMaxBytes();
+    if (fullUploadMaxBytes > 0 && bufferBytes > 0 && bufferBytes <= fullUploadMaxBytes) {
+        useFullBuffer("small-non-dmabuf-full-upload");
         return result;
     }
 
@@ -4508,7 +4534,8 @@ static bool updateVulkanTextureFromBufferDataWithRhiUpload(QRhi *rhi,
     }
 
     const VulkanBufferUploadRegions regions =
-        vulkanUploadRegionsFromSurfaceDamage(surface, size, rebuildTexture);
+        vulkanUploadRegionsFromSurfaceDamage(surface, size, rebuildTexture,
+                                             wrapped.sizeInBytes());
     if (regions.rects.isEmpty()) {
         qCDebug(lcWlRenderHelper)
             << "Vulkan RHI non-dmabuf upload skipped because damage is empty after clipping"
@@ -4620,7 +4647,10 @@ static bool updateVulkanTextureFromBufferData(qw_buffer *buffer, qw_texture *han
                                               QRhi *rhi,
                                               QRhiCommandBuffer *commandBuffer)
 {
-    if (!buffer || !buffer->handle() || !handle || !handle->handle() || !texture)
+    if (!buffer || !buffer->handle() || !texture)
+        return false;
+
+    if (handle && !handle->handle())
         return false;
 
     QElapsedTimer elapsed;
@@ -4647,7 +4677,8 @@ static bool updateVulkanTextureFromBufferData(qw_buffer *buffer, qw_texture *han
     const QImage::Format imageFormat = WTools::toImageFormat(drmFormat);
     bool updated = false;
     bool forcedOpaque = false;
-    const bool sourceHasAlpha = handle->has_alpha();
+    const bool sourceHasAlpha = handle ? handle->has_alpha()
+                                       : drmFormatLikelyHasAlpha(drmFormat);
     const bool forceSurfaceOpaque = surfaceOpaqueRegionCoversBuffer(surface, buffer);
     if (!size.isEmpty() && data && stride > 0 && imageFormat != QImage::Format_Invalid) {
         const QImage wrapped(static_cast<const uchar *>(data),
@@ -4892,6 +4923,9 @@ static bool updateVulkanTextureFromNonDmabufBuffer(qw_buffer *buffer, qw_texture
         return true;
     }
 
+    if (!handle || !handle->handle())
+        return false;
+
     if (vulkanNonDmabufForceReadbackEnabled()) {
         qCDebug(lcWlRenderHelper)
             << "Vulkan RHI non-dmabuf client texture buffer-data upload skipped by diagnostics env"
@@ -4905,6 +4939,53 @@ static bool updateVulkanTextureFromNonDmabufBuffer(qw_buffer *buffer, qw_texture
     return updateVulkanTextureFromReadback(buffer, handle, texture, surface);
 }
 #endif
+
+bool WRenderHelper::makeVulkanTextureFromNonDmabufBuffer(QRhi *rhi,
+                                                         qw_buffer *buffer,
+                                                         QSGPlainTexture *texture,
+                                                         wlr_surface *surface,
+                                                         QRhiCommandBuffer *commandBuffer)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!rhi || rhi->backend() != QRhi::Vulkan || !buffer || !buffer->handle()
+        || !texture || bufferExportsDmabuf(buffer)) {
+        return false;
+    }
+
+    if (vulkanNonDmabufForceReadbackEnabled()) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan RHI direct non-dmabuf buffer upload skipped by diagnostics env"
+            << "buffer" << buffer
+            << "surface" << surface
+            << "size" << QSize(buffer->handle()->width, buffer->handle()->height)
+            << "commandBuffer" << commandBuffer
+            << "unsafeReadbackEnabled" << vulkanUnsafeReadbackEnabled();
+        return false;
+    }
+
+    const bool updated = updateVulkanTextureFromBufferData(buffer, nullptr, texture,
+                                                           surface, rhi,
+                                                           commandBuffer);
+    if (updated) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan RHI client texture uploaded directly from non-dmabuf buffer"
+            << "buffer" << buffer
+            << "surface" << surface
+            << "size" << QSize(buffer->handle()->width, buffer->handle()->height)
+            << "alpha" << texture->hasAlphaChannel()
+            << "commandBuffer" << commandBuffer
+            << "bypassedWlrootsTexture" << true;
+    }
+    return updated;
+#else
+    Q_UNUSED(rhi);
+    Q_UNUSED(buffer);
+    Q_UNUSED(texture);
+    Q_UNUSED(surface);
+    Q_UNUSED(commandBuffer);
+    return false;
+#endif
+}
 
 static void updateImage(QRhi *, qw_texture *handle, QSGPlainTexture *texture) {
     auto image = handle->get_image();

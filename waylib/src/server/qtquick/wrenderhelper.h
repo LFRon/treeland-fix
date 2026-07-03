@@ -116,6 +116,11 @@ public:
                                             QSGPlainTexture *texture,
                                             NativeTextureCleanup *nativeCleanup,
                                             wlr_surface *surface = nullptr);
+    static bool makeVulkanTextureFromNonDmabufBuffer(QRhi *rhi,
+                                                     QW_NAMESPACE::qw_buffer *buffer,
+                                                     QSGPlainTexture *texture,
+                                                     wlr_surface *surface,
+                                                     QRhiCommandBuffer *commandBuffer);
 
     // Legacy explicit-sync experiment kept for compatibility with older local
     // tests. The active Qt RHI Vulkan output path uses
