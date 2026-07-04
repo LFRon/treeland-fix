@@ -29,12 +29,17 @@
 #include <qwsubcompositor.h>
 #include <qwtexture.h>
 
+extern "C" {
+#include <wlr/types/wlr_buffer.h>
+}
+
 #include <QByteArray>
 #include <QPointer>
 #include <QQueue>
 #include <QQuickWindow>
 #include <QSGImageNode>
 #include <QSGRenderNode>
+#include <QTimer>
 
 #include <memory>
 #include <vector>
@@ -43,7 +48,7 @@ QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
 
 #ifdef ENABLE_VULKAN_RENDER
-static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer);
+static bool registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer);
 
 static QRhiCommandBuffer *currentFrameCommandBuffer(QSGRenderContext *context)
 {
@@ -226,6 +231,15 @@ private:
     qw_buffer *m_buffer = nullptr;
 };
 
+#ifdef ENABLE_VULKAN_RENDER
+struct Q_DECL_HIDDEN DeferredDirectBufferRelease
+{
+    BufferRef buffer;
+    WRenderHelper::VulkanClientReleaseToken releaseToken;
+    QByteArray releaseReason;
+};
+#endif
+
 class Q_DECL_HIDDEN WSurfaceItemContentPrivate: public QQuickItemPrivate
 {
 public:
@@ -248,9 +262,11 @@ public:
         pendingBufferContentSerial = 0;
         textureRetryBackoffFrames = 0;
         textureRetryDelayFrames = 0;
-        releaseDeferredDirectBuffers();
+        releaseDeferredDirectBuffers(true);
         directBuffer.reset();
+        directBufferExplicitReleaseRegistered = true;
         pendingDirectBuffer.reset();
+        pendingDirectBufferExplicitReleaseRegistered = true;
 #endif
 
         if (frameDoneConnection)
@@ -261,8 +277,9 @@ public:
         if (dontCacheLastBuffer) {
             buffer.reset();
 #ifdef ENABLE_VULKAN_RENDER
-            releaseDeferredDirectBuffers();
+            releaseDeferredDirectBuffers(true);
             directBuffer.reset();
+            directBufferExplicitReleaseRegistered = true;
 #endif
             cleanTextureProvider();
             q->update();
@@ -293,7 +310,6 @@ public:
                     : 0;
 #ifdef ENABLE_VULKAN_RENDER
                 auto newDirectBuffer = surface->committedBuffer();
-                registerSurfaceBufferExplicitRelease(surface.data(), newDirectBuffer);
 #endif
 
                 if (!live) {
@@ -302,6 +318,8 @@ public:
                     pendingBufferContentSerial = newBufferContentSerial;
 #ifdef ENABLE_VULKAN_RENDER
                     pendingDirectBuffer.reset(newDirectBuffer);
+                    pendingDirectBufferExplicitReleaseRegistered =
+                        registerSurfaceBufferExplicitRelease(surface.data(), newDirectBuffer);
 #endif
                 } else {
                     // Live mode: update buffer immediately
@@ -309,6 +327,8 @@ public:
                     bufferContentSerial = newBufferContentSerial;
 #ifdef ENABLE_VULKAN_RENDER
                     directBuffer.reset(newDirectBuffer);
+                    directBufferExplicitReleaseRegistered =
+                        registerSurfaceBufferExplicitRelease(surface.data(), newDirectBuffer);
 #endif
                     q->update();
                 }
@@ -418,27 +438,109 @@ public:
         if (!directBuffer)
             return;
 
+        WRenderHelper::VulkanClientReleaseToken releaseToken;
+        bool tokenQueued = false;
+        if (textureProvider) {
+            wlr_surface *surfaceHandle = surface && surface->handle()
+                ? surface->handle()->handle()
+                : nullptr;
+            tokenQueued =
+                textureProvider->queueActiveVulkanDmabufTextureRelease(surfaceHandle,
+                                                                       &releaseToken);
+        }
+
+        DeferredDirectBufferRelease deferredRelease;
+        deferredRelease.buffer = std::move(directBuffer);
+        directBufferExplicitReleaseRegistered = true;
+        deferredRelease.releaseToken = releaseToken;
+        deferredRelease.releaseReason = tokenQueued
+            ? QByteArrayLiteral("vulkan-token")
+            : QByteArrayLiteral("render-end-fallback");
+
         if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
             qCDebug(lcWlSurface)
-                << "Deferring direct client buffer release until render end"
+                << "Deferring direct client buffer release"
                 << "surface" << surface
-                << "buffer" << directBuffer.get()
-                << "deferredCount" << deferredDirectBufferReleases.size() + 1;
+                << "buffer" << deferredRelease.buffer.get()
+                << "deferredCount" << deferredDirectBufferReleases.size() + 1
+                << "releaseReason" << deferredRelease.releaseReason
+                << "tokenQueued" << tokenQueued
+                << "tokenValid" << releaseToken.isValid();
         }
-        deferredDirectBufferReleases.emplace_back(std::move(directBuffer));
+        deferredDirectBufferReleases.emplace_back(std::move(deferredRelease));
     }
 
-    inline void releaseDeferredDirectBuffers() const {
+    inline void scheduleDeferredDirectBufferReleasePoll() const {
+        if (deferredDirectBufferReleasePollScheduled)
+            return;
+
+        W_QC(WSurfaceItemContent);
+        deferredDirectBufferReleasePollScheduled = true;
+        QTimer::singleShot(2, const_cast<WSurfaceItemContent *>(q), [this] {
+            deferredDirectBufferReleasePollScheduled = false;
+            releaseDeferredDirectBuffers(false);
+        });
+    }
+
+    inline void releaseDeferredDirectBuffers(bool wait = false) const {
         if (deferredDirectBufferReleases.empty())
             return;
 
         if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
             qCDebug(lcWlSurface)
-                << "Releasing deferred direct client buffers after render"
+                << "Checking deferred direct client buffer releases"
                 << "surface" << surface
-                << "count" << deferredDirectBufferReleases.size();
+                << "count" << deferredDirectBufferReleases.size()
+                << "wait" << wait;
         }
-        deferredDirectBufferReleases.clear();
+
+        bool hasPending = false;
+        bool hasRetryablePending = false;
+        for (auto it = deferredDirectBufferReleases.begin();
+             it != deferredDirectBufferReleases.end();) {
+            if (!it->releaseToken.isValid()) {
+                qCDebug(lcWlSurface)
+                    << "Releasing deferred direct client buffer through fallback path"
+                    << "surface" << surface
+                    << "buffer" << it->buffer.get()
+                    << "releaseReason" << it->releaseReason;
+                it = deferredDirectBufferReleases.erase(it);
+                continue;
+            }
+
+            qint64 waitUsec = 0;
+            const bool ready =
+                WRenderHelper::vulkanClientReleaseReady(it->releaseToken, wait, &waitUsec);
+            if (!ready) {
+                hasPending = true;
+                const bool failed =
+                    WRenderHelper::vulkanClientReleaseFailed(it->releaseToken);
+                if (!failed)
+                    hasRetryablePending = true;
+                if (Q_UNLIKELY(lcWlSurface().isDebugEnabled())) {
+                    qCDebug(lcWlSurface)
+                        << "Deferred direct client buffer release is waiting for Vulkan token"
+                        << "surface" << surface
+                        << "buffer" << it->buffer.get()
+                        << "waitedMs" << (waitUsec / 1000.0)
+                        << "releaseReason" << it->releaseReason
+                        << "failed" << failed;
+                }
+                ++it;
+                continue;
+            }
+
+            qCDebug(lcWlSurface)
+                << "Releasing deferred direct client buffer after Vulkan token"
+                << "surface" << surface
+                << "buffer" << it->buffer.get()
+                << "waitedMs" << (waitUsec / 1000.0)
+                << "releaseReason" << it->releaseReason;
+            it = deferredDirectBufferReleases.erase(it);
+        }
+
+        if (hasPending && hasRetryablePending && !wait)
+            scheduleDeferredDirectBufferReleasePoll();
     }
 #endif
 
@@ -449,6 +551,8 @@ public:
             pendingBufferContentSerial = 0;
 #ifdef ENABLE_VULKAN_RENDER
             directBuffer = std::move(pendingDirectBuffer);
+            directBufferExplicitReleaseRegistered = pendingDirectBufferExplicitReleaseRegistered;
+            pendingDirectBufferExplicitReleaseRegistered = true;
             pendingDirectBuffer.reset();
 #endif
             textureDirty = true;
@@ -505,8 +609,11 @@ public:
     QAtomicInteger<bool> rendered = false;
 #ifdef ENABLE_VULKAN_RENDER
     mutable BufferRef directBuffer;
-    mutable std::vector<BufferRef> deferredDirectBufferReleases;
+    mutable bool directBufferExplicitReleaseRegistered = true;
+    mutable std::vector<DeferredDirectBufferRelease> deferredDirectBufferReleases;
+    mutable bool deferredDirectBufferReleasePollScheduled = false;
     BufferRef pendingDirectBuffer;
+    bool pendingDirectBufferExplicitReleaseRegistered = true;
     int textureRetryBackoffFrames = 0;
     int textureRetryDelayFrames = 0;
 #endif
@@ -532,6 +639,9 @@ WSurfaceItemContent::~WSurfaceItemContent()
 
     //`d->window` will become nullptr in ~QQuickItem
     // Don't move this to private class
+#ifdef ENABLE_VULKAN_RENDER
+    d->releaseDeferredDirectBuffers(true);
+#endif
     d->cleanTextureProvider();
 }
 
@@ -789,24 +899,24 @@ public:
 };
 
 #ifdef ENABLE_VULKAN_RENDER
-static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer)
+static bool registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *buffer)
 {
     if (!surface || !surface->handle() || !surface->handle()->handle()
         || !buffer || !buffer->handle()) {
-        return;
+        return true;
     }
 
     auto *syncState =
         qw_linux_drm_syncobj_surface_v1_state::get_surface_state(surface->handle()->handle());
     if (!syncState || !syncState->has_release_timeline())
-        return;
+        return true;
 
     if (buffer->lock_count() == 0) {
         qCWarning(lcWlVulkanCompositor)
             << "Vulkan surface explicit release skipped: buffer has no locks"
             << "surface" << surface
             << "buffer" << buffer;
-        return;
+        return false;
     }
 
     if (!syncState->signal_release_with_buffer(buffer)) {
@@ -815,7 +925,7 @@ static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *b
             << "surface" << surface
             << "buffer" << buffer
             << "releasePoint" << syncState->release_point();
-        return;
+        return false;
     }
 
     qCDebug(lcWlVulkanCompositor)
@@ -823,6 +933,7 @@ static void registerSurfaceBufferExplicitRelease(WSurface *surface, qw_buffer *b
         << "surface" << surface
         << "buffer" << buffer
         << "releasePoint" << syncState->release_point();
+    return true;
 }
 #endif
 

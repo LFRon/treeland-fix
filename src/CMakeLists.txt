@@ -204,6 +204,8 @@ qt_add_qml_module(libtreeland
         utils/propertymonitor.h
         utils/loginddbustypes.h
         utils/loginddbustypes.cpp
+        utils/processenvironment.cpp
+        utils/processenvironment.h
         utils/fpsdisplaymanager.cpp
         utils/fpsdisplaymanager.h
         wallpaper/wallpapersurface.h

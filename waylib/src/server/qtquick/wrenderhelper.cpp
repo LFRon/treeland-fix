@@ -1,4 +1,4 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "wrenderhelper.h"
@@ -19,6 +19,7 @@
 #include <qwallocator.h>
 #include <qwcompositor.h>
 #include <qwlinuxdrmsyncobjv1.h>
+#include <qwdmabuf.h>
 #include <qwrendererinterface.h>
 
 #include <EGL/egl.h>
@@ -31,6 +32,7 @@
 #include <QVulkanInstance>
 #include <QVarLengthArray>
 #include <QVector>
+#include <QSet>
 
 #include <QSGTexture>
 #include <private/qquickrendercontrol_p.h>
@@ -40,6 +42,7 @@
 #include <private/qsgadaptationlayer_p.h>
 #include <private/qsgsoftwarepixmaptexture_p.h>
 #include <private/qsgrhisupport_p.h>
+#include <rhi/qrhi_platform.h>
 
 extern "C" {
 #define static
@@ -52,11 +55,9 @@ extern "C" {
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/render/dmabuf.h>
-#include <linux/dma-buf.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <poll.h>
 #include <errno.h>
 #endif
@@ -117,6 +118,18 @@ static const char *quickRenderTargetTypeName(QQuickRenderTargetPrivate::Type typ
 }
 
 #ifdef ENABLE_VULKAN_RENDER
+struct Q_DECL_HIDDEN VulkanInteropCommandContext;
+struct Q_DECL_HIDDEN VulkanInteropCompletionToken {
+    VulkanInteropCommandContext *context = nullptr;
+    int slotIndex = -1;
+    quint64 serial = 0;
+
+    bool isValid() const
+    {
+        return context && slotIndex >= 0 && serial != 0;
+    }
+};
+
 struct Q_DECL_HIDDEN VulkanImportedRenderTarget {
     VkDevice device = VK_NULL_HANDLE;
     VkImage image = VK_NULL_HANDLE;
@@ -129,6 +142,7 @@ struct Q_DECL_HIDDEN VulkanImportedRenderTarget {
     QSize size;
     uint32_t drmFormat = 0;
     uint64_t drmModifier = DRM_FORMAT_MOD_INVALID;
+    VulkanInteropCompletionToken lastCompletion;
 
     bool isValid() const {
         return device != VK_NULL_HANDLE && image != VK_NULL_HANDLE
@@ -145,14 +159,41 @@ struct Q_DECL_HIDDEN VulkanImportedNativeTexture {
     uint32_t memoryCount = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool ownerIsForeign = true;
     QSize size;
     uint32_t drmFormat = 0;
     uint64_t drmModifier = DRM_FORMAT_MOD_INVALID;
+    VulkanInteropCompletionToken lastCompletion;
 
     bool isValid() const {
         return device != VK_NULL_HANDLE && image != VK_NULL_HANDLE
             && format != VK_FORMAT_UNDEFINED && !size.isEmpty();
     }
+};
+
+struct WRenderHelper::VulkanClientReleaseTokenState {
+    ~VulkanClientReleaseTokenState()
+    {
+        if (syncFileFd >= 0)
+            close(syncFileFd);
+    }
+
+    VulkanInteropCompletionToken completion;
+    int syncFileFd = -1;
+    bool submitted = false;
+    bool failed = false;
+    bool readyNoted = false;
+    bool notReadyLogged = false;
+    QByteArray failureReason;
+    QPointer<qw_buffer> buffer;
+    wlr_surface *surface = nullptr;
+    quint32 contentSerial = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+    uint32_t dstQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+    QByteArray releaseReason;
 };
 #endif
 
@@ -371,6 +412,661 @@ static quint64 vulkanHandleToInteger(Handle handle)
         return quint64(handle);
 }
 
+static bool envFlagEnabledForDiagnostics(const char *name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return !value.isEmpty()
+        && value != "0"
+        && value != "false"
+        && value != "no"
+        && value != "off";
+}
+
+static constexpr const char *s_qtRhiVkAsyncOffscreenEnv = "QT_RHI_VK_ASYNC_OFFSCREEN";
+static constexpr const char *s_qtRhiVkAsyncOffscreenDefaultedEnv = "WAYLIB_QT_RHI_VK_ASYNC_OFFSCREEN_DEFAULTED";
+
+static bool &qtRhiVkAsyncOffscreenDefaulted()
+{
+    static bool defaulted = false;
+    return defaulted;
+}
+
+static void defaultQtRhiVkAsyncOffscreenForVulkan()
+{
+    if (qEnvironmentVariableIsSet(s_qtRhiVkAsyncOffscreenEnv))
+        return;
+
+    qputenv(s_qtRhiVkAsyncOffscreenEnv, "1");
+    qputenv(s_qtRhiVkAsyncOffscreenDefaultedEnv, "1");
+    qtRhiVkAsyncOffscreenDefaulted() = true;
+    qCInfo(lcWlRenderHelper)
+        << "Vulkan wlroots renderer requested: defaulting"
+        << s_qtRhiVkAsyncOffscreenEnv
+        << "to 1 for asynchronous Qt Vulkan offscreen frame completion";
+}
+
+static QByteArray qtRhiVkAsyncOffscreenSourceInternal()
+{
+    const bool envSet = qEnvironmentVariableIsSet(s_qtRhiVkAsyncOffscreenEnv);
+    const bool envEnabled = envSet && envFlagEnabledForDiagnostics(s_qtRhiVkAsyncOffscreenEnv);
+    const bool defaulted = qtRhiVkAsyncOffscreenDefaulted()
+        || envFlagEnabledForDiagnostics(s_qtRhiVkAsyncOffscreenDefaultedEnv);
+
+    if (envSet && !envEnabled)
+        return QByteArrayLiteral("env-off");
+    if (envSet && defaulted)
+        return QByteArrayLiteral("defaulted");
+    if (envSet)
+        return QByteArrayLiteral("user");
+    if (qgetenv("WLR_RENDERER") != "vulkan")
+        return QByteArrayLiteral("non-vulkan");
+    if (defaulted)
+        return QByteArrayLiteral("defaulted");
+    return QByteArrayLiteral("unset");
+}
+
+static bool vulkanPerfDiagnosticsEnabledInternal()
+{
+    static const bool enabled =
+        envFlagEnabledForDiagnostics("WAYLIB_VK_PERF_DIAGNOSTICS")
+        || envFlagEnabledForDiagnostics("TREELAND_VK_PERF_DIAGNOSTICS");
+    return enabled;
+}
+
+static bool vulkanAcquireBatchDisabledInternal()
+{
+    static const bool disabled = envFlagEnabledForDiagnostics("WAYLIB_VK_DISABLE_ACQUIRE_BATCH");
+    return disabled;
+}
+
+static bool vulkanClientReleaseBatchDisabledInternal()
+{
+    static const bool disabled = envFlagEnabledForDiagnostics("WAYLIB_VK_DISABLE_CLIENT_RELEASE_BATCH");
+    return disabled;
+}
+
+static bool vulkanSyncFileMergeDisabledInternal()
+{
+    static const bool disabled = envFlagEnabledForDiagnostics("WAYLIB_VK_DISABLE_SYNC_FILE_MERGE");
+    return disabled;
+}
+
+static bool qtRhiVkAsyncOffscreenEnabledInternal()
+{
+    return envFlagEnabledForDiagnostics(s_qtRhiVkAsyncOffscreenEnv);
+}
+
+struct Q_DECL_HIDDEN VulkanPerfStats {
+    quint64 frames = 0;
+    quint64 clientAcquireExplicit = 0;
+    quint64 clientAcquireImplicit = 0;
+    quint64 clientAcquireNoFence = 0;
+    quint64 clientAcquireGpuWait = 0;
+    quint64 clientAcquireCpuFallback = 0;
+    quint64 clientAcquireFailures = 0;
+    quint64 outputAcquire = 0;
+    quint64 outputRelease = 0;
+    quint64 barriers = 0;
+    quint64 barrierWaitSemaphores = 0;
+    quint64 barrierSignalSyncFiles = 0;
+    quint64 finishPerformed = 0;
+    quint64 finishSkipped = 0;
+    quint64 beginFrameCount = 0;
+    quint64 endFrameCount = 0;
+    quint64 acquireBatchSubmits = 0;
+    quint64 acquireBatchBarriers = 0;
+    quint64 acquireBatchWaitSemaphores = 0;
+    quint64 acquireBatchFailures = 0;
+    quint64 clientReleaseQueued = 0;
+    quint64 clientReleasePiggybacked = 0;
+    quint64 clientReleaseStandaloneSubmits = 0;
+    quint64 clientReleaseBarriers = 0;
+    quint64 clientReleaseFailures = 0;
+    quint64 clientReleasePendingBuffers = 0;
+    quint64 clientReleaseReady = 0;
+    quint64 syncFileDeduped = 0;
+    quint64 syncFileMerged = 0;
+    quint64 syncFileMergeFailures = 0;
+    quint64 acquireBatchWaitBuffers = 0;
+    quint64 cleanupImmediate = 0;
+    quint64 cleanupDeferred = 0;
+    quint64 cleanupPendingRetry = 0;
+    qint64 clientAcquireCpuWaitUsec = 0;
+    qint64 barrierSubmitUsec = 0;
+    qint64 finishUsec = 0;
+    qint64 beginFrameUsec = 0;
+    qint64 endFrameUsec = 0;
+    qint64 acquireBatchSubmitUsec = 0;
+    qint64 clientReleaseSubmitUsec = 0;
+    qint64 clientReleaseWaitUsec = 0;
+    qint64 cleanupWaitUsec = 0;
+};
+
+Q_GLOBAL_STATIC(QMutex, s_vulkanPerfMutex)
+Q_GLOBAL_STATIC(VulkanPerfStats, s_vulkanPerfStats)
+
+static constexpr quint64 s_vulkanPerfSummaryFrames = 120;
+static constexpr qint64 s_slowAcquireUsec = 2000;
+static constexpr qint64 s_slowBarrierSubmitUsec = 1000;
+static constexpr qint64 s_slowFinishUsec = 2000;
+static constexpr qint64 s_slowBeginFrameUsec = 2000;
+static constexpr qint64 s_slowEndFrameUsec = 2000;
+static constexpr qint64 s_slowClientReleaseSubmitUsec = 1000;
+static constexpr qint64 s_slowClientReleaseWaitUsec = 1000;
+static constexpr qint64 s_slowCleanupWaitUsec = 1000;
+
+static qint64 elapsedUsec(const QElapsedTimer &timer)
+{
+    return timer.isValid() ? timer.nsecsElapsed() / 1000 : 0;
+}
+
+static void recordVulkanPerfFrame()
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    QMutexLocker locker(s_vulkanPerfMutex());
+    auto &stats = *s_vulkanPerfStats;
+    ++stats.frames;
+    if (stats.frames % s_vulkanPerfSummaryFrames != 0)
+        return;
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf summary"
+        << "frames" << stats.frames
+        << "clientAcquireExplicit" << stats.clientAcquireExplicit
+        << "clientAcquireImplicit" << stats.clientAcquireImplicit
+        << "clientAcquireNoFence" << stats.clientAcquireNoFence
+        << "clientAcquireGpuWait" << stats.clientAcquireGpuWait
+        << "clientAcquireCpuFallback" << stats.clientAcquireCpuFallback
+        << "clientAcquireFailures" << stats.clientAcquireFailures
+        << "outputAcquire" << stats.outputAcquire
+        << "outputRelease" << stats.outputRelease
+        << "barriers" << stats.barriers
+        << "barrierWaitSemaphores" << stats.barrierWaitSemaphores
+        << "barrierSignalSyncFiles" << stats.barrierSignalSyncFiles
+        << "finishPerformed" << stats.finishPerformed
+        << "finishSkipped" << stats.finishSkipped
+        << "beginFrameCount" << stats.beginFrameCount
+        << "endFrameCount" << stats.endFrameCount
+        << "acquireBatchSubmits" << stats.acquireBatchSubmits
+        << "acquireBatchBarriers" << stats.acquireBatchBarriers
+        << "acquireBatchWaitSemaphores" << stats.acquireBatchWaitSemaphores
+        << "acquireBatchFailures" << stats.acquireBatchFailures
+        << "clientReleaseQueued" << stats.clientReleaseQueued
+        << "clientReleasePiggybacked" << stats.clientReleasePiggybacked
+        << "clientReleaseStandaloneSubmits" << stats.clientReleaseStandaloneSubmits
+        << "clientReleaseBarriers" << stats.clientReleaseBarriers
+        << "clientReleaseFailures" << stats.clientReleaseFailures
+        << "clientReleasePendingBuffers" << stats.clientReleasePendingBuffers
+        << "clientReleaseReady" << stats.clientReleaseReady
+        << "syncFileDeduped" << stats.syncFileDeduped
+        << "syncFileMerged" << stats.syncFileMerged
+        << "syncFileMergeFailures" << stats.syncFileMergeFailures
+        << "acquireBatchWaitBuffers" << stats.acquireBatchWaitBuffers
+        << "cleanupImmediate" << stats.cleanupImmediate
+        << "cleanupDeferred" << stats.cleanupDeferred
+        << "cleanupPendingRetry" << stats.cleanupPendingRetry
+        << "clientAcquireCpuWaitMs" << (stats.clientAcquireCpuWaitUsec / 1000.0)
+        << "barrierSubmitMs" << (stats.barrierSubmitUsec / 1000.0)
+        << "finishMs" << (stats.finishUsec / 1000.0)
+        << "beginFrameMs" << (stats.beginFrameUsec / 1000.0)
+        << "endFrameMs" << (stats.endFrameUsec / 1000.0)
+        << "acquireBatchSubmitMs" << (stats.acquireBatchSubmitUsec / 1000.0)
+        << "clientReleaseSubmitMs" << (stats.clientReleaseSubmitUsec / 1000.0)
+        << "clientReleaseWaitMs" << (stats.clientReleaseWaitUsec / 1000.0)
+        << "cleanupWaitMs" << (stats.cleanupWaitUsec / 1000.0)
+        << "qtAsyncOffscreen" << qtRhiVkAsyncOffscreenEnabledInternal()
+        << "qtAsyncOffscreenSource" << qtRhiVkAsyncOffscreenSourceInternal()
+        << "env" << "WAYLIB_VK_PERF_DIAGNOSTICS=1 QT_RHI_VK_ASYNC_OFFSCREEN="
+                 << (qtRhiVkAsyncOffscreenEnabledInternal() ? "1" : "0");
+}
+
+static void recordVulkanPerfClientAcquire(const char *phase,
+                                          wlr_surface *surface,
+                                          qw_buffer *buffer,
+                                          const wlr_dmabuf_attributes *dmabuf,
+                                          quint32 contentSerial,
+                                          bool explicitAcquire,
+                                          bool implicitAcquire,
+                                          bool gpuWait,
+                                          int syncFileFdCount,
+                                          qint64 cpuWaitUsec,
+                                          bool ok)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        if (explicitAcquire)
+            ++stats.clientAcquireExplicit;
+        else if (implicitAcquire)
+            ++stats.clientAcquireImplicit;
+        else
+            ++stats.clientAcquireNoFence;
+        if (gpuWait)
+            ++stats.clientAcquireGpuWait;
+        if (cpuWaitUsec > 0) {
+            ++stats.clientAcquireCpuFallback;
+            stats.clientAcquireCpuWaitUsec += cpuWaitUsec;
+        }
+        if (!ok)
+            ++stats.clientAcquireFailures;
+    }
+
+    if (!ok || cpuWaitUsec >= s_slowAcquireUsec || syncFileFdCount > 0) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf client acquire"
+            << "phase" << phase
+            << "surface" << surface
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial
+            << "size" << (dmabuf ? QSize(dmabuf->width, dmabuf->height) : QSize())
+            << "format" << (dmabuf ? drmFormatToName(dmabuf->format) : QByteArrayLiteral("<none>"))
+            << "modifier" << (dmabuf ? drmModifierToName(dmabuf->modifier) : QByteArrayLiteral("<none>"))
+            << "planes" << (dmabuf ? dmabuf->n_planes : 0)
+            << "explicitAcquire" << explicitAcquire
+            << "implicitAcquire" << implicitAcquire
+            << "gpuSemaphoreWait" << gpuWait
+            << "cpuFallbackWaitMs" << (cpuWaitUsec / 1000.0)
+            << "syncFileFdCount" << syncFileFdCount
+            << "ok" << ok;
+    }
+}
+
+static void recordVulkanPerfBarrier(const char *subject,
+                                    const char *phase,
+                                    VkImage image,
+                                    VkImageLayout oldLayout,
+                                    VkImageLayout newLayout,
+                                    uint32_t srcQueueFamily,
+                                    uint32_t dstQueueFamily,
+                                    int waitSemaphoreCount,
+                                    bool signalSyncFile,
+                                    bool slotReused,
+                                    qint64 slotWaitUsec,
+                                    qint64 submitUsec,
+                                    bool ok,
+                                    const char *failureReason = nullptr)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.barriers;
+        stats.barrierWaitSemaphores += quint64(qMax(waitSemaphoreCount, 0));
+        if (signalSyncFile)
+            ++stats.barrierSignalSyncFiles;
+        stats.barrierSubmitUsec += submitUsec;
+        if (QByteArray(phase).contains("output acquire"))
+            ++stats.outputAcquire;
+        if (QByteArray(phase).contains("output release"))
+            ++stats.outputRelease;
+    }
+
+    if (!ok || submitUsec >= s_slowBarrierSubmitUsec || slotWaitUsec >= s_slowBarrierSubmitUsec
+        || waitSemaphoreCount > 0 || signalSyncFile) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf barrier"
+            << "subject" << subject
+            << "phase" << phase
+            << "image" << Qt::hex << vulkanHandleToInteger(image) << Qt::dec
+            << "oldLayout" << vkImageLayoutName(oldLayout)
+            << "newLayout" << vkImageLayoutName(newLayout)
+            << "srcQueue" << srcQueueFamily
+            << "dstQueue" << dstQueueFamily
+            << "waitSemaphoreCount" << waitSemaphoreCount
+            << "signalSyncFile" << signalSyncFile
+            << "slotReused" << slotReused
+            << "slotWaitMs" << (slotWaitUsec / 1000.0)
+            << "submitMs" << (submitUsec / 1000.0)
+            << "ok" << ok
+            << "failureReason" << (failureReason ? failureReason : "none");
+    }
+}
+
+static void recordVulkanPerfRenderControlBeginFrame(qint64 elapsedUsec)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.beginFrameCount;
+        stats.beginFrameUsec += elapsedUsec;
+    }
+
+    if (elapsedUsec >= s_slowBeginFrameUsec) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf render-control beginFrame"
+            << "durationMs" << (elapsedUsec / 1000.0)
+            << "slowThresholdMs" << (s_slowBeginFrameUsec / 1000.0)
+            << "qtAsyncOffscreen" << qtRhiVkAsyncOffscreenEnabledInternal();
+    }
+}
+
+static void recordVulkanPerfRenderControlEndFrame(qint64 elapsedUsec)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.endFrameCount;
+        stats.endFrameUsec += elapsedUsec;
+    }
+
+    if (elapsedUsec >= s_slowEndFrameUsec) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf render-control endFrame"
+            << "durationMs" << (elapsedUsec / 1000.0)
+            << "slowThresholdMs" << (s_slowEndFrameUsec / 1000.0);
+    }
+}
+
+static void recordVulkanPerfSyncFileDedup(int removedCount,
+                                          const char *subject,
+                                          const char *phase,
+                                          int beforeCount,
+                                          int afterCount)
+{
+    if (removedCount <= 0 || !vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        stats.syncFileDeduped += quint64(removedCount);
+    }
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf sync_file dedup"
+        << "subject" << subject
+        << "phase" << phase
+        << "before" << beforeCount
+        << "after" << afterCount
+        << "deduped" << removedCount;
+}
+
+static void recordVulkanPerfSyncFileMerge(int mergedCount,
+                                          bool failed,
+                                          const char *subject,
+                                          const char *phase,
+                                          int beforeCount,
+                                          int afterCount)
+{
+    if ((mergedCount <= 0 && !failed) || !vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        if (mergedCount > 0)
+            stats.syncFileMerged += quint64(mergedCount);
+        if (failed)
+            ++stats.syncFileMergeFailures;
+    }
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf sync_file merge"
+        << "subject" << subject
+        << "phase" << phase
+        << "before" << beforeCount
+        << "after" << afterCount
+        << "merged" << mergedCount
+        << "failed" << failed;
+}
+
+static void recordVulkanPerfAcquireBatchWaitBuffer(const char *subject,
+                                                   const char *phase,
+                                                   int waitFdCount)
+{
+    Q_UNUSED(subject);
+    Q_UNUSED(phase);
+    if (waitFdCount <= 0 || !vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.acquireBatchWaitBuffers;
+    }
+}
+
+static void recordVulkanPerfAcquireBatch(const char *reason,
+                                         int barrierCount,
+                                         int clientBarrierCount,
+                                         int outputBarrierCount,
+                                         int waitSemaphoreCount,
+                                         qint64 slotWaitUsec,
+                                         qint64 submitUsec,
+                                         bool ok,
+                                         const char *failureReason = nullptr)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        if (barrierCount > 0)
+            ++stats.acquireBatchSubmits;
+        stats.acquireBatchBarriers += quint64(qMax(barrierCount, 0));
+        stats.acquireBatchWaitSemaphores += quint64(qMax(waitSemaphoreCount, 0));
+        stats.acquireBatchSubmitUsec += submitUsec;
+        if (!ok)
+            ++stats.acquireBatchFailures;
+    }
+
+    if (!ok || submitUsec >= s_slowBarrierSubmitUsec || slotWaitUsec >= s_slowBarrierSubmitUsec
+        || waitSemaphoreCount > 0) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf acquire batch"
+            << "reason" << reason
+            << "barrierCount" << barrierCount
+            << "clientBarrierCount" << clientBarrierCount
+            << "outputBarrierCount" << outputBarrierCount
+            << "waitSemaphoreCount" << waitSemaphoreCount
+            << "slotWaitMs" << (slotWaitUsec / 1000.0)
+            << "submitMs" << (submitUsec / 1000.0)
+            << "ok" << ok
+            << "failureReason" << (failureReason ? failureReason : "none");
+    }
+}
+
+static void recordVulkanPerfAcquireBatchQueued(const char *subject,
+                                               const char *phase,
+                                               VkImage image,
+                                               VkImageLayout oldLayout,
+                                               VkImageLayout newLayout,
+                                               uint32_t srcQueueFamily,
+                                               uint32_t dstQueueFamily,
+                                               int waitSemaphoreCount,
+                                               const char *reason)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf acquire batch queued"
+        << "subject" << subject
+        << "phase" << phase
+        << "image" << Qt::hex << vulkanHandleToInteger(image) << Qt::dec
+        << "oldLayout" << vkImageLayoutName(oldLayout)
+        << "newLayout" << vkImageLayoutName(newLayout)
+        << "srcQueue" << srcQueueFamily
+        << "dstQueue" << dstQueueFamily
+        << "waitSemaphoreCount" << waitSemaphoreCount
+        << "reason" << reason;
+}
+
+static void recordVulkanPerfClientReleaseQueued(wlr_surface *surface,
+                                                qw_buffer *buffer,
+                                                quint32 contentSerial,
+                                                VkImage image,
+                                                VkImageLayout oldLayout,
+                                                VkImageLayout newLayout,
+                                                uint32_t srcQueueFamily,
+                                                uint32_t dstQueueFamily,
+                                                const char *releaseReason)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.clientReleaseQueued;
+        ++stats.clientReleasePendingBuffers;
+    }
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf client release"
+        << "surface" << surface
+        << "buffer" << buffer
+        << "contentSerial" << contentSerial
+        << "image" << Qt::hex << vulkanHandleToInteger(image) << Qt::dec
+        << "oldLayout" << vkImageLayoutName(oldLayout)
+        << "newLayout" << vkImageLayoutName(newLayout)
+        << "srcQueue" << srcQueueFamily
+        << "dstQueue" << dstQueueFamily
+        << "tokenReady" << false
+        << "waitedMs" << 0.0
+        << "releaseReason" << (releaseReason ? releaseReason : "queued");
+}
+
+static void recordVulkanPerfClientReleaseCompletion(
+    WRenderHelper::VulkanClientReleaseTokenState *state,
+    bool tokenReady,
+    qint64 waitUsec,
+    const char *releaseReason)
+{
+    if (!state || !vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    bool shouldLog = tokenReady || waitUsec >= s_slowClientReleaseWaitUsec;
+    if (!tokenReady && !state->notReadyLogged) {
+        state->notReadyLogged = true;
+        shouldLog = true;
+    }
+
+    if (tokenReady && !state->readyNoted) {
+        state->readyNoted = true;
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        ++stats.clientReleaseReady;
+        stats.clientReleaseWaitUsec += waitUsec;
+        if (stats.clientReleasePendingBuffers > 0)
+            --stats.clientReleasePendingBuffers;
+    } else if (waitUsec > 0) {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        stats.clientReleaseWaitUsec += waitUsec;
+    }
+
+    if (!shouldLog)
+        return;
+
+    qCDebug(lcWlRenderHelper)
+        << "Vulkan perf client release"
+        << "surface" << state->surface
+        << "buffer" << state->buffer.data()
+        << "contentSerial" << state->contentSerial
+        << "image" << Qt::hex << vulkanHandleToInteger(state->image) << Qt::dec
+        << "oldLayout" << vkImageLayoutName(state->oldLayout)
+        << "newLayout" << vkImageLayoutName(state->newLayout)
+        << "srcQueue" << state->srcQueueFamily
+        << "dstQueue" << state->dstQueueFamily
+        << "tokenReady" << tokenReady
+        << "waitedMs" << (waitUsec / 1000.0)
+        << "releaseReason" << (releaseReason ? releaseReason
+                                               : state->releaseReason.constData());
+}
+
+static void recordVulkanPerfClientReleaseBatch(const char *reason,
+                                               int barrierCount,
+                                               int clientBarrierCount,
+                                               int outputBarrierCount,
+                                               bool signalSyncFile,
+                                               bool standaloneSubmit,
+                                               qint64 slotWaitUsec,
+                                               qint64 submitUsec,
+                                               bool ok,
+                                               const char *failureReason = nullptr)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        stats.clientReleaseBarriers += quint64(qMax(clientBarrierCount, 0));
+        stats.clientReleaseSubmitUsec += submitUsec;
+        if (clientBarrierCount > 0 && outputBarrierCount > 0)
+            stats.clientReleasePiggybacked += quint64(clientBarrierCount);
+        if (standaloneSubmit && barrierCount > 0)
+            ++stats.clientReleaseStandaloneSubmits;
+        if (!ok)
+            ++stats.clientReleaseFailures;
+    }
+
+    if (!ok || submitUsec >= s_slowClientReleaseSubmitUsec
+        || slotWaitUsec >= s_slowClientReleaseSubmitUsec
+        || clientBarrierCount > 0 || signalSyncFile) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf client release batch"
+            << "reason" << reason
+            << "barrierCount" << barrierCount
+            << "clientBarrierCount" << clientBarrierCount
+            << "outputBarrierCount" << outputBarrierCount
+            << "signalSyncFile" << signalSyncFile
+            << "slotWaitMs" << (slotWaitUsec / 1000.0)
+            << "submitMs" << (submitUsec / 1000.0)
+            << "ok" << ok
+            << "failureReason" << (failureReason ? failureReason : "none");
+    }
+}
+
+static void recordVulkanPerfCleanup(const char *kind,
+                                    bool immediate,
+                                    bool deferred,
+                                    bool pendingRetry,
+                                    qint64 waitUsec,
+                                    quint64 image)
+{
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        if (immediate)
+            ++stats.cleanupImmediate;
+        if (deferred)
+            ++stats.cleanupDeferred;
+        if (pendingRetry)
+            ++stats.cleanupPendingRetry;
+        stats.cleanupWaitUsec += waitUsec;
+    }
+
+    if (pendingRetry || waitUsec >= s_slowCleanupWaitUsec) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan perf cleanup"
+            << "kind" << kind
+            << "image" << Qt::hex << image << Qt::dec
+            << "immediate" << immediate
+            << "deferred" << deferred
+            << "pendingRetry" << pendingRetry
+            << "waitMs" << (waitUsec / 1000.0);
+    }
+}
+
 struct Q_DECL_HIDDEN VulkanInteropCommandFunctions {
     PFN_vkCreateCommandPool vkCreateCommandPool = nullptr;
     PFN_vkDestroyCommandPool vkDestroyCommandPool = nullptr;
@@ -388,8 +1084,9 @@ struct Q_DECL_HIDDEN VulkanInteropCommandFunctions {
     PFN_vkCreateSemaphore vkCreateSemaphore = nullptr;
     PFN_vkDestroySemaphore vkDestroySemaphore = nullptr;
     PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR = nullptr;
+    PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR = nullptr;
 
-    bool resolve(VkDevice device, bool needSyncFileExport,
+    bool resolve(VkDevice device, bool needSyncFileExport, bool needSyncFileWait,
                  const char *subject, const char *phase)
     {
         auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddr();
@@ -432,17 +1129,22 @@ struct Q_DECL_HIDDEN VulkanInteropCommandFunctions {
             vkGetDeviceProcAddr(device, "vkDestroySemaphore"));
         vkGetSemaphoreFdKHR = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
             vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
+        vkImportSemaphoreFdKHR = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
+            vkGetDeviceProcAddr(device, "vkImportSemaphoreFdKHR"));
 
         if (!vkCreateCommandPool || !vkDestroyCommandPool || !vkAllocateCommandBuffers
             || !vkBeginCommandBuffer || !vkEndCommandBuffer || !vkResetCommandBuffer
             || !vkCmdPipelineBarrier || !vkQueueSubmit || !vkCreateFence || !vkDestroyFence
             || !vkGetFenceStatus || !vkWaitForFences || !vkResetFences
             || (needSyncFileExport && (!vkCreateSemaphore || !vkDestroySemaphore
-                                       || !vkGetSemaphoreFdKHR))) {
+                                       || !vkGetSemaphoreFdKHR))
+            || (needSyncFileWait && (!vkCreateSemaphore || !vkDestroySemaphore
+                                     || !vkImportSemaphoreFdKHR))) {
             qCWarning(lcWlRenderHelper)
                 << subject << phase
                 << "failed: required Vulkan command/sync functions unavailable"
-                << "exportSyncFile" << needSyncFileExport;
+                << "exportSyncFile" << needSyncFileExport
+                << "waitSyncFile" << needSyncFileWait;
             return false;
         }
 
@@ -454,6 +1156,8 @@ struct Q_DECL_HIDDEN VulkanInteropCommandSlot {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore semaphore = VK_NULL_HANDLE;
+    QVector<VkSemaphore> waitSemaphores;
+    quint64 serial = 0;
     bool busy = false;
 };
 
@@ -470,13 +1174,16 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
         return device == dev && queue == q && queueFamilyIndex == family;
     }
 
+    quint64 submitSerial = 0;
+
     bool init(VkDevice dev, VkQueue q, uint32_t family,
-              bool needSyncFileExport, const char *subject, const char *phase)
+              bool needSyncFileExport, bool needSyncFileWait,
+              const char *subject, const char *phase)
     {
         device = dev;
         queue = q;
         queueFamilyIndex = family;
-        if (!api.resolve(device, needSyncFileExport, subject, phase))
+        if (!api.resolve(device, needSyncFileExport, needSyncFileWait, subject, phase))
             return false;
 
         VkCommandPoolCreateInfo poolInfo = {};
@@ -502,7 +1209,14 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
     {
         if (api.vkCreateSemaphore && api.vkDestroySemaphore && api.vkGetSemaphoreFdKHR)
             return true;
-        return api.resolve(device, true, subject, phase);
+        return api.resolve(device, true, false, subject, phase);
+    }
+
+    bool ensureSyncFileWaitFunctions(const char *subject, const char *phase)
+    {
+        if (api.vkCreateSemaphore && api.vkDestroySemaphore && api.vkImportSemaphoreFdKHR)
+            return true;
+        return api.resolve(device, false, true, subject, phase);
     }
 
     bool slotReady(VulkanInteropCommandSlot *slot, bool wait,
@@ -545,6 +1259,10 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
         for (auto &slot : slots) {
             if (slot.semaphore != VK_NULL_HANDLE && api.vkDestroySemaphore)
                 api.vkDestroySemaphore(device, slot.semaphore, nullptr);
+            for (VkSemaphore sem : std::as_const(slot.waitSemaphores)) {
+                if (sem != VK_NULL_HANDLE && api.vkDestroySemaphore)
+                    api.vkDestroySemaphore(device, sem, nullptr);
+            }
             if (slot.fence != VK_NULL_HANDLE && api.vkDestroyFence)
                 api.vkDestroyFence(device, slot.fence, nullptr);
         }
@@ -559,17 +1277,27 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
         queueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     }
 
-    VulkanInteropCommandSlot *acquireSlot(bool exportSyncFile,
-                                          const char *subject, const char *phase)
+    VulkanInteropCommandSlot *acquireSlot(bool exportSyncFile, bool waitSyncFile,
+                                          const char *subject, const char *phase,
+                                          bool *reusedSlot, qint64 *waitUsec)
     {
+        if (reusedSlot)
+            *reusedSlot = false;
+        if (waitUsec)
+            *waitUsec = 0;
         if (exportSyncFile && !ensureSyncFileExportFunctions(subject, phase))
+            return nullptr;
+        if (waitSyncFile && !ensureSyncFileWaitFunctions(subject, phase))
             return nullptr;
 
         retireCompletedSlots(false);
 
         for (auto &slot : slots) {
-            if (!slot.busy)
+            if (!slot.busy) {
+                if (reusedSlot)
+                    *reusedSlot = slot.commandBuffer != VK_NULL_HANDLE;
                 return ensureSlotObjects(&slot, exportSyncFile, subject, phase) ? &slot : nullptr;
+            }
         }
 
         static constexpr qsizetype maxCachedSlots = 8;
@@ -580,8 +1308,15 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
         }
 
         VulkanInteropCommandSlot *slot = &slots.first();
+        QElapsedTimer timer;
+        if (vulkanPerfDiagnosticsEnabledInternal())
+            timer.start();
         if (!slotReady(slot, true, subject, phase))
             return nullptr;
+        if (waitUsec)
+            *waitUsec = elapsedUsec(timer);
+        if (reusedSlot)
+            *reusedSlot = true;
         return ensureSlotObjects(slot, exportSyncFile, subject, phase) ? slot : nullptr;
     }
 
@@ -662,6 +1397,42 @@ struct Q_DECL_HIDDEN VulkanInteropCommandContext {
 
         return true;
     }
+
+    int slotIndex(const VulkanInteropCommandSlot *slot) const
+    {
+        if (!slot)
+            return -1;
+        for (int i = 0; i < slots.size(); ++i) {
+            if (&slots[i] == slot)
+                return i;
+        }
+        return -1;
+    }
+
+    bool ensureWaitSemaphores(VulkanInteropCommandSlot *slot, int count,
+                              const char *subject, const char *phase)
+    {
+        if (!slot || count <= 0)
+            return true;
+
+        while (slot->waitSemaphores.size() < count) {
+            VkSemaphoreCreateInfo semInfo = {};
+            semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            VkResult res = api.vkCreateSemaphore(device, &semInfo, nullptr, &semaphore);
+            if (res != VK_SUCCESS) {
+                qCWarning(lcWlRenderHelper)
+                    << subject << phase
+                    << "failed: vkCreateSemaphore for sync_file wait"
+                    << vkResultName(res) << int(res);
+                return false;
+            }
+            slot->waitSemaphores.append(semaphore);
+        }
+
+        return true;
+    }
 };
 
 Q_GLOBAL_STATIC(QMutex, s_vulkanInteropCommandMutex)
@@ -671,6 +1442,7 @@ static VulkanInteropCommandContext *vulkanInteropCommandContextFor(VkDevice devi
                                                                    VkQueue queue,
                                                                    uint32_t queueFamilyIndex,
                                                                    bool needSyncFileExport,
+                                                                   bool needSyncFileWait,
                                                                    const char *subject,
                                                                    const char *phase)
 {
@@ -678,12 +1450,15 @@ static VulkanInteropCommandContext *vulkanInteropCommandContextFor(VkDevice devi
         if (context->matches(device, queue, queueFamilyIndex)) {
             if (needSyncFileExport && !context->ensureSyncFileExportFunctions(subject, phase))
                 return nullptr;
+            if (needSyncFileWait && !context->ensureSyncFileWaitFunctions(subject, phase))
+                return nullptr;
             return context;
         }
     }
 
     auto context = std::make_unique<VulkanInteropCommandContext>();
-    if (!context->init(device, queue, queueFamilyIndex, needSyncFileExport, subject, phase))
+    if (!context->init(device, queue, queueFamilyIndex, needSyncFileExport,
+                       needSyncFileWait, subject, phase))
         return nullptr;
 
     auto result = context.release();
@@ -691,15 +1466,26 @@ static VulkanInteropCommandContext *vulkanInteropCommandContextFor(VkDevice devi
     return result;
 }
 
-static void flushPendingVulkanCommandCleanups(bool wait = false)
+[[maybe_unused]] static void flushPendingVulkanCommandCleanups(bool wait = false)
 {
+    if (wait) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan perf cleanup global interop context slot drain requested"
+            << "reason" << "legacy-call-path"
+            << "diagnostics" << vulkanPerfDiagnosticsEnabledInternal();
+    }
     QMutexLocker locker(s_vulkanInteropCommandMutex());
     for (auto *context : std::as_const(*s_vulkanInteropCommandContexts))
         context->retireCompletedSlots(wait);
 }
 
-static void destroyVulkanInteropCommandContexts()
+[[maybe_unused]] static void destroyVulkanInteropCommandContexts()
 {
+    qCWarning(lcWlRenderHelper)
+        << "Vulkan perf cleanup global interop context drain requested"
+        << "reason" << "legacy-call-path"
+        << "diagnostics" << vulkanPerfDiagnosticsEnabledInternal();
+
     QVector<VulkanInteropCommandContext *> contexts;
     {
         QMutexLocker locker(s_vulkanInteropCommandMutex());
@@ -712,16 +1498,51 @@ static void destroyVulkanInteropCommandContexts()
     }
 }
 
-static void destroyVulkanImportedRenderTarget(VulkanImportedRenderTarget *target)
+static bool vulkanInteropCompletionReady(const VulkanInteropCompletionToken &token,
+                                         bool wait,
+                                         const char *kind,
+                                         qint64 *waitUsec = nullptr)
+{
+    if (waitUsec)
+        *waitUsec = 0;
+    if (!token.isValid())
+        return true;
+
+    QMutexLocker locker(s_vulkanInteropCommandMutex());
+    auto *context = token.context;
+    if (!s_vulkanInteropCommandContexts->contains(context))
+        return true;
+    if (token.slotIndex < 0 || token.slotIndex >= context->slots.size())
+        return true;
+
+    auto *slot = &context->slots[token.slotIndex];
+    if (slot->serial != token.serial)
+        return true;
+
+    QElapsedTimer timer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        timer.start();
+    const bool ready = context->slotReady(slot, wait, "Vulkan RHI cleanup", kind);
+    if (waitUsec)
+        *waitUsec = elapsedUsec(timer);
+    return ready;
+}
+
+static bool destroyVulkanImportedRenderTarget(VulkanImportedRenderTarget *target)
 {
     if (!target || target->device == VK_NULL_HANDLE) {
         if (target)
             *target = {};
-        return;
+        return true;
     }
 
-    flushPendingVulkanCommandCleanups(true);
-    destroyVulkanInteropCommandContexts();
+    qint64 waitUsec = 0;
+    if (!vulkanInteropCompletionReady(target->lastCompletion, false,
+                                      "output target destroy", &waitUsec)) {
+        recordVulkanPerfCleanup("output-render-target", false, true, true,
+                                waitUsec, vulkanHandleToInteger(target->image));
+        return false;
+    }
 
     auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddr();
     if (!vkGetDeviceProcAddr) {
@@ -730,7 +1551,7 @@ static void destroyVulkanImportedRenderTarget(VulkanImportedRenderTarget *target
             << "image" << Qt::hex << vulkanHandleToInteger(target->image) << Qt::dec
             << "memoryCount" << target->memoryCount;
         *target = {};
-        return;
+        return true;
     }
 
     auto vkDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(
@@ -761,19 +1582,27 @@ static void destroyVulkanImportedRenderTarget(VulkanImportedRenderTarget *target
         << "format" << drmFormatToName(target->drmFormat)
         << "modifier" << drmModifierToName(target->drmModifier);
 
+    recordVulkanPerfCleanup("output-render-target", true, false, false,
+                            waitUsec, vulkanHandleToInteger(target->image));
     *target = {};
+    return true;
 }
 
-static void destroyVulkanImportedNativeTexture(VulkanImportedNativeTexture *texture)
+static bool destroyVulkanImportedNativeTexture(VulkanImportedNativeTexture *texture)
 {
     if (!texture || texture->device == VK_NULL_HANDLE) {
         if (texture)
             *texture = {};
-        return;
+        return true;
     }
 
-    flushPendingVulkanCommandCleanups(true);
-    destroyVulkanInteropCommandContexts();
+    qint64 waitUsec = 0;
+    if (!vulkanInteropCompletionReady(texture->lastCompletion, false,
+                                      "client texture destroy", &waitUsec)) {
+        recordVulkanPerfCleanup("client-texture", false, true, true,
+                                waitUsec, vulkanHandleToInteger(texture->image));
+        return false;
+    }
 
     auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddr();
     if (!vkGetDeviceProcAddr) {
@@ -782,7 +1611,7 @@ static void destroyVulkanImportedNativeTexture(VulkanImportedNativeTexture *text
             << "image" << Qt::hex << vulkanHandleToInteger(texture->image) << Qt::dec
             << "memoryCount" << texture->memoryCount;
         *texture = {};
-        return;
+        return true;
     }
 
     auto vkDestroyImage = reinterpret_cast<PFN_vkDestroyImage>(
@@ -814,7 +1643,10 @@ static void destroyVulkanImportedNativeTexture(VulkanImportedNativeTexture *text
         << "modifier" << drmModifierToName(texture->drmModifier)
         << "lastLayout" << vkImageLayoutName(texture->layout);
 
+    recordVulkanPerfCleanup("client-texture", true, false, false,
+                            waitUsec, vulkanHandleToInteger(texture->image));
     *texture = {};
+    return true;
 }
 
 static bool waitDmabufImplicitFence(qw_buffer *buffer, uint32_t flags,
@@ -913,12 +1745,557 @@ static bool waitSyncFileFence(int syncFileFd, const char *subject, const char *p
     return true;
 }
 
-static bool waitSurfaceExplicitAcquireFence(wlr_surface *surface,
-                                            const char *subject,
-                                            bool *usedExplicitAcquire)
+static bool syncFileFenceReady(int syncFileFd, bool wait, const char *subject,
+                               const char *phase, qint64 *waitUsec)
+{
+    if (waitUsec)
+        *waitUsec = 0;
+    if (syncFileFd < 0)
+        return true;
+
+    pollfd pfd = {};
+    pfd.fd = syncFileFd;
+    pfd.events = POLLIN;
+
+    QElapsedTimer timer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        timer.start();
+
+    const int timeoutMs = wait ? 1000 : 0;
+    int ret = 0;
+    do {
+        ret = poll(&pfd, 1, timeoutMs);
+    } while (ret < 0 && errno == EINTR);
+
+    if (waitUsec)
+        *waitUsec = elapsedUsec(timer);
+
+    if (ret < 0) {
+        qCWarning(lcWlRenderHelper)
+            << subject << phase
+            << "failed to poll sync_file fence"
+            << "errno" << errno
+            << "wait" << wait;
+        return false;
+    }
+
+    if (ret == 0)
+        return false;
+
+    if (!(pfd.revents & POLLIN)) {
+        qCWarning(lcWlRenderHelper)
+            << subject << phase
+            << "sync_file fence poll returned unexpected events"
+            << "events" << pfd.revents
+            << "wait" << wait;
+        return false;
+    }
+
+    return true;
+}
+
+static void closeSyncFileFds(QVector<int> *syncFileFds)
+{
+    if (!syncFileFds)
+        return;
+
+    for (int &fd : *syncFileFds) {
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+    syncFileFds->clear();
+}
+
+static bool vulkanSyncFileWaitAvailable(QRhi *rhi)
+{
+    if (!rhi || rhi->backend() != QRhi::Vulkan)
+        return false;
+
+    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi->nativeHandles());
+    if (!handles || !handles->dev)
+        return false;
+
+    auto vkGetDeviceProcAddr = resolveVkGetDeviceProcAddr();
+    if (!vkGetDeviceProcAddr)
+        return false;
+
+    return vkGetDeviceProcAddr(handles->dev, "vkCreateSemaphore")
+        && vkGetDeviceProcAddr(handles->dev, "vkDestroySemaphore")
+        && vkGetDeviceProcAddr(handles->dev, "vkImportSemaphoreFdKHR");
+}
+
+enum class VulkanAcquireBatchTarget {
+    ClientTexture,
+    OutputTarget,
+};
+
+struct Q_DECL_HIDDEN VulkanAcquireBatchItem {
+    VkDevice expectedDevice = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    const char *subject = nullptr;
+    const char *phase = nullptr;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+    uint32_t dstQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+    VkAccessFlags srcAccessMask = 0;
+    VkAccessFlags dstAccessMask = 0;
+    VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    QVector<int> waitSyncFileFds;
+    VulkanAcquireBatchTarget target = VulkanAcquireBatchTarget::ClientTexture;
+    VulkanImportedNativeTexture *clientTexture = nullptr;
+    VulkanImportedRenderTarget *outputTarget = nullptr;
+    QRhiTexture *outputRhiTexture = nullptr;
+};
+
+struct Q_DECL_HIDDEN VulkanAcquireBatchState {
+    bool active = false;
+    bool failed = false;
+    QRhi *rhi = nullptr;
+    QByteArray failureReason;
+    QVector<VulkanAcquireBatchItem> items;
+};
+
+struct Q_DECL_HIDDEN VulkanClientReleaseBatchItem {
+    VkDevice expectedDevice = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+    uint32_t dstQueueFamily = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    VkAccessFlags srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkAccessFlags dstAccessMask = 0;
+    VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    VulkanImportedNativeTexture *clientTexture = nullptr;
+    std::shared_ptr<WRenderHelper::VulkanClientReleaseTokenState> tokenState;
+};
+
+struct Q_DECL_HIDDEN VulkanClientReleaseBatchState {
+    bool active = false;
+    bool failed = false;
+    QRhi *rhi = nullptr;
+    QByteArray failureReason;
+    QVector<VulkanClientReleaseBatchItem> items;
+};
+
+Q_GLOBAL_STATIC(QMutex, s_vulkanAcquireBatchMutex)
+Q_GLOBAL_STATIC(VulkanAcquireBatchState, s_vulkanAcquireBatch)
+Q_GLOBAL_STATIC(QMutex, s_vulkanClientReleaseBatchMutex)
+Q_GLOBAL_STATIC(VulkanClientReleaseBatchState, s_vulkanClientReleaseBatch)
+
+static int closeDuplicateSyncFileFds(QVector<int> *syncFileFds,
+                                     const char *subject,
+                                     const char *phase)
+{
+    if (!syncFileFds || syncFileFds->size() <= 1)
+        return 0;
+
+    QSet<int> seen;
+    QVector<int> unique;
+    unique.reserve(syncFileFds->size());
+    const int before = syncFileFds->size();
+    int removed = 0;
+    for (int fd : std::as_const(*syncFileFds)) {
+        if (fd < 0)
+            continue;
+        if (seen.contains(fd)) {
+            close(fd);
+            ++removed;
+            continue;
+        }
+        seen.insert(fd);
+        unique.append(fd);
+    }
+
+    *syncFileFds = unique;
+    recordVulkanPerfSyncFileDedup(removed, subject, phase, before, unique.size());
+    return removed;
+}
+
+static void mergeSyncFileFds(QVector<int> *syncFileFds,
+                             const char *subject,
+                             const char *phase)
+{
+    if (!syncFileFds || syncFileFds->size() <= 1 || vulkanSyncFileMergeDisabledInternal())
+        return;
+
+    const int before = syncFileFds->size();
+    int mergedFd = dup(syncFileFds->constFirst());
+    if (mergedFd < 0) {
+        recordVulkanPerfSyncFileMerge(0, true, subject, phase, before, before);
+        return;
+    }
+
+    for (int i = 1; i < syncFileFds->size(); ++i) {
+        const int nextFd = syncFileFds->at(i);
+        if (nextFd < 0)
+            continue;
+
+        const int newMergedFd =
+            qw_dmabuf_attributes::merge_sync_file(mergedFd, nextFd, "waylib-vk-acquire");
+        if (newMergedFd < 0) {
+            close(mergedFd);
+            recordVulkanPerfSyncFileMerge(0, true, subject, phase, before, before);
+            return;
+        }
+
+        close(mergedFd);
+        mergedFd = newMergedFd;
+    }
+
+    closeSyncFileFds(syncFileFds);
+    syncFileFds->clear();
+    syncFileFds->append(mergedFd);
+    recordVulkanPerfSyncFileMerge(before - 1, false, subject, phase, before, 1);
+}
+
+static bool vulkanAcquireBatchActiveFor(QRhi *rhi)
+{
+    if (vulkanAcquireBatchDisabledInternal() || !rhi || rhi->backend() != QRhi::Vulkan)
+        return false;
+
+    QMutexLocker locker(s_vulkanAcquireBatchMutex());
+    const auto &batch = *s_vulkanAcquireBatch;
+    return batch.active && !batch.failed && batch.rhi == rhi;
+}
+
+static bool queueVulkanAcquireBarrier(QRhi *rhi,
+                                      VulkanAcquireBatchItem item,
+                                      QVector<int> *waitSyncFileFds)
+{
+    if (!vulkanAcquireBatchActiveFor(rhi))
+        return false;
+
+    if (!item.subject || !item.phase || item.expectedDevice == VK_NULL_HANDLE
+        || item.image == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    if (waitSyncFileFds) {
+        closeDuplicateSyncFileFds(waitSyncFileFds, item.subject, item.phase);
+        mergeSyncFileFds(waitSyncFileFds, item.subject, item.phase);
+        item.waitSyncFileFds = std::move(*waitSyncFileFds);
+        waitSyncFileFds->clear();
+    }
+    recordVulkanPerfAcquireBatchWaitBuffer(item.subject,
+                                           item.phase,
+                                           item.waitSyncFileFds.size());
+
+    recordVulkanPerfAcquireBatchQueued(item.subject,
+                                       item.phase,
+                                       item.image,
+                                       item.oldLayout,
+                                       item.newLayout,
+                                       item.srcQueueFamily,
+                                       item.dstQueueFamily,
+                                       item.waitSyncFileFds.size(),
+                                       "queued-for-frame-flush");
+
+    QMutexLocker locker(s_vulkanAcquireBatchMutex());
+    auto &batch = *s_vulkanAcquireBatch;
+    if (!batch.active || batch.failed || batch.rhi != rhi) {
+        closeSyncFileFds(&item.waitSyncFileFds);
+        return false;
+    }
+
+    batch.items.append(std::move(item));
+    return true;
+}
+
+static void markVulkanAcquireBatchFailed(const char *reason)
+{
+    QMutexLocker locker(s_vulkanAcquireBatchMutex());
+    auto &batch = *s_vulkanAcquireBatch;
+    batch.failed = true;
+    batch.failureReason = reason ? QByteArray(reason) : QByteArrayLiteral("unknown");
+}
+
+static bool vulkanClientReleaseBatchActiveFor(QRhi *rhi)
+{
+    if (vulkanClientReleaseBatchDisabledInternal() || !rhi || rhi->backend() != QRhi::Vulkan)
+        return false;
+
+    QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+    const auto &batch = *s_vulkanClientReleaseBatch;
+    return batch.active && !batch.failed && batch.rhi == rhi;
+}
+
+static bool queueVulkanClientReleaseBarrier(QRhi *rhi,
+                                            VulkanClientReleaseBatchItem item)
+{
+    if (!vulkanClientReleaseBatchActiveFor(rhi))
+        return false;
+
+    if (item.expectedDevice == VK_NULL_HANDLE || item.image == VK_NULL_HANDLE
+        || !item.clientTexture || !item.tokenState) {
+        return false;
+    }
+
+    QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+    auto &batch = *s_vulkanClientReleaseBatch;
+    if (!batch.active || batch.failed || batch.rhi != rhi)
+        return false;
+
+    batch.items.append(std::move(item));
+    return true;
+}
+
+static QVector<VulkanClientReleaseBatchItem> takeVulkanClientReleaseBatchItems(QRhi *rhi)
+{
+    QVector<VulkanClientReleaseBatchItem> items;
+    if (vulkanClientReleaseBatchDisabledInternal())
+        return items;
+
+    QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+    auto &batch = *s_vulkanClientReleaseBatch;
+    if (!batch.active || batch.failed || batch.rhi != rhi)
+        return items;
+
+    items = std::move(batch.items);
+    batch.items.clear();
+    return items;
+}
+
+static bool submitVulkanAcquireBatchItems(QRhi *rhi,
+                                          QVector<VulkanAcquireBatchItem> items,
+                                          const char *reason)
+{
+    if (items.isEmpty())
+        return true;
+
+    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi ? rhi->nativeHandles() : nullptr);
+    if (!handles || !handles->dev || !handles->gfxQueue || !handles->inst) {
+        for (auto &item : items)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        recordVulkanPerfAcquireBatch(reason, items.size(), 0, 0, 0,
+                                     0, 0, false, "native-handles-unavailable");
+        markVulkanAcquireBatchFailed("native-handles-unavailable");
+        return false;
+    }
+
+    int clientBarrierCount = 0;
+    int outputBarrierCount = 0;
+    int waitSyncFileCount = 0;
+    for (const auto &item : std::as_const(items)) {
+        if (item.expectedDevice != handles->dev) {
+            for (auto &queued : items)
+                closeSyncFileFds(&queued.waitSyncFileFds);
+            recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                         outputBarrierCount, waitSyncFileCount,
+                                         0, 0, false, "device-mismatch");
+            markVulkanAcquireBatchFailed("device-mismatch");
+            return false;
+        }
+        if (item.target == VulkanAcquireBatchTarget::ClientTexture)
+            ++clientBarrierCount;
+        else
+            ++outputBarrierCount;
+        waitSyncFileCount += item.waitSyncFileFds.size();
+    }
+
+    QMutexLocker commandLocker(s_vulkanInteropCommandMutex());
+    auto *context = vulkanInteropCommandContextFor(handles->dev,
+                                                   handles->gfxQueue,
+                                                   static_cast<uint32_t>(handles->gfxQueueFamilyIdx),
+                                                   false,
+                                                   waitSyncFileCount > 0,
+                                                   "Vulkan RHI acquire batch",
+                                                   reason);
+    if (!context) {
+        for (auto &item : items)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSyncFileCount,
+                                     0, 0, false, "context-unavailable");
+        markVulkanAcquireBatchFailed("context-unavailable");
+        return false;
+    }
+
+    bool reusedSlot = false;
+    qint64 slotWaitUsec = 0;
+    auto *slot = context->acquireSlot(false, waitSyncFileCount > 0,
+                                      "Vulkan RHI acquire batch", reason,
+                                      &reusedSlot, &slotWaitUsec);
+    if (!slot) {
+        for (auto &item : items)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSyncFileCount,
+                                     slotWaitUsec, 0, false, "slot-unavailable");
+        markVulkanAcquireBatchFailed("slot-unavailable");
+        return false;
+    }
+
+    if (!context->ensureWaitSemaphores(slot, waitSyncFileCount,
+                                       "Vulkan RHI acquire batch", reason)) {
+        for (auto &item : items)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSyncFileCount,
+                                     slotWaitUsec, 0, false, "wait-semaphore-create");
+        markVulkanAcquireBatchFailed("wait-semaphore-create");
+        return false;
+    }
+
+    QVector<VkPipelineStageFlags> waitStages;
+    QVector<VkSemaphore> waitSemaphores;
+    waitStages.reserve(waitSyncFileCount);
+    waitSemaphores.reserve(waitSyncFileCount);
+
+    int waitIndex = 0;
+    for (auto &item : items) {
+        for (int i = 0; i < item.waitSyncFileFds.size(); ++i) {
+            const int syncFileFd = item.waitSyncFileFds[i];
+            if (syncFileFd < 0)
+                continue;
+
+            VkImportSemaphoreFdInfoKHR importInfo = {};
+            importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+            importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+            importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            importInfo.semaphore = slot->waitSemaphores[waitIndex];
+            importInfo.fd = syncFileFd;
+
+            VkResult importRes = context->api.vkImportSemaphoreFdKHR(handles->dev, &importInfo);
+            if (importRes != VK_SUCCESS) {
+                qCWarning(lcWlRenderHelper)
+                    << "Vulkan RHI acquire batch" << reason
+                    << "failed: vkImportSemaphoreFdKHR"
+                    << vkResultName(importRes) << int(importRes)
+                    << "fdIndex" << waitIndex
+                    << "itemSubject" << item.subject
+                    << "itemPhase" << item.phase;
+                for (auto &queued : items)
+                    closeSyncFileFds(&queued.waitSyncFileFds);
+                recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                             outputBarrierCount, waitSemaphores.size(),
+                                             slotWaitUsec, 0, false, "semaphore-import");
+                markVulkanAcquireBatchFailed("semaphore-import");
+                return false;
+            }
+
+            item.waitSyncFileFds[i] = -1;
+            waitSemaphores.append(slot->waitSemaphores[waitIndex]);
+            waitStages.append(item.dstStageMask);
+            ++waitIndex;
+        }
+        closeSyncFileFds(&item.waitSyncFileFds);
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    VkResult res = context->api.vkBeginCommandBuffer(slot->commandBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSemaphores.size(),
+                                     slotWaitUsec, 0, false, "begin-command-buffer");
+        markVulkanAcquireBatchFailed("begin-command-buffer");
+        return false;
+    }
+
+    for (const auto &item : std::as_const(items)) {
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcQueueFamilyIndex = item.srcQueueFamily;
+        barrier.dstQueueFamilyIndex = item.dstQueueFamily;
+        barrier.image = item.image;
+        barrier.oldLayout = item.oldLayout;
+        barrier.newLayout = item.newLayout;
+        barrier.srcAccessMask = item.srcAccessMask;
+        barrier.dstAccessMask = item.dstAccessMask;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.levelCount = 1;
+
+        context->api.vkCmdPipelineBarrier(slot->commandBuffer,
+                                          item.srcStageMask,
+                                          item.dstStageMask,
+                                          0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+
+    res = context->api.vkEndCommandBuffer(slot->commandBuffer);
+    if (res != VK_SUCCESS) {
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSemaphores.size(),
+                                     slotWaitUsec, 0, false, "end-command-buffer");
+        markVulkanAcquireBatchFailed("end-command-buffer");
+        return false;
+    }
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &slot->commandBuffer;
+    if (!waitSemaphores.isEmpty()) {
+        submitInfo.waitSemaphoreCount = uint32_t(waitSemaphores.size());
+        submitInfo.pWaitSemaphores = waitSemaphores.constData();
+        submitInfo.pWaitDstStageMask = waitStages.constData();
+    }
+
+    QElapsedTimer submitTimer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        submitTimer.start();
+    res = context->api.vkQueueSubmit(handles->gfxQueue, 1, &submitInfo, slot->fence);
+    const qint64 submitUsec = elapsedUsec(submitTimer);
+    if (res != VK_SUCCESS) {
+        recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                     outputBarrierCount, waitSemaphores.size(),
+                                     slotWaitUsec, submitUsec, false, "queue-submit");
+        markVulkanAcquireBatchFailed("queue-submit");
+        return false;
+    }
+
+    slot->busy = true;
+    slot->serial = ++context->submitSerial;
+
+    VulkanInteropCompletionToken completion;
+    completion.context = context;
+    completion.slotIndex = context->slotIndex(slot);
+    completion.serial = slot->serial;
+
+    for (auto &item : items) {
+        if (item.target == VulkanAcquireBatchTarget::ClientTexture && item.clientTexture) {
+            item.clientTexture->queue = handles->gfxQueue;
+            item.clientTexture->queueFamilyIndex = handles->gfxQueueFamilyIdx;
+            item.clientTexture->layout = item.newLayout;
+            item.clientTexture->ownerIsForeign = false;
+            item.clientTexture->lastCompletion = completion;
+        } else if (item.target == VulkanAcquireBatchTarget::OutputTarget && item.outputTarget) {
+            item.outputTarget->layout = item.newLayout;
+            item.outputTarget->ownerIsForeign = false;
+            item.outputTarget->scanoutReleaseReady = false;
+            item.outputTarget->lastCompletion = completion;
+            if (item.outputRhiTexture)
+                item.outputRhiTexture->setNativeLayout(item.newLayout);
+        }
+    }
+
+    recordVulkanPerfAcquireBatch(reason, items.size(), clientBarrierCount,
+                                 outputBarrierCount, waitSemaphores.size(),
+                                 slotWaitUsec, submitUsec, true);
+    return true;
+}
+
+static bool collectSurfaceExplicitAcquireFence(QRhi *rhi,
+                                               wlr_surface *surface,
+                                               const char *subject,
+                                               bool *usedExplicitAcquire,
+                                               QVector<int> *waitSyncFileFds,
+                                               bool *gpuSemaphoreWait,
+                                               qint64 *cpuWaitUsec)
 {
     if (usedExplicitAcquire)
         *usedExplicitAcquire = false;
+    if (gpuSemaphoreWait)
+        *gpuSemaphoreWait = false;
+    if (cpuWaitUsec)
+        *cpuWaitUsec = 0;
 
     if (!surface)
         return true;
@@ -941,16 +2318,127 @@ static bool waitSurfaceExplicitAcquireFence(wlr_surface *surface,
         return false;
     }
 
-    const bool ok = waitSyncFileFence(syncFileFd, subject, "explicit acquire");
-    close(syncFileFd);
+    if (vulkanSyncFileWaitAvailable(rhi)) {
+        if (waitSyncFileFds)
+            waitSyncFileFds->append(syncFileFd);
+        else
+            close(syncFileFd);
+        if (gpuSemaphoreWait)
+            *gpuSemaphoreWait = true;
 
-    if (ok) {
         qCDebug(lcWlRenderHelper)
-            << subject << "explicit acquire fence signaled"
+            << subject << "explicit acquire sync_file exported for Vulkan semaphore wait"
             << "surface" << surface
-            << "point" << acquirePoint;
+            << "point" << acquirePoint
+            << "fdCount" << (waitSyncFileFds ? waitSyncFileFds->size() : 0);
+        return true;
     }
 
+    QElapsedTimer timer;
+        if (vulkanPerfDiagnosticsEnabledInternal())
+        timer.start();
+    const bool ok = waitSyncFileFence(syncFileFd, subject, "explicit acquire CPU fallback");
+    if (cpuWaitUsec)
+        *cpuWaitUsec = elapsedUsec(timer);
+    close(syncFileFd);
+
+    if (ok && vulkanPerfDiagnosticsEnabledInternal()) {
+        qCWarning(lcWlRenderHelper)
+            << subject << "explicit acquire used CPU fallback wait"
+            << "surface" << surface
+            << "point" << acquirePoint
+            << "waitMs" << ((cpuWaitUsec ? *cpuWaitUsec : 0) / 1000.0)
+            << "reason" << "Vulkan sync_file semaphore import unavailable";
+    }
+    return ok;
+}
+
+static bool exportDmabufSyncFiles(qw_buffer *buffer, uint32_t flags,
+                                  QVector<int> *syncFileFds)
+{
+    if (!buffer || !syncFileFds)
+        return false;
+
+    wlr_dmabuf_attributes dmabuf = {};
+    if (!buffer->get_dmabuf(&dmabuf))
+        return false;
+
+    QVector<int> exported;
+    exported.reserve(dmabuf.n_planes);
+    QSet<int> seenPlaneFds;
+    int dedupedPlanes = 0;
+    for (int i = 0; i < dmabuf.n_planes; ++i) {
+        if (seenPlaneFds.contains(dmabuf.fd[i])) {
+            ++dedupedPlanes;
+            continue;
+        }
+        seenPlaneFds.insert(dmabuf.fd[i]);
+
+        const int fd = qw_dmabuf_attributes::export_sync_file(dmabuf.fd[i], flags);
+        if (fd < 0) {
+            closeSyncFileFds(&exported);
+            return false;
+        }
+        exported.append(fd);
+    }
+
+    recordVulkanPerfSyncFileDedup(dedupedPlanes,
+                                  "dmabuf",
+                                  "export_sync_file",
+                                  dmabuf.n_planes,
+                                  exported.size());
+    *syncFileFds += exported;
+    return true;
+}
+
+static bool collectDmabufImplicitAcquireFence(QRhi *rhi,
+                                              qw_buffer *buffer,
+                                              uint32_t flags,
+                                              const char *subject,
+                                              const char *phase,
+                                              QVector<int> *waitSyncFileFds,
+                                              bool *gpuSemaphoreWait,
+                                              qint64 *cpuWaitUsec)
+{
+    if (gpuSemaphoreWait)
+        *gpuSemaphoreWait = false;
+    if (cpuWaitUsec)
+        *cpuWaitUsec = 0;
+
+    if (vulkanSyncFileWaitAvailable(rhi)
+        && qw_dmabuf_attributes::sync_file_import_export_supported()) {
+        QVector<int> exported;
+        if (exportDmabufSyncFiles(buffer, flags, &exported)) {
+            if (waitSyncFileFds)
+                *waitSyncFileFds += exported;
+            else
+                closeSyncFileFds(&exported);
+            if (gpuSemaphoreWait)
+                *gpuSemaphoreWait = true;
+            return true;
+        }
+
+        qCWarning(lcWlRenderHelper)
+            << subject << phase
+            << "failed to export dmabuf sync_file, falling back to CPU wait"
+            << "buffer" << buffer;
+    }
+
+    QElapsedTimer timer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        timer.start();
+    const bool ok = waitDmabufImplicitFence(buffer, flags, subject, phase);
+    if (cpuWaitUsec)
+        *cpuWaitUsec = elapsedUsec(timer);
+    if (ok && vulkanPerfDiagnosticsEnabledInternal()) {
+        qCWarning(lcWlRenderHelper)
+            << subject << phase
+            << "used CPU fallback wait"
+            << "buffer" << buffer
+            << "waitMs" << ((cpuWaitUsec ? *cpuWaitUsec : 0) / 1000.0)
+            << "syncFileInterop" << qw_dmabuf_attributes::sync_file_import_export_supported()
+            << "vulkanSemaphoreImport" << vulkanSyncFileWaitAvailable(rhi);
+    }
     return ok;
 }
 
@@ -967,12 +2455,18 @@ static bool importSyncFileIntoDmabuf(qw_buffer *buffer, int syncFileFd, const ch
         return false;
     }
 
+    QSet<int> seenPlaneFds;
+    int dedupedPlanes = 0;
     for (int i = 0; i < dmabuf.n_planes; ++i) {
-        struct dma_buf_import_sync_file data = {};
-        data.flags = DMA_BUF_SYNC_WRITE;
-        data.fd = syncFileFd;
+        if (seenPlaneFds.contains(dmabuf.fd[i])) {
+            ++dedupedPlanes;
+            continue;
+        }
+        seenPlaneFds.insert(dmabuf.fd[i]);
 
-        if (ioctl(dmabuf.fd[i], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &data) != 0) {
+        if (!qw_dmabuf_attributes::import_sync_file(dmabuf.fd[i],
+                                                    DMA_BUF_SYNC_WRITE,
+                                                    syncFileFd)) {
             qCWarning(lcWlRenderHelper)
                 << "Vulkan RHI output" << phase
                 << "failed to import sync_file into dmabuf"
@@ -982,6 +2476,11 @@ static bool importSyncFileIntoDmabuf(qw_buffer *buffer, int syncFileFd, const ch
         }
     }
 
+    recordVulkanPerfSyncFileDedup(dedupedPlanes,
+                                  "dmabuf",
+                                  phase,
+                                  dmabuf.n_planes,
+                                  seenPlaneFds.size());
     return true;
 }
 
@@ -999,8 +2498,13 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
                                      VkAccessFlags dstAccessMask,
                                      VkPipelineStageFlags srcStageMask,
                                      VkPipelineStageFlags dstStageMask,
-                                     bool exportSyncFile)
+                                     bool exportSyncFile,
+                                     QVector<int> waitSyncFileFds = {},
+                                     VulkanInteropCompletionToken *completionToken = nullptr)
 {
+    if (completionToken)
+        *completionToken = {};
+
     if (!rhi || expectedDevice == VK_NULL_HANDLE || image == VK_NULL_HANDLE)
         return false;
 
@@ -1009,6 +2513,11 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
         qCWarning(lcWlRenderHelper)
             << subject << phase
             << "failed: QRhi Vulkan native handles unavailable";
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                waitSyncFileFds.size(), exportSyncFile,
+                                false, 0, 0, false, "native-handles-unavailable");
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
@@ -1018,23 +2527,96 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
             << "failed: QRhi device differs from imported Vulkan image"
             << "rhi" << Qt::hex << vulkanHandleToInteger(handles->dev)
             << "expected" << vulkanHandleToInteger(expectedDevice) << Qt::dec;
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                waitSyncFileFds.size(), exportSyncFile,
+                                false, 0, 0, false, "device-mismatch");
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
     const uint32_t queueFamily = static_cast<uint32_t>(handles->gfxQueueFamilyIdx);
     QMutexLocker locker(s_vulkanInteropCommandMutex());
+    closeDuplicateSyncFileFds(&waitSyncFileFds, subject, phase);
+    mergeSyncFileFds(&waitSyncFileFds, subject, phase);
+    const bool waitSyncFile = !waitSyncFileFds.isEmpty();
+    const int requestedWaitSyncFileCount = waitSyncFileFds.size();
     auto *context = vulkanInteropCommandContextFor(handles->dev,
                                                    handles->gfxQueue,
                                                    queueFamily,
                                                    exportSyncFile,
+                                                   waitSyncFile,
                                                    subject,
                                                    phase);
-    if (!context)
+    if (!context) {
+        closeSyncFileFds(&waitSyncFileFds);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                requestedWaitSyncFileCount, exportSyncFile,
+                                false, 0, 0, false, "context-unavailable");
         return false;
+    }
 
-    auto *slot = context->acquireSlot(exportSyncFile, subject, phase);
-    if (!slot)
+    bool reusedSlot = false;
+    qint64 slotWaitUsec = 0;
+    auto *slot = context->acquireSlot(exportSyncFile, waitSyncFile,
+                                      subject, phase, &reusedSlot, &slotWaitUsec);
+    if (!slot) {
+        closeSyncFileFds(&waitSyncFileFds);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                requestedWaitSyncFileCount, exportSyncFile,
+                                reusedSlot, slotWaitUsec, 0, false, "slot-unavailable");
         return false;
+    }
+
+    if (!context->ensureWaitSemaphores(slot, waitSyncFileFds.size(), subject, phase)) {
+        closeSyncFileFds(&waitSyncFileFds);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                requestedWaitSyncFileCount, exportSyncFile,
+                                reusedSlot, slotWaitUsec, 0, false, "wait-semaphore-create");
+        return false;
+    }
+
+    QVarLengthArray<VkPipelineStageFlags, WLR_DMABUF_MAX_PLANES> waitStages;
+    QVarLengthArray<VkSemaphore, WLR_DMABUF_MAX_PLANES> waitSemaphores;
+    waitStages.reserve(waitSyncFileFds.size());
+    waitSemaphores.reserve(waitSyncFileFds.size());
+
+    for (int i = 0; i < waitSyncFileFds.size(); ++i) {
+        const int syncFileFd = waitSyncFileFds[i];
+        if (syncFileFd < 0)
+            continue;
+
+        VkImportSemaphoreFdInfoKHR importInfo = {};
+        importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+        importInfo.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+        importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        importInfo.semaphore = slot->waitSemaphores[i];
+        importInfo.fd = syncFileFd;
+
+        VkResult importRes = context->api.vkImportSemaphoreFdKHR(handles->dev, &importInfo);
+        if (importRes != VK_SUCCESS) {
+            qCWarning(lcWlRenderHelper)
+                << subject << phase
+                << "failed: vkImportSemaphoreFdKHR"
+                << vkResultName(importRes) << int(importRes)
+                << "fdIndex" << i;
+            closeSyncFileFds(&waitSyncFileFds);
+            recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                    srcQueueFamily, dstQueueFamily,
+                                    waitSemaphores.size(), exportSyncFile,
+                                    reusedSlot, slotWaitUsec, 0, false, "semaphore-import");
+            return false;
+        }
+
+        // Vulkan takes ownership of the sync_file fd on successful import.
+        waitSyncFileFds[i] = -1;
+        waitSemaphores.append(slot->waitSemaphores[i]);
+        waitStages.append(dstStageMask);
+    }
+    closeSyncFileFds(&waitSyncFileFds);
 
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1046,6 +2628,10 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
             << subject << phase
             << "failed: vkBeginCommandBuffer"
             << vkResultName(res) << int(res);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                waitSemaphores.size(), exportSyncFile,
+                                reusedSlot, slotWaitUsec, 0, false, "begin-command-buffer");
         return false;
     }
 
@@ -1073,6 +2659,10 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
             << subject << phase
             << "failed: vkEndCommandBuffer"
             << vkResultName(res) << int(res);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                waitSemaphores.size(), exportSyncFile,
+                                reusedSlot, slotWaitUsec, 0, false, "end-command-buffer");
         return false;
     }
 
@@ -1080,21 +2670,45 @@ static bool submitVulkanImageBarrier(QRhi *rhi,
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &slot->commandBuffer;
+    if (!waitSemaphores.isEmpty()) {
+        submitInfo.waitSemaphoreCount = uint32_t(waitSemaphores.size());
+        submitInfo.pWaitSemaphores = waitSemaphores.constData();
+        submitInfo.pWaitDstStageMask = waitStages.constData();
+    }
     if (exportSyncFile) {
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &slot->semaphore;
     }
 
+    QElapsedTimer submitTimer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        submitTimer.start();
     res = context->api.vkQueueSubmit(handles->gfxQueue, 1, &submitInfo, slot->fence);
+    const qint64 submitUsec = elapsedUsec(submitTimer);
     if (res != VK_SUCCESS) {
         qCWarning(lcWlRenderHelper)
             << subject << phase
             << "failed: vkQueueSubmit"
             << vkResultName(res) << int(res);
+        recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                                srcQueueFamily, dstQueueFamily,
+                                waitSemaphores.size(), exportSyncFile,
+                                reusedSlot, slotWaitUsec, submitUsec, false, "queue-submit");
         return false;
     }
 
     slot->busy = true;
+    slot->serial = ++context->submitSerial;
+    if (completionToken) {
+        completionToken->context = context;
+        completionToken->slotIndex = context->slotIndex(slot);
+        completionToken->serial = slot->serial;
+    }
+
+    recordVulkanPerfBarrier(subject, phase, image, oldLayout, newLayout,
+                            srcQueueFamily, dstQueueFamily,
+                            waitSemaphores.size(), exportSyncFile,
+                            reusedSlot, slotWaitUsec, submitUsec, true);
 
     if (!exportSyncFile)
         return true;
@@ -1132,7 +2746,9 @@ static bool submitVulkanOutputTargetBarrier(QRhi *rhi,
                                             VkAccessFlags dstAccessMask,
                                             VkPipelineStageFlags srcStageMask,
                                             VkPipelineStageFlags dstStageMask,
-                                            bool exportSyncFile)
+                                            bool exportSyncFile,
+                                            QVector<int> waitSyncFileFds = {},
+                                            VulkanInteropCompletionToken *completionToken = nullptr)
 {
     if (!rhi || !target || !target->isValid())
         return false;
@@ -1151,7 +2767,9 @@ static bool submitVulkanOutputTargetBarrier(QRhi *rhi,
                                              dstAccessMask,
                                              srcStageMask,
                                              dstStageMask,
-                                             exportSyncFile);
+                                             exportSyncFile,
+                                             std::move(waitSyncFileFds),
+                                             completionToken);
 
     if (ok) {
         qCDebug(lcWlRenderHelper)
@@ -1162,9 +2780,313 @@ static bool submitVulkanOutputTargetBarrier(QRhi *rhi,
             << "newLayout" << vkImageLayoutName(newLayout)
             << "srcQueue" << srcQueueFamily
             << "dstQueue" << dstQueueFamily
-            << "syncFile" << exportSyncFile;
+            << "syncFile" << exportSyncFile
+            << "completionToken" << (completionToken && completionToken->isValid());
     }
 
+    return ok;
+}
+
+static void failVulkanClientReleaseItems(QVector<VulkanClientReleaseBatchItem> *items,
+                                         const char *failureReason)
+{
+    if (!items)
+        return;
+
+    for (auto &item : *items) {
+        if (!item.tokenState)
+            continue;
+        item.tokenState->failed = true;
+        item.tokenState->failureReason = failureReason
+            ? QByteArray(failureReason)
+            : QByteArrayLiteral("unknown");
+    }
+}
+
+static bool submitVulkanReleaseBarrierBatchItems(QRhi *rhi,
+                                                 VulkanImportedRenderTarget *outputTarget,
+                                                 QRhiTexture *outputRhiTexture,
+                                                 qw_buffer *outputBuffer,
+                                                 VkImageLayout outputOldLayout,
+                                                 uint32_t outputSrcQueueFamily,
+                                                 uint32_t outputDstQueueFamily,
+                                                 VkAccessFlags outputSrcAccessMask,
+                                                 VkAccessFlags outputDstAccessMask,
+                                                 VkPipelineStageFlags outputSrcStageMask,
+                                                 VkPipelineStageFlags outputDstStageMask,
+                                                 QVector<VulkanClientReleaseBatchItem> clientItems,
+                                                 const char *reason,
+                                                 VulkanInteropCompletionToken *completionToken = nullptr)
+{
+    if (completionToken)
+        *completionToken = {};
+
+    const bool hasOutput = outputTarget && outputTarget->isValid();
+    const int outputBarrierCount = hasOutput ? 1 : 0;
+    const int clientBarrierCount = clientItems.size();
+    const int barrierCount = outputBarrierCount + clientBarrierCount;
+    const bool exportSyncFile = hasOutput;
+    const bool standaloneSubmit = !hasOutput;
+
+    if (barrierCount == 0)
+        return true;
+
+    if (!rhi) {
+        failVulkanClientReleaseItems(&clientItems, "rhi-unavailable");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, 0, 0, false,
+                                           "rhi-unavailable");
+        return false;
+    }
+
+    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi->nativeHandles());
+    if (!handles || !handles->dev || !handles->gfxQueue || !handles->inst) {
+        failVulkanClientReleaseItems(&clientItems, "native-handles-unavailable");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, 0, 0, false,
+                                           "native-handles-unavailable");
+        return false;
+    }
+
+    if (hasOutput && outputTarget->device != handles->dev) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan RHI release batch failed: output device differs from QRhi device"
+            << "rhi" << Qt::hex << vulkanHandleToInteger(handles->dev)
+            << "output" << vulkanHandleToInteger(outputTarget->device) << Qt::dec;
+        failVulkanClientReleaseItems(&clientItems, "output-device-mismatch");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, 0, 0, false,
+                                           "output-device-mismatch");
+        return false;
+    }
+
+    for (const auto &item : std::as_const(clientItems)) {
+        if (item.expectedDevice != handles->dev) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan RHI release batch failed: client texture device differs from QRhi device"
+                << "rhi" << Qt::hex << vulkanHandleToInteger(handles->dev)
+                << "client" << vulkanHandleToInteger(item.expectedDevice) << Qt::dec;
+            failVulkanClientReleaseItems(&clientItems, "client-device-mismatch");
+            recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                               outputBarrierCount, exportSyncFile,
+                                               standaloneSubmit, 0, 0, false,
+                                               "client-device-mismatch");
+            return false;
+        }
+    }
+
+    QMutexLocker locker(s_vulkanInteropCommandMutex());
+    auto *context = vulkanInteropCommandContextFor(handles->dev,
+                                                   handles->gfxQueue,
+                                                   static_cast<uint32_t>(handles->gfxQueueFamilyIdx),
+                                                   exportSyncFile,
+                                                   false,
+                                                   "Vulkan RHI release batch",
+                                                   reason);
+    if (!context) {
+        failVulkanClientReleaseItems(&clientItems, "context-unavailable");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, 0, 0, false,
+                                           "context-unavailable");
+        return false;
+    }
+
+    bool reusedSlot = false;
+    qint64 slotWaitUsec = 0;
+    auto *slot = context->acquireSlot(exportSyncFile, false,
+                                      "Vulkan RHI release batch", reason,
+                                      &reusedSlot, &slotWaitUsec);
+    Q_UNUSED(reusedSlot);
+    if (!slot) {
+        failVulkanClientReleaseItems(&clientItems, "slot-unavailable");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, 0, false,
+                                           "slot-unavailable");
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    VkResult res = context->api.vkBeginCommandBuffer(slot->commandBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan RHI release batch failed: vkBeginCommandBuffer"
+            << vkResultName(res) << int(res);
+        failVulkanClientReleaseItems(&clientItems, "begin-command-buffer");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, 0, false,
+                                           "begin-command-buffer");
+        return false;
+    }
+
+    if (hasOutput) {
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcQueueFamilyIndex = outputSrcQueueFamily;
+        barrier.dstQueueFamilyIndex = outputDstQueueFamily;
+        barrier.image = outputTarget->image;
+        barrier.oldLayout = outputOldLayout;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcAccessMask = outputSrcAccessMask;
+        barrier.dstAccessMask = outputDstAccessMask;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.levelCount = 1;
+
+        context->api.vkCmdPipelineBarrier(slot->commandBuffer,
+                                          outputSrcStageMask,
+                                          outputDstStageMask,
+                                          0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+
+    for (const auto &item : std::as_const(clientItems)) {
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcQueueFamilyIndex = item.srcQueueFamily;
+        barrier.dstQueueFamilyIndex = item.dstQueueFamily;
+        barrier.image = item.image;
+        barrier.oldLayout = item.oldLayout;
+        barrier.newLayout = item.newLayout;
+        barrier.srcAccessMask = item.srcAccessMask;
+        barrier.dstAccessMask = item.dstAccessMask;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.levelCount = 1;
+
+        context->api.vkCmdPipelineBarrier(slot->commandBuffer,
+                                          item.srcStageMask,
+                                          item.dstStageMask,
+                                          0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+
+    res = context->api.vkEndCommandBuffer(slot->commandBuffer);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan RHI release batch failed: vkEndCommandBuffer"
+            << vkResultName(res) << int(res);
+        failVulkanClientReleaseItems(&clientItems, "end-command-buffer");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, 0, false,
+                                           "end-command-buffer");
+        return false;
+    }
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &slot->commandBuffer;
+    if (exportSyncFile) {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &slot->semaphore;
+    }
+
+    QElapsedTimer submitTimer;
+    if (vulkanPerfDiagnosticsEnabledInternal())
+        submitTimer.start();
+    res = context->api.vkQueueSubmit(handles->gfxQueue, 1, &submitInfo, slot->fence);
+    const qint64 submitUsec = elapsedUsec(submitTimer);
+    if (res != VK_SUCCESS) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan RHI release batch failed: vkQueueSubmit"
+            << vkResultName(res) << int(res);
+        failVulkanClientReleaseItems(&clientItems, "queue-submit");
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, submitUsec,
+                                           false, "queue-submit");
+        return false;
+    }
+
+    slot->busy = true;
+    slot->serial = ++context->submitSerial;
+
+    VulkanInteropCompletionToken completion;
+    completion.context = context;
+    completion.slotIndex = context->slotIndex(slot);
+    completion.serial = slot->serial;
+    if (completionToken)
+        *completionToken = completion;
+
+    for (auto &item : clientItems) {
+        if (item.clientTexture) {
+            item.clientTexture->layout = item.newLayout;
+            item.clientTexture->ownerIsForeign = true;
+            item.clientTexture->lastCompletion = completion;
+        }
+        if (item.tokenState) {
+            item.tokenState->completion = completion;
+            item.tokenState->submitted = true;
+        }
+    }
+
+    recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                       outputBarrierCount, exportSyncFile,
+                                       standaloneSubmit, slotWaitUsec, submitUsec,
+                                       true);
+    if (hasOutput) {
+        recordVulkanPerfBarrier("Vulkan RHI output",
+                                "output release",
+                                outputTarget->image,
+                                outputOldLayout,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                outputSrcQueueFamily,
+                                outputDstQueueFamily,
+                                0,
+                                true,
+                                false,
+                                slotWaitUsec,
+                                submitUsec,
+                                true);
+    }
+
+    if (hasOutput) {
+        outputTarget->layout = VK_IMAGE_LAYOUT_GENERAL;
+        outputTarget->ownerIsForeign = true;
+        outputTarget->scanoutReleaseReady = true;
+        outputTarget->lastCompletion = completion;
+        if (outputRhiTexture)
+            outputRhiTexture->setNativeLayout(VK_IMAGE_LAYOUT_GENERAL);
+    }
+
+    if (!exportSyncFile)
+        return true;
+
+    VkSemaphoreGetFdInfoKHR getFdInfo = {};
+    getFdInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    getFdInfo.semaphore = slot->semaphore;
+    getFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+
+    int syncFileFd = -1;
+    res = context->api.vkGetSemaphoreFdKHR(handles->dev, &getFdInfo, &syncFileFd);
+    if (res != VK_SUCCESS || syncFileFd < 0) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan RHI release batch failed: vkGetSemaphoreFdKHR"
+            << vkResultName(res) << int(res)
+            << "fd" << syncFileFd;
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, submitUsec,
+                                           false, "sync-file-export");
+        return false;
+    }
+
+    const bool ok = importSyncFileIntoDmabuf(outputBuffer, syncFileFd, "output release");
+    close(syncFileFd);
+    if (!ok) {
+        recordVulkanPerfClientReleaseBatch(reason, barrierCount, clientBarrierCount,
+                                           outputBarrierCount, exportSyncFile,
+                                           standaloneSubmit, slotWaitUsec, submitUsec,
+                                           false, "sync-file-import");
+    }
     return ok;
 }
 
@@ -1302,13 +3224,15 @@ static bool releaseNativeTextureNow(WRenderHelper::NativeTextureCleanup *cleanup
     } else if (cleanup->type == WRenderHelper::NativeTextureCleanup::Type::VulkanTexture) {
         auto imported = static_cast<VulkanImportedNativeTexture *>(cleanup->nativeData);
         if (imported) {
-            destroyVulkanImportedNativeTexture(imported);
+            if (!destroyVulkanImportedNativeTexture(imported))
+                return false;
             delete imported;
         }
     } else if (cleanup->type == WRenderHelper::NativeTextureCleanup::Type::VulkanRenderTarget) {
         auto imported = static_cast<VulkanImportedRenderTarget *>(cleanup->nativeData);
         if (imported) {
-            destroyVulkanImportedRenderTarget(imported);
+            if (!destroyVulkanImportedRenderTarget(imported))
+                return false;
             delete imported;
         }
     }
@@ -1329,9 +3253,6 @@ static void queueNativeTextureCleanup(WRenderHelper::NativeTextureCleanup *clean
 
 static void flushPendingNativeTextureCleanups()
 {
-    if (!QOpenGLContext::currentContext())
-        return;
-
     QVector<WRenderHelper::NativeTextureCleanup> pending;
     {
         QMutexLocker locker(s_pendingNativeTextureCleanupMutex());
@@ -1342,6 +3263,11 @@ static void flushPendingNativeTextureCleanups()
 
     QVector<WRenderHelper::NativeTextureCleanup> remaining;
     for (auto &cleanup : pending) {
+        if (cleanup.type == WRenderHelper::NativeTextureCleanup::Type::OpenGLTexture
+            && !QOpenGLContext::currentContext()) {
+            remaining.append(cleanup);
+            continue;
+        }
         if (!releaseNativeTextureNow(&cleanup))
             remaining.append(cleanup);
     }
@@ -2467,7 +4393,8 @@ static bool importDmabufAsVulkanNativeTexture(
 }
 
 static bool acquireVulkanNativeTextureForSampling(QRhi *rhi,
-                                                  VulkanImportedNativeTexture *texture)
+                                                  VulkanImportedNativeTexture *texture,
+                                                  QVector<int> waitSyncFileFds = {})
 {
     if (!rhi || !texture || !texture->isValid())
         return false;
@@ -2493,6 +4420,44 @@ static bool acquireVulkanNativeTextureForSampling(QRhi *rhi,
     texture->queueFamilyIndex = handles->gfxQueueFamilyIdx;
 
     const VkImageLayout oldLayout = texture->layout;
+    const uint32_t srcQueueFamily = texture->ownerIsForeign
+        ? VK_QUEUE_FAMILY_FOREIGN_EXT
+        : VK_QUEUE_FAMILY_IGNORED;
+    const uint32_t dstQueueFamily = texture->ownerIsForeign
+        ? handles->gfxQueueFamilyIdx
+        : VK_QUEUE_FAMILY_IGNORED;
+    VulkanAcquireBatchItem batchItem;
+    batchItem.expectedDevice = device;
+    batchItem.image = texture->image;
+    batchItem.subject = "Vulkan RHI client texture";
+    batchItem.phase = "acquire";
+    batchItem.oldLayout = oldLayout;
+    batchItem.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    batchItem.srcQueueFamily = srcQueueFamily;
+    batchItem.dstQueueFamily = dstQueueFamily;
+    batchItem.srcAccessMask = 0;
+    batchItem.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    batchItem.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    batchItem.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    batchItem.target = VulkanAcquireBatchTarget::ClientTexture;
+    batchItem.clientTexture = texture;
+    if (queueVulkanAcquireBarrier(rhi, std::move(batchItem), &waitSyncFileFds)) {
+        texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        texture->ownerIsForeign = false;
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan RHI client texture acquire queued for Qt sampling"
+            << "image" << Qt::hex << vulkanHandleToInteger(texture->image) << Qt::dec
+            << "oldLayout" << vkImageLayoutName(oldLayout)
+            << "newLayout" << vkImageLayoutName(texture->layout)
+            << "format" << drmFormatToName(texture->drmFormat)
+            << "modifier" << drmModifierToName(texture->drmModifier)
+            << "size" << texture->size
+            << "srcQueue" << srcQueueFamily
+            << "dstQueue" << dstQueueFamily;
+        return true;
+    }
+
+    VulkanInteropCompletionToken completion;
     if (!submitVulkanImageBarrier(rhi,
                                   device,
                                   texture->image,
@@ -2501,17 +4466,21 @@ static bool acquireVulkanNativeTextureForSampling(QRhi *rhi,
                                   "acquire",
                                   oldLayout,
                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                  VK_QUEUE_FAMILY_FOREIGN_EXT,
-                                  handles->gfxQueueFamilyIdx,
+                                  srcQueueFamily,
+                                  dstQueueFamily,
                                   0,
                                   VK_ACCESS_SHADER_READ_BIT,
                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                  false)) {
+                                  false,
+                                  std::move(waitSyncFileFds),
+                                  &completion)) {
         return false;
     }
 
     texture->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    texture->ownerIsForeign = false;
+    texture->lastCompletion = completion;
     qCDebug(lcWlRenderHelper)
         << "Vulkan RHI client texture acquired for Qt sampling"
         << "image" << Qt::hex << vulkanHandleToInteger(texture->image) << Qt::dec
@@ -2520,8 +4489,8 @@ static bool acquireVulkanNativeTextureForSampling(QRhi *rhi,
         << "format" << drmFormatToName(texture->drmFormat)
         << "modifier" << drmModifierToName(texture->drmModifier)
         << "size" << texture->size
-        << "srcQueue" << VK_QUEUE_FAMILY_FOREIGN_EXT
-        << "dstQueue" << handles->gfxQueueFamilyIdx;
+        << "srcQueue" << srcQueueFamily
+        << "dstQueue" << dstQueueFamily;
 
     return true;
 }
@@ -2633,7 +4602,14 @@ void WRenderHelper::releaseNativeTexture(NativeTextureCleanup *cleanup)
 #ifdef ENABLE_VULKAN_RENDER
     if (cleanup->type == NativeTextureCleanup::Type::VulkanTexture
         || cleanup->type == NativeTextureCleanup::Type::VulkanRenderTarget) {
-        releaseNativeTextureNow(cleanup);
+        flushPendingNativeTextureCleanups();
+        if (!releaseNativeTextureNow(cleanup)) {
+            recordVulkanPerfCleanup(cleanup->type == NativeTextureCleanup::Type::VulkanTexture
+                                        ? "client-texture"
+                                        : "output-render-target",
+                                    false, true, true, 0, cleanup->texture);
+            queueNativeTextureCleanup(cleanup);
+        }
         return;
     }
 
@@ -2983,6 +4959,312 @@ QSGRendererInterface::GraphicsApi WRenderHelper::getGraphicsApi()
 
     static auto api = getApi();
     return api;
+}
+
+bool WRenderHelper::vulkanPerfDiagnosticsEnabled()
+{
+#ifdef ENABLE_VULKAN_RENDER
+    return vulkanPerfDiagnosticsEnabledInternal();
+#else
+    return false;
+#endif
+}
+
+void WRenderHelper::noteVulkanRenderControlBeginFrame(qint64 elapsedUsec)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    recordVulkanPerfRenderControlBeginFrame(elapsedUsec);
+#else
+    Q_UNUSED(elapsedUsec);
+#endif
+}
+
+void WRenderHelper::noteVulkanRenderControlEndFrame(qint64 elapsedUsec)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    recordVulkanPerfRenderControlEndFrame(elapsedUsec);
+#else
+    Q_UNUSED(elapsedUsec);
+#endif
+}
+
+void WRenderHelper::beginVulkanAcquireBatch(QRhi *rhi)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanAcquireBatchDisabledInternal() || !rhi || rhi->backend() != QRhi::Vulkan)
+        return;
+
+    QMutexLocker locker(s_vulkanAcquireBatchMutex());
+    auto &batch = *s_vulkanAcquireBatch;
+    if (batch.active) {
+        for (auto &item : batch.items)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        if (!batch.items.isEmpty()) {
+            recordVulkanPerfAcquireBatch("begin-replaced-active-batch",
+                                         batch.items.size(), 0, 0, 0,
+                                         0, 0, false, "nested-begin");
+        }
+    }
+
+    batch = VulkanAcquireBatchState{};
+    batch.active = true;
+    batch.rhi = rhi;
+#else
+    Q_UNUSED(rhi);
+#endif
+}
+
+bool WRenderHelper::flushVulkanAcquireBatch(const char *reason)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanAcquireBatchDisabledInternal())
+        return true;
+
+    QRhi *rhi = nullptr;
+    QVector<VulkanAcquireBatchItem> items;
+    QByteArray failureReason;
+    {
+        QMutexLocker locker(s_vulkanAcquireBatchMutex());
+        auto &batch = *s_vulkanAcquireBatch;
+        if (!batch.active)
+            return true;
+        if (batch.failed) {
+            failureReason = batch.failureReason;
+            qCDebug(lcWlRenderHelper)
+                << "Vulkan perf acquire batch flush skipped"
+                << "reason" << (reason ? reason : "none")
+                << "failureReason" << failureReason;
+            return false;
+        }
+        if (batch.items.isEmpty())
+            return true;
+
+        rhi = batch.rhi;
+        items = std::move(batch.items);
+        batch.items.clear();
+    }
+
+    return submitVulkanAcquireBatchItems(rhi, std::move(items),
+                                         reason ? reason : "unspecified");
+#else
+    Q_UNUSED(reason);
+    return true;
+#endif
+}
+
+void WRenderHelper::endVulkanAcquireBatch(const char *reason)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanAcquireBatchDisabledInternal())
+        return;
+
+    QVector<VulkanAcquireBatchItem> pendingItems;
+    QByteArray failureReason;
+    {
+        QMutexLocker locker(s_vulkanAcquireBatchMutex());
+        auto &batch = *s_vulkanAcquireBatch;
+        if (!batch.active)
+            return;
+
+        pendingItems = std::move(batch.items);
+        failureReason = batch.failureReason;
+        batch = VulkanAcquireBatchState{};
+    }
+
+    if (!pendingItems.isEmpty()) {
+        for (auto &item : pendingItems)
+            closeSyncFileFds(&item.waitSyncFileFds);
+        recordVulkanPerfAcquireBatch(reason ? reason : "end",
+                                     pendingItems.size(), 0, 0, 0,
+                                     0, 0, false, "end-with-pending-acquire");
+    }
+
+    if (!failureReason.isEmpty()) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan acquire batch ended after failure"
+            << "reason" << (reason ? reason : "end")
+            << "failureReason" << failureReason;
+    }
+#else
+    Q_UNUSED(reason);
+#endif
+}
+
+void WRenderHelper::beginVulkanClientReleaseBatch(QRhi *rhi)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanClientReleaseBatchDisabledInternal() || !rhi || rhi->backend() != QRhi::Vulkan)
+        return;
+
+    QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+    auto &batch = *s_vulkanClientReleaseBatch;
+    if (batch.active && !batch.items.isEmpty()) {
+        failVulkanClientReleaseItems(&batch.items, "begin-replaced-active-batch");
+        recordVulkanPerfClientReleaseBatch("begin-replaced-active-batch",
+                                           batch.items.size(), batch.items.size(),
+                                           0, false, true, 0, 0, false,
+                                           "nested-begin");
+    }
+
+    batch = VulkanClientReleaseBatchState{};
+    batch.active = true;
+    batch.rhi = rhi;
+#else
+    Q_UNUSED(rhi);
+#endif
+}
+
+bool WRenderHelper::flushVulkanClientReleaseBatch(const char *reason)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanClientReleaseBatchDisabledInternal())
+        return true;
+
+    QRhi *rhi = nullptr;
+    QVector<VulkanClientReleaseBatchItem> items;
+    QByteArray failureReason;
+    {
+        QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+        auto &batch = *s_vulkanClientReleaseBatch;
+        if (!batch.active)
+            return true;
+        if (batch.failed) {
+            failureReason = batch.failureReason;
+            qCDebug(lcWlRenderHelper)
+                << "Vulkan perf client release batch flush skipped"
+                << "reason" << (reason ? reason : "none")
+                << "failureReason" << failureReason;
+            return false;
+        }
+        if (batch.items.isEmpty())
+            return true;
+
+        rhi = batch.rhi;
+        items = std::move(batch.items);
+        batch.items.clear();
+    }
+
+    return submitVulkanReleaseBarrierBatchItems(rhi,
+                                                nullptr,
+                                                nullptr,
+                                                nullptr,
+                                                VK_IMAGE_LAYOUT_UNDEFINED,
+                                                VK_QUEUE_FAMILY_IGNORED,
+                                                VK_QUEUE_FAMILY_IGNORED,
+                                                0,
+                                                0,
+                                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                std::move(items),
+                                                reason ? reason : "standalone-client-release");
+#else
+    Q_UNUSED(reason);
+    return true;
+#endif
+}
+
+void WRenderHelper::endVulkanClientReleaseBatch(const char *reason)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (vulkanClientReleaseBatchDisabledInternal())
+        return;
+
+    QRhi *rhi = nullptr;
+    QVector<VulkanClientReleaseBatchItem> pendingItems;
+    QByteArray failureReason;
+    {
+        QMutexLocker locker(s_vulkanClientReleaseBatchMutex());
+        auto &batch = *s_vulkanClientReleaseBatch;
+        if (!batch.active)
+            return;
+
+        rhi = batch.rhi;
+        pendingItems = std::move(batch.items);
+        failureReason = batch.failureReason;
+        batch = VulkanClientReleaseBatchState{};
+    }
+
+    if (!pendingItems.isEmpty()
+        && !submitVulkanReleaseBarrierBatchItems(rhi,
+                                                 nullptr,
+                                                 nullptr,
+                                                 nullptr,
+                                                 VK_IMAGE_LAYOUT_UNDEFINED,
+                                                 VK_QUEUE_FAMILY_IGNORED,
+                                                 VK_QUEUE_FAMILY_IGNORED,
+                                                 0,
+                                                 0,
+                                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                 std::move(pendingItems),
+                                                 reason ? reason : "end-with-pending-client-release")) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan client release batch ended with pending barriers"
+            << "reason" << (reason ? reason : "end");
+    }
+
+    if (!failureReason.isEmpty()) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan client release batch ended after failure"
+            << "reason" << (reason ? reason : "end")
+            << "failureReason" << failureReason;
+    }
+#else
+    Q_UNUSED(reason);
+#endif
+}
+
+void WRenderHelper::noteVulkanPerfFrame()
+{
+#ifdef ENABLE_VULKAN_RENDER
+    recordVulkanPerfFrame();
+#endif
+}
+
+void WRenderHelper::noteVulkanFinish(bool performed, const char *reason,
+                                     int sourceIndex, int renderFlags,
+                                     const QByteArray &outputName,
+                                     bool directPrimary, bool outputLayer,
+                                     qint64 elapsedUsec)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!vulkanPerfDiagnosticsEnabledInternal())
+        return;
+
+    {
+        QMutexLocker locker(s_vulkanPerfMutex());
+        auto &stats = *s_vulkanPerfStats;
+        if (performed)
+            ++stats.finishPerformed;
+        else
+            ++stats.finishSkipped;
+        stats.finishUsec += elapsedUsec;
+    }
+
+    if (!performed || elapsedUsec >= s_slowFinishUsec) {
+        qCDebug(lcWlBufferRenderer)
+            << "Vulkan perf QRhi finish policy"
+            << "performed" << performed
+            << "reason" << (reason ? reason : "<none>")
+            << "sourceIndex" << sourceIndex
+            << "renderFlags" << renderFlags
+            << "output" << outputName
+            << "finishMs" << (elapsedUsec / 1000.0)
+            << "directPrimary" << directPrimary
+            << "outputLayer" << outputLayer
+            << "path" << (directPrimary ? "vulkan-direct-primary"
+                         : (outputLayer ? "vulkan-output-layer" : "vulkan-intermediate"));
+    }
+#else
+    Q_UNUSED(performed);
+    Q_UNUSED(reason);
+    Q_UNUSED(sourceIndex);
+    Q_UNUSED(renderFlags);
+    Q_UNUSED(outputName);
+    Q_UNUSED(directPrimary);
+    Q_UNUSED(outputLayer);
+    Q_UNUSED(elapsedUsec);
+#endif
 }
 
 class Q_DECL_HIDDEN GLTextureBuffer : public qw_buffer_interface
@@ -3552,9 +5834,19 @@ bool WRenderHelper::prepareVulkanRenderTargetForQt(QRhi *rhi, QRhiTexture *textu
         return true;
     }
 
+    QVector<int> waitSyncFileFds;
+    bool outputGpuSemaphoreWait = false;
+    qint64 outputCpuWaitUsec = 0;
     if (needsOwnershipAcquire
-        && !waitDmabufImplicitFence(buffer, DMA_BUF_SYNC_WRITE,
-                                    "Vulkan RHI output", "acquire")) {
+        && !collectDmabufImplicitAcquireFence(rhi,
+                                              buffer,
+                                              DMA_BUF_SYNC_WRITE,
+                                              "Vulkan RHI output",
+                                              "output acquire implicit",
+                                              &waitSyncFileFds,
+                                              &outputGpuSemaphoreWait,
+                                              &outputCpuWaitUsec)) {
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
@@ -3588,10 +5880,42 @@ bool WRenderHelper::prepareVulkanRenderTargetForQt(QRhi *rhi, QRhiTexture *textu
             << "modifier" << drmModifierToName(target.drmModifier);
     }
 
+    VulkanInteropCompletionToken completion;
+    VulkanAcquireBatchItem batchItem;
+    batchItem.expectedDevice = target.device;
+    batchItem.image = target.image;
+    batchItem.subject = "Vulkan RHI output";
+    batchItem.phase = "output acquire";
+    batchItem.oldLayout = oldLayout;
+    batchItem.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    batchItem.srcQueueFamily = srcQueue;
+    batchItem.dstQueueFamily = dstQueue;
+    batchItem.srcAccessMask = 0;
+    batchItem.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+        | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    batchItem.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    batchItem.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    batchItem.target = VulkanAcquireBatchTarget::OutputTarget;
+    batchItem.outputTarget = &target;
+    batchItem.outputRhiTexture = texture;
+    if (queueVulkanAcquireBarrier(rhi, std::move(batchItem), &waitSyncFileFds)) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan RHI output acquire queued for Qt rendering"
+            << "image" << Qt::hex << vulkanHandleToInteger(target.image) << Qt::dec
+            << "oldLayout" << vkImageLayoutName(oldLayout)
+            << "newLayout" << vkImageLayoutName(VK_IMAGE_LAYOUT_GENERAL)
+            << "format" << drmFormatToName(target.drmFormat)
+            << "modifier" << drmModifierToName(target.drmModifier)
+            << "size" << target.size
+            << "gpuSemaphoreWait" << outputGpuSemaphoreWait
+            << "cpuFallbackWaitMs" << (outputCpuWaitUsec / 1000.0);
+        return true;
+    }
+
     if (!submitVulkanOutputTargetBarrier(rhi,
                                          &target,
                                          buffer,
-                                         "acquire",
+                                         "output acquire",
                                          oldLayout,
                                          VK_IMAGE_LAYOUT_GENERAL,
                                          srcQueue,
@@ -3601,13 +5925,16 @@ bool WRenderHelper::prepareVulkanRenderTargetForQt(QRhi *rhi, QRhiTexture *textu
                                              | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                         false)) {
+                                         false,
+                                         std::move(waitSyncFileFds),
+                                         &completion)) {
         return false;
     }
 
     target.layout = VK_IMAGE_LAYOUT_GENERAL;
     target.ownerIsForeign = false;
     target.scanoutReleaseReady = false;
+    target.lastCompletion = completion;
     texture->setNativeLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     qCDebug(lcWlRenderHelper)
@@ -3617,7 +5944,9 @@ bool WRenderHelper::prepareVulkanRenderTargetForQt(QRhi *rhi, QRhiTexture *textu
         << "newLayout" << vkImageLayoutName(target.layout)
         << "format" << drmFormatToName(target.drmFormat)
         << "modifier" << drmModifierToName(target.drmModifier)
-        << "size" << target.size;
+        << "size" << target.size
+        << "gpuSemaphoreWait" << outputGpuSemaphoreWait
+        << "cpuFallbackWaitMs" << (outputCpuWaitUsec / 1000.0);
 
     return true;
 #else
@@ -3666,6 +5995,12 @@ bool WRenderHelper::releaseVulkanRenderTargetToScanout(QRhi *rhi, QRhiTexture *t
             << "Vulkan RHI output release skipped: target already owned by foreign queue"
             << "image" << Qt::hex << vulkanHandleToInteger(target.image) << Qt::dec
             << "layout" << vkImageLayoutName(target.layout);
+        if (!flushVulkanClientReleaseBatch("output-release-skipped-target-foreign")) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan client release batch flush failed after output release skip"
+                << "image" << Qt::hex << vulkanHandleToInteger(target.image) << Qt::dec;
+            return false;
+        }
         return target.scanoutReleaseReady;
     }
 
@@ -3696,28 +6031,26 @@ bool WRenderHelper::releaseVulkanRenderTargetToScanout(QRhi *rhi, QRhiTexture *t
             << "modifier" << drmModifierToName(target.drmModifier);
     }
 
-    if (!submitVulkanOutputTargetBarrier(rhi,
-                                         &target,
-                                         buffer,
-                                         "release",
-                                         oldLayout,
-                                         VK_IMAGE_LAYOUT_GENERAL,
-                                         queueFamily,
-                                         VK_QUEUE_FAMILY_FOREIGN_EXT,
-                                         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-                                             | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                                         0,
-                                         VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                         true)) {
+    auto clientReleaseItems = takeVulkanClientReleaseBatchItems(rhi);
+    VulkanInteropCompletionToken completion;
+    if (!submitVulkanReleaseBarrierBatchItems(rhi,
+                                              &target,
+                                              texture,
+                                              buffer,
+                                              oldLayout,
+                                              queueFamily,
+                                              VK_QUEUE_FAMILY_FOREIGN_EXT,
+                                              VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                                  | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                              0,
+                                              VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                              std::move(clientReleaseItems),
+                                              "output-release-piggyback",
+                                              &completion)) {
         target.scanoutReleaseReady = false;
         return false;
     }
-
-    target.layout = VK_IMAGE_LAYOUT_GENERAL;
-    target.ownerIsForeign = true;
-    target.scanoutReleaseReady = true;
-    texture->setNativeLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     qCDebug(lcWlRenderHelper)
         << "Vulkan RHI output released for scanout"
@@ -3726,7 +6059,8 @@ bool WRenderHelper::releaseVulkanRenderTargetToScanout(QRhi *rhi, QRhiTexture *t
         << "newLayout" << vkImageLayoutName(target.layout)
         << "format" << drmFormatToName(target.drmFormat)
         << "modifier" << drmModifierToName(target.drmModifier)
-        << "size" << target.size;
+        << "size" << target.size
+        << "completionToken" << completion.isValid();
 
     return true;
 #else
@@ -3884,7 +6218,22 @@ void WRenderHelper::transitionVkImageToGeneral(QRhi *rhi, QRhiTexture *texture,
         // vkQueueWaitIdle — the validation layer (12.txt) confirmed that
         // vkDestroySemaphore/vkFreeCommandBuffers were called while the
         // semaphore/command buffer was still pending.
+        QElapsedTimer waitIdleTimer;
+        if (vulkanPerfDiagnosticsEnabledInternal()) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan perf GPU/driver sync fallback"
+                << "phase" << "legacy-image-transition"
+                << "reason" << "binary-semaphore-sync-file-export"
+                << "action" << "vkQueueWaitIdle";
+            waitIdleTimer.start();
+        }
         vkQueueWaitIdle(queue);
+        if (waitIdleTimer.isValid()) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan perf GPU/driver sync fallback complete"
+                << "phase" << "legacy-image-transition"
+                << "waitMs" << (waitIdleTimer.nsecsElapsed() / 1000000.0);
+        }
 
         // Export the signalled semaphore as a sync_file fd. After vkQueueWaitIdle
         // the semaphore is signalled and the GPU is idle, so this returns an
@@ -3903,9 +6252,6 @@ void WRenderHelper::transitionVkImageToGeneral(QRhi *rhi, QRhiTexture *texture,
             // implicit sync fence on every plane so KMS scanout waits for the
             // Vulkan render. Mirrors wlroots renderer.c:1014-1026
             // (dmabuf_import_sync_file with DMA_BUF_SYNC_WRITE).
-            // DMA_BUF_IOCTL_IMPORT_SYNC_FILE is a kernel UAPI (linux/dma-buf.h,
-            // available since Linux 5.20).
-            //
             // NOTE: qw_buffer::get_dmabuf() returns a *reference* to the
             // buffer's dmabuf attributes (gbm's buffer_get_dmabuf does a
             // shallow struct copy, no fd dup). wlr_dmabuf_attributes_finish()
@@ -3913,11 +6259,10 @@ void WRenderHelper::transitionVkImageToGeneral(QRhi *rhi, QRhiTexture *texture,
             wlr_dmabuf_attributes dmabuf;
             if (buffer->get_dmabuf(&dmabuf)) {
                 for (int i = 0; i < dmabuf.n_planes; ++i) {
-                    struct dma_buf_import_sync_file data = {};
-                    data.flags = DMA_BUF_SYNC_WRITE;
-                    data.fd = syncFileFd;
-                    if (ioctl(dmabuf.fd[i], DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &data) != 0) {
-                        qCWarning(lcWlRenderHelper) << "Vulkan: DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed on plane" << i
+                    if (!qw_dmabuf_attributes::import_sync_file(dmabuf.fd[i],
+                                                                 DMA_BUF_SYNC_WRITE,
+                                                                 syncFileFd)) {
+                        qCWarning(lcWlRenderHelper) << "Vulkan: dmabuf import_sync_file failed on plane" << i
                                                     << "errno=" << errno << "- KMS implicit sync may not wait";
                         break;
                     }
@@ -4052,11 +6397,14 @@ void WRenderHelper::setupRendererBackend(qw_backend *testBackend)
         QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
     } else if (wlrRenderer == "vulkan") {
 #ifdef ENABLE_VULKAN_RENDER
+        defaultQtRhiVkAsyncOffscreenForVulkan();
         qunsetenv("QSG_RHI_BACKEND");
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
         qCInfo(lcWlRenderHelper)
             << "Vulkan wlroots renderer requested: forcing treeland Qt Quick RHI to Vulkan"
-            << "and clearing QSG_RHI_BACKEND for child processes";
+            << "clearing QSG_RHI_BACKEND for child processes"
+            << "qtAsyncOffscreen" << qtRhiVkAsyncOffscreenEnabledInternal()
+            << "qtAsyncOffscreenSource" << qtRhiVkAsyncOffscreenSourceInternal();
 #else
         qFatal("Vulkan support is not enabled");
 #endif
@@ -5300,7 +7648,8 @@ void WRenderHelper::releaseImportedVulkanTexture(ImportedVulkanTexture *imported
 
 bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
                                                   wlr_surface *surface,
-                                                  ImportedVulkanTexture *importedTexture)
+                                                  ImportedVulkanTexture *importedTexture,
+                                                  quint32 contentSerial)
 {
 #ifdef ENABLE_VULKAN_RENDER
     if (!rhi || !buffer || !importedTexture)
@@ -5332,10 +7681,17 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
         return false;
     }
 
+    QVector<int> waitSyncFileFds;
     bool usedExplicitAcquire = false;
-    if (!waitSurfaceExplicitAcquireFence(surface,
-                                         "Vulkan RHI dmabuf texture",
-                                         &usedExplicitAcquire)) {
+    bool gpuSemaphoreWait = false;
+    qint64 cpuWaitUsec = 0;
+    if (!collectSurfaceExplicitAcquireFence(rhi,
+                                            surface,
+                                            "Vulkan RHI dmabuf texture",
+                                            &usedExplicitAcquire,
+                                            &waitSyncFileFds,
+                                            &gpuSemaphoreWait,
+                                            &cpuWaitUsec)) {
         qCWarning(lcWlRenderHelper)
             << "Vulkan RHI dmabuf texture import rejected: explicit acquire wait failed"
             << buffer
@@ -5343,12 +7699,26 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
             << "format" << drmFormatToName(dmabuf.format)
             << "modifier" << drmModifierToName(dmabuf.modifier)
             << "planes" << dmabuf.n_planes;
+        recordVulkanPerfClientAcquire("client-import", surface, buffer, &dmabuf,
+                                      contentSerial,
+                                      usedExplicitAcquire, false,
+                                      gpuSemaphoreWait, waitSyncFileFds.size(),
+                                      cpuWaitUsec, false);
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
+    bool usedImplicitAcquire = false;
     if (!usedExplicitAcquire
-        && !waitDmabufImplicitFence(buffer, DMA_BUF_SYNC_READ,
-                                    "Vulkan RHI dmabuf texture", "implicit acquire")) {
+        && !collectDmabufImplicitAcquireFence(rhi,
+                                              buffer,
+                                              DMA_BUF_SYNC_READ,
+                                              "Vulkan RHI dmabuf texture",
+                                              "implicit acquire",
+                                              &waitSyncFileFds,
+                                              &gpuSemaphoreWait,
+                                              &cpuWaitUsec)) {
+        usedImplicitAcquire = true;
         qCWarning(lcWlRenderHelper)
             << "Vulkan RHI dmabuf texture import rejected: implicit producer fence wait failed"
             << buffer
@@ -5356,8 +7726,20 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
             << "format" << drmFormatToName(dmabuf.format)
             << "modifier" << drmModifierToName(dmabuf.modifier)
             << "planes" << dmabuf.n_planes;
+        recordVulkanPerfClientAcquire("client-import", surface, buffer, &dmabuf,
+                                      contentSerial,
+                                      usedExplicitAcquire, usedImplicitAcquire,
+                                      gpuSemaphoreWait, waitSyncFileFds.size(),
+                                      cpuWaitUsec, false);
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
+    usedImplicitAcquire = !usedExplicitAcquire;
+    recordVulkanPerfClientAcquire("client-import", surface, buffer, &dmabuf,
+                                  contentSerial,
+                                  usedExplicitAcquire, usedImplicitAcquire,
+                                  gpuSemaphoreWait, waitSyncFileFds.size(),
+                                  cpuWaitUsec, true);
 
     auto imported = std::make_unique<VulkanImportedNativeTexture>();
     if (!importDmabufAsVulkanNativeTexture(handles->inst->vkInstance(),
@@ -5372,10 +7754,12 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
             << "format" << drmFormatToName(dmabuf.format)
             << "modifier" << drmModifierToName(dmabuf.modifier)
             << "planes" << dmabuf.n_planes;
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
-    if (!acquireVulkanNativeTextureForSampling(rhi, imported.get())) {
+    if (!acquireVulkanNativeTextureForSampling(rhi, imported.get(),
+                                               std::move(waitSyncFileFds))) {
         qCWarning(lcWlRenderHelper)
             << "Vulkan RHI dmabuf texture import failed: cannot acquire image for Qt sampling"
             << buffer
@@ -5457,7 +7841,9 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
         << "layout" << vkImageLayoutName(ownedImport->layout)
         << "planes" << dmabuf.n_planes
         << "usedExplicitAcquire" << usedExplicitAcquire
-        << "usedImplicitAcquire" << !usedExplicitAcquire
+        << "usedImplicitAcquire" << usedImplicitAcquire
+        << "gpuSemaphoreWait" << gpuSemaphoreWait
+        << "cpuFallbackWaitMs" << (cpuWaitUsec / 1000.0)
         << "rhiFormat" << textureFormat
         << "alpha" << importedTexture->hasAlpha;
     return true;
@@ -5466,6 +7852,214 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
     Q_UNUSED(buffer);
     Q_UNUSED(surface);
     Q_UNUSED(importedTexture);
+    Q_UNUSED(contentSerial);
+    return false;
+#endif
+}
+
+bool WRenderHelper::queueVulkanClientTextureRelease(QRhi *rhi,
+                                                    const NativeTextureCleanup *nativeCleanup,
+                                                    qw_buffer *buffer,
+                                                    wlr_surface *surface,
+                                                    quint32 contentSerial,
+                                                    VulkanClientReleaseToken *releaseToken)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (releaseToken)
+        *releaseToken = {};
+
+    if (vulkanClientReleaseBatchDisabledInternal()) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan client release skipped: batch disabled by environment"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial;
+        return false;
+    }
+
+    if (!rhi || rhi->backend() != QRhi::Vulkan || !nativeCleanup
+        || nativeCleanup->type != NativeTextureCleanup::Type::VulkanTexture
+        || !nativeCleanup->nativeData || !buffer) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan client release skipped: no active Vulkan native texture"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial;
+        return false;
+    }
+
+    if (!vulkanClientReleaseBatchActiveFor(rhi)) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan client release skipped: no active frame batch"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial;
+        return false;
+    }
+
+    auto *imported = static_cast<VulkanImportedNativeTexture *>(nativeCleanup->nativeData);
+    if (!imported || !imported->isValid()) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan client release skipped: imported texture is invalid"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial;
+        return false;
+    }
+
+    if (imported->ownerIsForeign) {
+        qCDebug(lcWlRenderHelper)
+            << "Vulkan client release skipped: texture already owned by foreign queue"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial
+            << "image" << Qt::hex << vulkanHandleToInteger(imported->image) << Qt::dec
+            << "layout" << vkImageLayoutName(imported->layout);
+        return false;
+    }
+
+    const auto *handles = static_cast<const QRhiVulkanNativeHandles *>(rhi->nativeHandles());
+    if (!handles || !handles->dev || !handles->gfxQueue || !handles->inst
+        || handles->dev != imported->device) {
+        qCWarning(lcWlRenderHelper)
+            << "Vulkan client release rejected: QRhi Vulkan native handles unavailable or device mismatch"
+            << "buffer" << buffer
+            << "contentSerial" << contentSerial
+            << "image" << Qt::hex << vulkanHandleToInteger(imported->image) << Qt::dec;
+        return false;
+    }
+
+    auto tokenState = std::make_shared<VulkanClientReleaseTokenState>();
+    tokenState->buffer = buffer;
+    tokenState->surface = surface;
+    tokenState->contentSerial = contentSerial;
+    tokenState->image = imported->image;
+    tokenState->oldLayout = imported->layout;
+    tokenState->newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    tokenState->srcQueueFamily = static_cast<uint32_t>(handles->gfxQueueFamilyIdx);
+    tokenState->dstQueueFamily = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    tokenState->releaseReason = QByteArrayLiteral("queued-for-output-release-piggyback");
+
+    VulkanClientReleaseBatchItem item;
+    item.expectedDevice = imported->device;
+    item.image = imported->image;
+    item.oldLayout = imported->layout;
+    item.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    item.srcQueueFamily = static_cast<uint32_t>(handles->gfxQueueFamilyIdx);
+    item.dstQueueFamily = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    item.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    item.dstAccessMask = 0;
+    item.srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+    item.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    item.clientTexture = imported;
+    item.tokenState = tokenState;
+
+    if (!queueVulkanClientReleaseBarrier(rhi, std::move(item)))
+        return false;
+
+    if (releaseToken)
+        releaseToken->state = tokenState;
+
+    recordVulkanPerfClientReleaseQueued(surface,
+                                        buffer,
+                                        contentSerial,
+                                        tokenState->image,
+                                        tokenState->oldLayout,
+                                        tokenState->newLayout,
+                                        tokenState->srcQueueFamily,
+                                        tokenState->dstQueueFamily,
+                                        tokenState->releaseReason.constData());
+    return true;
+#else
+    Q_UNUSED(rhi);
+    Q_UNUSED(nativeCleanup);
+    Q_UNUSED(buffer);
+    Q_UNUSED(surface);
+    Q_UNUSED(contentSerial);
+    if (releaseToken)
+        *releaseToken = {};
+    return false;
+#endif
+}
+
+bool WRenderHelper::vulkanClientReleaseReady(const VulkanClientReleaseToken &releaseToken,
+                                             bool wait,
+                                             qint64 *waitUsec)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (waitUsec)
+        *waitUsec = 0;
+    auto state = releaseToken.state;
+    if (!state)
+        return true;
+
+    if (state->failed) {
+        recordVulkanPerfClientReleaseCompletion(state.get(), false, 0,
+                                                state->failureReason.constData());
+        return false;
+    }
+
+    if (!state->submitted) {
+        recordVulkanPerfClientReleaseCompletion(state.get(), false, 0,
+                                                "not-submitted");
+        return false;
+    }
+
+    qint64 localWaitUsec = 0;
+    bool ready = false;
+    const char *readyReason = "fence-not-ready";
+    if (state->syncFileFd >= 0) {
+        ready = syncFileFenceReady(state->syncFileFd, wait,
+                                   "client buffer release",
+                                   "qt-submit-sync-file",
+                                   &localWaitUsec);
+        readyReason = ready ? "sync-file-ready" : "sync-file-not-ready";
+        if (ready) {
+            close(state->syncFileFd);
+            state->syncFileFd = -1;
+        }
+    } else {
+        ready = vulkanInteropCompletionReady(state->completion,
+                                            wait,
+                                            "client buffer release",
+                                            &localWaitUsec);
+        readyReason = ready ? "fence-ready" : "fence-not-ready";
+    }
+    if (waitUsec)
+        *waitUsec = localWaitUsec;
+    recordVulkanPerfClientReleaseCompletion(state.get(), ready, localWaitUsec,
+                                            readyReason);
+    return ready;
+#else
+    Q_UNUSED(releaseToken);
+    Q_UNUSED(wait);
+    if (waitUsec)
+        *waitUsec = 0;
+    return true;
+#endif
+}
+
+bool WRenderHelper::vulkanClientReleaseFailed(const VulkanClientReleaseToken &releaseToken)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    return releaseToken.state && releaseToken.state->failed;
+#else
+    Q_UNUSED(releaseToken);
+    return false;
+#endif
+}
+
+bool WRenderHelper::vulkanClientTextureNeedsAcquire(const NativeTextureCleanup *nativeCleanup)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!nativeCleanup || nativeCleanup->type != NativeTextureCleanup::Type::VulkanTexture
+        || !nativeCleanup->nativeData) {
+        return false;
+    }
+
+    auto *imported = static_cast<VulkanImportedNativeTexture *>(nativeCleanup->nativeData);
+    if (!imported || !imported->isValid())
+        return false;
+
+    return imported->ownerIsForeign
+        || imported->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+#else
+    Q_UNUSED(nativeCleanup);
     return false;
 #endif
 }
@@ -5473,7 +8067,8 @@ bool WRenderHelper::importVulkanTextureFromBuffer(QRhi *rhi, qw_buffer *buffer,
 bool WRenderHelper::acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
                                                            qw_buffer *buffer,
                                                            wlr_surface *surface,
-                                                           NativeTextureCleanup *nativeCleanup)
+                                                           NativeTextureCleanup *nativeCleanup,
+                                                           quint32 contentSerial)
 {
 #ifdef ENABLE_VULKAN_RENDER
     if (!rhi || !buffer || !nativeCleanup
@@ -5486,10 +8081,17 @@ bool WRenderHelper::acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
     if (!buffer->get_dmabuf(&dmabuf))
         return false;
 
+    QVector<int> waitSyncFileFds;
     bool usedExplicitAcquire = false;
-    if (!waitSurfaceExplicitAcquireFence(surface,
-                                         "Vulkan RHI cached dmabuf texture",
-                                         &usedExplicitAcquire)) {
+    bool gpuSemaphoreWait = false;
+    qint64 cpuWaitUsec = 0;
+    if (!collectSurfaceExplicitAcquireFence(rhi,
+                                            surface,
+                                            "Vulkan RHI cached dmabuf texture",
+                                            &usedExplicitAcquire,
+                                            &waitSyncFileFds,
+                                            &gpuSemaphoreWait,
+                                            &cpuWaitUsec)) {
         qCWarning(lcWlRenderHelper)
             << "Vulkan RHI cached dmabuf texture acquire rejected: explicit acquire wait failed"
             << buffer
@@ -5497,12 +8099,26 @@ bool WRenderHelper::acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
             << "format" << drmFormatToName(dmabuf.format)
             << "modifier" << drmModifierToName(dmabuf.modifier)
             << "planes" << dmabuf.n_planes;
+        recordVulkanPerfClientAcquire("client-reacquire", surface, buffer, &dmabuf,
+                                      contentSerial,
+                                      usedExplicitAcquire, false,
+                                      gpuSemaphoreWait, waitSyncFileFds.size(),
+                                      cpuWaitUsec, false);
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
 
+    bool usedImplicitAcquire = false;
     if (!usedExplicitAcquire
-        && !waitDmabufImplicitFence(buffer, DMA_BUF_SYNC_READ,
-                                    "Vulkan RHI cached dmabuf texture", "implicit acquire")) {
+        && !collectDmabufImplicitAcquireFence(rhi,
+                                              buffer,
+                                              DMA_BUF_SYNC_READ,
+                                              "Vulkan RHI cached dmabuf texture",
+                                              "implicit acquire",
+                                              &waitSyncFileFds,
+                                              &gpuSemaphoreWait,
+                                              &cpuWaitUsec)) {
+        usedImplicitAcquire = true;
         qCWarning(lcWlRenderHelper)
             << "Vulkan RHI cached dmabuf texture acquire rejected: implicit producer fence wait failed"
             << buffer
@@ -5510,15 +8126,27 @@ bool WRenderHelper::acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
             << "format" << drmFormatToName(dmabuf.format)
             << "modifier" << drmModifierToName(dmabuf.modifier)
             << "planes" << dmabuf.n_planes;
+        recordVulkanPerfClientAcquire("client-reacquire", surface, buffer, &dmabuf,
+                                      contentSerial,
+                                      usedExplicitAcquire, usedImplicitAcquire,
+                                      gpuSemaphoreWait, waitSyncFileFds.size(),
+                                      cpuWaitUsec, false);
+        closeSyncFileFds(&waitSyncFileFds);
         return false;
     }
+    usedImplicitAcquire = !usedExplicitAcquire;
+    recordVulkanPerfClientAcquire("client-reacquire", surface, buffer, &dmabuf,
+                                  contentSerial,
+                                  usedExplicitAcquire, usedImplicitAcquire,
+                                  gpuSemaphoreWait, waitSyncFileFds.size(),
+                                  cpuWaitUsec, true);
 
     auto *imported = static_cast<VulkanImportedNativeTexture *>(nativeCleanup->nativeData);
     if (!imported || !imported->isValid())
         return false;
 
-    imported->layout = VK_IMAGE_LAYOUT_GENERAL;
-    if (!acquireVulkanNativeTextureForSampling(rhi, imported))
+    if (!acquireVulkanNativeTextureForSampling(rhi, imported,
+                                               std::move(waitSyncFileFds)))
         return false;
 
     qCDebug(lcWlRenderHelper)
@@ -5529,13 +8157,16 @@ bool WRenderHelper::acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
         << "format" << drmFormatToName(imported->drmFormat)
         << "modifier" << drmModifierToName(imported->drmModifier)
         << "usedExplicitAcquire" << usedExplicitAcquire
-        << "usedImplicitAcquire" << !usedExplicitAcquire;
+        << "usedImplicitAcquire" << usedImplicitAcquire
+        << "gpuSemaphoreWait" << gpuSemaphoreWait
+        << "cpuFallbackWaitMs" << (cpuWaitUsec / 1000.0);
     return true;
 #else
     Q_UNUSED(rhi);
     Q_UNUSED(buffer);
     Q_UNUSED(surface);
     Q_UNUSED(nativeCleanup);
+    Q_UNUSED(contentSerial);
     return false;
 #endif
 }

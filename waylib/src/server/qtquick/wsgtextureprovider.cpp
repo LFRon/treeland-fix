@@ -227,7 +227,8 @@ public:
 
         WRenderHelper::ImportedVulkanTexture importedTexture;
         if (!WRenderHelper::importVulkanTextureFromBuffer(rhi, buffer, surface,
-                                                          &importedTexture)) {
+                                                          &importedTexture,
+                                                          contentSerial)) {
             return nullptr;
         }
 
@@ -409,15 +410,47 @@ private:
         entry->lastAcquireCacheHit = true;
         entry->lastAcquireReacquired = false;
 
-        if (contentSerial != 0 && entry->lastContentSerial == contentSerial)
+        const bool needsSamplingAcquire =
+            WRenderHelper::vulkanClientTextureNeedsAcquire(&entry->nativeCleanup);
+        if (contentSerial != 0 && entry->lastContentSerial == contentSerial
+            && !needsSamplingAcquire) {
+            if (WRenderHelper::vulkanPerfDiagnosticsEnabled()) {
+                const auto cacheStats = stats();
+                qCDebug(lcWlQtQuickTexture)
+                    << "Vulkan client dmabuf texture cache reuse-same-serial"
+                    << "buffer" << pointerAddress(buffer)
+                    << "contentSerial" << contentSerial
+                    << "rhiTexture" << entry->rhiTexture
+                    << "entryBytes" << entry->costBytes
+                    << "cacheBytes" << cacheStats.cachedBytes
+                    << "budgetBytes" << cacheStats.budgetBytes
+                    << "entries" << cacheStats.entries
+                    << "activeRefs" << cacheStats.activeRefs;
+            }
             return true;
+        }
 
         if (!WRenderHelper::acquireImportedVulkanTextureFromBuffer(rhi, buffer,
                                                                    surface,
-                                                                   &entry->nativeCleanup)) {
+                                                                   &entry->nativeCleanup,
+                                                                   contentSerial)) {
             return false;
         }
 
+        if (WRenderHelper::vulkanPerfDiagnosticsEnabled()) {
+            const auto cacheStats = stats();
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan client dmabuf texture cache reacquired"
+                << "buffer" << pointerAddress(buffer)
+                << "oldContentSerial" << entry->lastContentSerial
+                << "newContentSerial" << contentSerial
+                << "rhiTexture" << entry->rhiTexture
+                << "entryBytes" << entry->costBytes
+                << "cacheBytes" << cacheStats.cachedBytes
+                << "budgetBytes" << cacheStats.budgetBytes
+                << "entries" << cacheStats.entries
+                << "activeRefs" << cacheStats.activeRefs;
+        }
         entry->lastContentSerial = contentSerial;
         entry->lastAcquireReacquired = true;
         return true;
@@ -575,6 +608,20 @@ private:
                 cleanups.append(release.nativeCleanup);
                 m_deferredReleases.removeAt(i);
             }
+        }
+
+        if (WRenderHelper::vulkanPerfDiagnosticsEnabled() && !cleanups.isEmpty()) {
+            const auto cacheStats = stats();
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan client dmabuf texture cache deferred cleanup ready"
+                << "force" << force
+                << "window" << pointerAddress(window)
+                << "cleanupCount" << cleanups.size()
+                << "cacheBytes" << cacheStats.cachedBytes
+                << "budgetBytes" << cacheStats.budgetBytes
+                << "entries" << cacheStats.entries
+                << "activeRefs" << cacheStats.activeRefs
+                << "deferredReleases" << cacheStats.deferredReleases;
         }
 
         for (auto cleanup : cleanups)
@@ -746,6 +793,47 @@ public:
 
         s_vulkanDmabufTextureCache->release(activeVulkanDmabufTexture);
         activeVulkanDmabufTexture = nullptr;
+    }
+
+    bool queueActiveVulkanDmabufTextureRelease(wlr_surface *surface,
+                                               WRenderHelper::VulkanClientReleaseToken *releaseToken) const
+    {
+        if (releaseToken)
+            *releaseToken = {};
+
+        if (!activeVulkanDmabufTexture || !window || !window->rhi()) {
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan client dmabuf release skipped: no active cached texture"
+                << "buffer" << pointerAddress(buffer)
+                << "contentSerial" << bufferContentSerial;
+            return false;
+        }
+
+        auto *activeBuffer = activeVulkanDmabufTexture->buffer.data();
+        if (!activeBuffer || activeBuffer != buffer) {
+            qCDebug(lcWlQtQuickTexture)
+                << "Vulkan client dmabuf release skipped: active texture buffer mismatch"
+                << "providerBuffer" << pointerAddress(buffer)
+                << "activeBuffer" << pointerAddress(activeBuffer)
+                << "contentSerial" << bufferContentSerial;
+            return false;
+        }
+
+        const bool queued =
+            WRenderHelper::queueVulkanClientTextureRelease(window->rhi(),
+                                                           &activeVulkanDmabufTexture->nativeCleanup,
+                                                           activeBuffer,
+                                                           surface,
+                                                           bufferContentSerial,
+                                                           releaseToken);
+        qCDebug(lcWlQtQuickTexture)
+            << "Vulkan client dmabuf release queue result"
+            << "queued" << queued
+            << "buffer" << pointerAddress(activeBuffer)
+            << "contentSerial" << bufferContentSerial
+            << "rhiTexture" << activeVulkanDmabufTexture->rhiTexture
+            << "token" << (releaseToken && releaseToken->isValid());
+        return queued;
     }
 
     void activateSharedVulkanDmabufTexture(VulkanSharedDmabufTexture *entry,
@@ -1446,6 +1534,21 @@ qw_buffer *WSGTextureProvider::qwBuffer() const
 {
     W_DC(WSGTextureProvider);
     return d->buffer;
+}
+
+bool WSGTextureProvider::queueActiveVulkanDmabufTextureRelease(
+    wlr_surface *surface,
+    WRenderHelper::VulkanClientReleaseToken *releaseToken) const
+{
+#ifdef ENABLE_VULKAN_RENDER
+    W_DC(WSGTextureProvider);
+    return d->queueActiveVulkanDmabufTextureRelease(surface, releaseToken);
+#else
+    Q_UNUSED(surface);
+    if (releaseToken)
+        *releaseToken = {};
+    return false;
+#endif
 }
 
 bool WSGTextureProvider::smooth() const

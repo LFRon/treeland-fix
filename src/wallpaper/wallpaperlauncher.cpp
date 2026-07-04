@@ -4,6 +4,7 @@
 #include "wallpaperlauncher.h"
 #include "common/treelandlogging.h"
 #include "helper.h"
+#include "utils/processenvironment.h"
 
 #include <wsocket.h>
 
@@ -70,7 +71,7 @@ void WallpaperLauncher::onStartRequested()
     m_wallpaperProcess = new QProcess(this);
     m_wallpaperProcess->setProgram(QStringLiteral("treeland-wallpaper-factory"));
     m_wallpaperProcess->setProcessChannelMode(QProcess::MergedChannels);
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = Treeland::ProcessEnvironment::clientSystemEnvironment();
     env.insert("WAYLAND_DISPLAY", m_socket->fullServerName());
     env.insert("QT_QPA_PLATFORM", "wayland");
     m_wallpaperProcess->setProcessEnvironment(env);

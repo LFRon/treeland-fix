@@ -10,6 +10,8 @@
 #include "woutputviewport_p.h"
 #include "wqmlhelper_p.h"
 #include "woutputlayer.h"
+#include "wsurfaceitem.h"
+#include "wsurface.h"
 #include "wbufferrenderer_p.h"
 #include "wquicktextureproxy.h"
 #include "weventjunkman.h"
@@ -40,8 +42,10 @@
 #include <QOpenGLFunctions>
 #include <QRunnable>
 #include <QHash>
+#include <QElapsedTimer>
 #include <algorithm>
 #include <memory>
+#include <utility>
 
 #include <private/qsgrenderer_p.h>
 #include <private/qsgsoftwarerenderer_p.h>
@@ -86,20 +90,6 @@ static bool envFlagEnabledForVulkanRenderer(const char *name)
 {
     const QByteArray value = qgetenv(name).trimmed().toLower();
     return value == "1" || value == "true" || value == "yes" || value == "on";
-}
-
-static bool vulkanSoftwareCursorRequested()
-{
-    static const bool enabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_FORCE_SOFTWARE_CURSOR")
-        || envFlagEnabledForVulkanRenderer("TREELAND_VK_FORCE_SOFTWARE_CURSOR");
-    return enabled;
-}
-
-static bool vulkanHardwareCursorRequested()
-{
-    static const bool enabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_ENABLE_HARDWARE_CURSOR")
-        || envFlagEnabledForVulkanRenderer("TREELAND_VK_ENABLE_HARDWARE_CURSOR");
-    return enabled;
 }
 
 static bool vulkanOutputLayerCompositorDisabled()
@@ -334,6 +324,46 @@ public:
             m_vulkanOutputLayerFallback = false;
             m_vulkanOutputLayerFallbackRetryFrames = 0;
         }
+    }
+
+    inline void logVulkanOutputPathCommit(WBufferRenderer *buffer,
+                                          bool commitAttempted,
+                                          bool commitSucceeded,
+                                          bool usedOutputLayer) const {
+        if (!isVulkanRenderer() || !WRenderHelper::vulkanPerfDiagnosticsEnabled())
+            return;
+
+        qw_buffer *currentBuffer = buffer ? buffer->currentBuffer() : nullptr;
+        const QSize bufferSize = currentBuffer && currentBuffer->handle()
+            ? QSize(currentBuffer->handle()->width, currentBuffer->handle()->height)
+            : QSize();
+        const bool explicitOutputLayer =
+            WOutputHelper::isVulkanOutputLayerCompositorRequested();
+        const char *fallbackReason = "none";
+        if (!commitAttempted)
+            fallbackReason = "frame-pending";
+        else if (!commitSucceeded)
+            fallbackReason = "commit-failed";
+        else if (usedOutputLayer && explicitOutputLayer)
+            fallbackReason = "explicit-env-request";
+        else if (usedOutputLayer && m_vulkanOutputLayerFallback)
+            fallbackReason = "temporary-direct-primary-fallback";
+
+        qCDebug(lcWlVulkanCompositor)
+            << "Vulkan perf output path"
+            << "output" << qwoutput()->handle()->name
+            << "path" << (usedOutputLayer ? "output-layer-compositor" : "direct-primary")
+            << "scanoutReady" << (buffer ? buffer->currentBufferReadyForScanout() : false)
+            << "commitAttempted" << commitAttempted
+            << "commitSucceeded" << commitSucceeded
+            << "fallbackReason" << fallbackReason
+            << "outputLayerEnvRequested" << explicitOutputLayer
+            << "outputLayerDisabled" << vulkanOutputLayerCompositorDisabled()
+            << "temporaryFallbackActive" << m_vulkanOutputLayerFallback
+            << "temporaryFallbackRetryFrames" << m_vulkanOutputLayerFallbackRetryFrames
+            << "buffer" << currentBuffer
+            << "bufferSize" << bufferSize
+            << "env" << "WAYLIB_VK_OUTPUT_LAYER_COMPOSITOR/TREELAND_VK_OUTPUT_LAYER_COMPOSITOR";
     }
 #endif
 
@@ -1281,14 +1311,12 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
 
 #ifdef ENABLE_VULKAN_RENDER
         if (isVulkanRenderer()
-            && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan
-            && (vulkanSoftwareCursorRequested() || !vulkanHardwareCursorRequested())) {
+            && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan) {
             static bool logged = false;
             if (!logged) {
                 qCInfo(lcWlRenderer)
                     << "Keeping cursor in Qt composition for Vulkan RHI with wlroots Vulkan renderer"
-                    << "forcedSoftware" << vulkanSoftwareCursorRequested()
-                    << "hardwareOptIn" << vulkanHardwareCursorRequested();
+                    << "hardwareCursor" << false;
                 logged = true;
             }
             return false;
@@ -1819,8 +1847,29 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
 
     rc()->polishItems();
 
-    if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
+    const bool rhiBasedFrame = QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi());
+#ifdef ENABLE_VULKAN_RENDER
+    const bool vulkanFrame = WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+#else
+    const bool vulkanFrame = false;
+#endif
+
+    if (rhiBasedFrame) {
+        QElapsedTimer beginFrameTimer;
+#ifdef ENABLE_VULKAN_RENDER
+        if (vulkanFrame && WRenderHelper::vulkanPerfDiagnosticsEnabled())
+            beginFrameTimer.start();
+#endif
         rc()->beginFrame();
+#ifdef ENABLE_VULKAN_RENDER
+        if (vulkanFrame) {
+            WRenderHelper::noteVulkanRenderControlBeginFrame(
+                beginFrameTimer.isValid() ? beginFrameTimer.nsecsElapsed() / 1000 : 0);
+            WRenderHelper::beginVulkanAcquireBatch(rc()->rhi());
+            WRenderHelper::beginVulkanClientReleaseBatch(rc()->rhi());
+        }
+#endif
+    }
     rc()->sync();
 
     QQuickAnimatorController_advance(animationController.get());
@@ -1832,14 +1881,41 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     Q_EMIT q->afterRendering();
     runAndClearJobs(&afterRenderingJobs);
 
-    if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
+    if (rhiBasedFrame) {
+#ifdef ENABLE_VULKAN_RENDER
+        if (vulkanFrame && !WRenderHelper::flushVulkanAcquireBatch("before-endFrame")) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan acquire batch flush failed before render-control endFrame";
+        }
+#endif
+        QElapsedTimer endFrameTimer;
+#ifdef ENABLE_VULKAN_RENDER
+        if (vulkanFrame && WRenderHelper::vulkanPerfDiagnosticsEnabled())
+            endFrameTimer.start();
+#endif
         rc()->endFrame();
+#ifdef ENABLE_VULKAN_RENDER
+        if (vulkanFrame) {
+            WRenderHelper::noteVulkanRenderControlEndFrame(
+                endFrameTimer.isValid() ? endFrameTimer.nsecsElapsed() / 1000 : 0);
+            WRenderHelper::endVulkanAcquireBatch("after-endFrame");
+        }
+#endif
+    }
 
 #ifdef ENABLE_VULKAN_RENDER
     for (const auto &commitTarget : std::as_const(needsCommit)) {
         WBufferRenderer *bufferRenderer = commitTarget.second;
         if (bufferRenderer->currentBuffer())
             bufferRenderer->releaseCurrentBufferForScanout();
+    }
+    if (vulkanFrame) {
+        if (!WRenderHelper::flushVulkanClientReleaseBatch("after-output-release")) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan client release batch flush failed after output release";
+        }
+        WRenderHelper::endVulkanClientReleaseBatch("after-output-release");
+        WRenderHelper::noteVulkanPerfFrame();
     }
 #endif
 
@@ -1874,6 +1950,15 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
                     }
                 }
             }
+
+#ifdef ENABLE_VULKAN_RENDER
+            if (hadCurrentBuffer) {
+                i.first->logVulkanOutputPathCommit(i.second,
+                                                   commitAttempted,
+                                                   commitSucceeded,
+                                                   usedVulkanOutputLayer);
+            }
+#endif
 
             if (hadCurrentBuffer) {
                 i.second->endRender();

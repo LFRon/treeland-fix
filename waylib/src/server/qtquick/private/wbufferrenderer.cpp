@@ -19,6 +19,8 @@
 
 #include <QSGImageNode>
 #include <QSGSimpleRectNode>
+#include <QElapsedTimer>
+#include <QByteArray>
 
 #include <private/qsgsoftwarerenderer_p.h>
 #include <private/qsgsoftwarerenderablenodeupdater_p.h>
@@ -849,12 +851,87 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
         }
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    const bool preRenderIsVulkan = wd->rhi && wd->rhi->backend() == QRhi::Vulkan;
+    bool acquireReady = true;
+    if (preRenderIsVulkan)
+        acquireReady = WRenderHelper::flushVulkanAcquireBatch("before-renderNextFrame");
+    if (!acquireReady) {
+        state.scanoutReady = false;
+        qCWarning(lcWlBufferRenderer)
+            << "Skipping Vulkan render because acquire batch flush failed"
+            << "sourceIndex" << sourceIndex
+            << "renderFlags" << int(state.flags)
+            << "bufferPtr" << quintptr(state.buffer.get())
+            << "bufferSize" << (state.buffer
+                                 ? QSize(state.buffer->handle()->width,
+                                         state.buffer->handle()->height)
+                                 : QSize());
+            return;
+    }
+#endif
+
     state.context->renderNextFrame(renderer);
 
     { // after render
         if (!softwareRenderer) {
             // TODO: get damage area from QRhi renderer
             m_damageRing.add_whole();
+#ifdef ENABLE_VULKAN_RENDER
+            const bool isVulkan = wd->rhi && wd->rhi->backend() == QRhi::Vulkan;
+            const bool directPrimary =
+                isVulkan && state.flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject);
+            const bool outputLayer =
+                isVulkan && state.flags.testFlag(DontConfigureSwapchain);
+            const bool finalSource = sourceIndex + 1 >= m_sourceList.size();
+            bool finishPerformed = true;
+            qint64 finishUsec = 0;
+            const char *finishReason = "legacy-immediate-completion";
+
+            if (!isVulkan) {
+                wd->rhi->finish();
+            } else if (directPrimary && finalSource) {
+                finishPerformed = false;
+                finishReason = "defer-direct-primary-to-endFrame";
+            } else {
+                // The result of an earlier source can be sampled by a later source,
+                // so keep the legacy completion point for dependent and non-primary paths.
+                QElapsedTimer finishTimer;
+                if (WRenderHelper::vulkanPerfDiagnosticsEnabled())
+                    finishTimer.start();
+                wd->rhi->finish();
+                finishUsec = finishTimer.isValid() ? finishTimer.nsecsElapsed() / 1000 : 0;
+                if (isVulkan) {
+                    if (directPrimary)
+                        finishReason = "direct-primary-dependent-source";
+                    else if (outputLayer)
+                        finishReason = "output-layer-immediate-release";
+                    else
+                        finishReason = "intermediate-immediate-release";
+                }
+            }
+
+            if (isVulkan) {
+                WRenderHelper::noteVulkanFinish(finishPerformed,
+                                                finishReason,
+                                                sourceIndex,
+                                                int(state.flags),
+                                                m_output ? m_output->name().toUtf8() : QByteArray(),
+                                                directPrimary,
+                                                outputLayer,
+                                                finishUsec);
+
+                // The primary/output render target must stay Qt-owned until
+                // QQuickRenderControl::endFrame() submits the complete offscreen frame.
+                // Smaller wlroots layer/cursor targets are committed outside the primary
+                // output path and still need the legacy immediate release before their
+                // current buffer is ended.
+                if (m_renderHelper
+                    && !state.flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject)) {
+                    releaseCurrentBufferForScanout();
+                }
+            }
+#else
             // ###: maybe Qt bug? Before executing QRhi::endOffscreenFrame, we may
             // use the same QSGRenderer for multiple drawings. This can lead to
             // rendering the same content for different QSGRhiRenderTarget instances
@@ -864,16 +941,6 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
             // complete the results of this drawing here to ensure the current
             // drawing result is available for use.
             wd->rhi->finish();
-#ifdef ENABLE_VULKAN_RENDER
-            // The primary/output render target must stay Qt-owned until
-            // QQuickRenderControl::endFrame() submits the complete offscreen frame.
-            // Smaller wlroots layer/cursor targets are committed outside the primary
-            // output path and still need the legacy immediate release before their
-            // current buffer is ended.
-            if (wd->rhi->backend() == QRhi::Vulkan && m_renderHelper
-                && !state.flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject)) {
-                releaseCurrentBufferForScanout();
-            }
 #endif
         } else {
             state.dirty = softwareRenderer->flushRegion();

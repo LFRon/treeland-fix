@@ -1,4 +1,4 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #pragma once
@@ -11,8 +11,10 @@
 #include <QSGRendererInterface>
 
 #include <cstdint>
+#include <memory>
 
 QT_BEGIN_NAMESPACE
+class QByteArray;
 class QQuickRenderControl;
 class QRhiTexture;
 class QSGTexture;
@@ -65,6 +67,21 @@ public:
 
     static void setupRendererBackend(QW_NAMESPACE::qw_backend *testBackend = nullptr);
     static QSGRendererInterface::GraphicsApi probe(QW_NAMESPACE::qw_backend *testBackend, const QList<QSGRendererInterface::GraphicsApi> &apiList);
+    static bool vulkanPerfDiagnosticsEnabled();
+    static void noteVulkanPerfFrame();
+    static void noteVulkanFinish(bool performed, const char *reason,
+                                 int sourceIndex, int renderFlags,
+                                 const QByteArray &outputName,
+                                 bool directPrimary, bool outputLayer,
+                                 qint64 elapsedUsec);
+    static void noteVulkanRenderControlBeginFrame(qint64 elapsedUsec);
+    static void noteVulkanRenderControlEndFrame(qint64 elapsedUsec);
+    static void beginVulkanAcquireBatch(QRhi *rhi);
+    static bool flushVulkanAcquireBatch(const char *reason);
+    static void endVulkanAcquireBatch(const char *reason);
+    static void beginVulkanClientReleaseBatch(QRhi *rhi);
+    static bool flushVulkanClientReleaseBatch(const char *reason);
+    static void endVulkanClientReleaseBatch(const char *reason);
 
     struct NativeTextureCleanup {
         enum class Type {
@@ -96,11 +113,31 @@ public:
 
     static bool importVulkanTextureFromBuffer(QRhi *rhi, QW_NAMESPACE::qw_buffer *buffer,
                                               wlr_surface *surface,
-                                              ImportedVulkanTexture *importedTexture);
+                                              ImportedVulkanTexture *importedTexture,
+                                              quint32 contentSerial = 0);
+    struct VulkanClientReleaseTokenState;
+    struct VulkanClientReleaseToken {
+        std::shared_ptr<VulkanClientReleaseTokenState> state;
+
+        bool isValid() const { return bool(state); }
+    };
+
+    static bool queueVulkanClientTextureRelease(QRhi *rhi,
+                                                const NativeTextureCleanup *nativeCleanup,
+                                                QW_NAMESPACE::qw_buffer *buffer,
+                                                wlr_surface *surface,
+                                                quint32 contentSerial,
+                                                VulkanClientReleaseToken *releaseToken);
+    static bool vulkanClientReleaseReady(const VulkanClientReleaseToken &releaseToken,
+                                         bool wait,
+                                         qint64 *waitUsec = nullptr);
+    static bool vulkanClientReleaseFailed(const VulkanClientReleaseToken &releaseToken);
+    static bool vulkanClientTextureNeedsAcquire(const NativeTextureCleanup *nativeCleanup);
     static bool acquireImportedVulkanTextureFromBuffer(QRhi *rhi,
                                                        QW_NAMESPACE::qw_buffer *buffer,
                                                        wlr_surface *surface,
-                                                       NativeTextureCleanup *nativeCleanup);
+                                                       NativeTextureCleanup *nativeCleanup,
+                                                       quint32 contentSerial = 0);
     static void releaseImportedVulkanTexture(ImportedVulkanTexture *importedTexture);
 
     static bool makeTexture(QRhi *rhi, QW_NAMESPACE::qw_texture *handle,

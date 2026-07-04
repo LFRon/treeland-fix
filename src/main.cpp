@@ -1,7 +1,8 @@
-// Copyright (C) 2024 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2024-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "core/treeland.h"
+#include "common/treelandlogging.h"
 #include "utils/cmdline.h"
 
 #include <wrenderhelper.h>
@@ -30,6 +31,33 @@
 WAYLIB_SERVER_USE_NAMESPACE
 DCORE_USE_NAMESPACE;
 
+namespace {
+
+constexpr const char *s_qtRhiVkAsyncOffscreenEnv = "QT_RHI_VK_ASYNC_OFFSCREEN";
+constexpr const char *s_qtRhiVkAsyncOffscreenDefaultedEnv = "WAYLIB_QT_RHI_VK_ASYNC_OFFSCREEN_DEFAULTED";
+
+void defaultQtRhiVkAsyncOffscreenForVulkan()
+{
+    if (qgetenv("WLR_RENDERER") != "vulkan") {
+        qunsetenv(s_qtRhiVkAsyncOffscreenDefaultedEnv);
+        return;
+    }
+
+    if (qEnvironmentVariableIsSet(s_qtRhiVkAsyncOffscreenEnv)) {
+        qunsetenv(s_qtRhiVkAsyncOffscreenDefaultedEnv);
+        return;
+    }
+
+    qputenv(s_qtRhiVkAsyncOffscreenEnv, "1");
+    qputenv(s_qtRhiVkAsyncOffscreenDefaultedEnv, "1");
+    qCInfo(lcTlCore)
+        << "Vulkan renderer requested: defaulting"
+        << s_qtRhiVkAsyncOffscreenEnv
+        << "to 1 before Qt/QPA initialization";
+}
+
+}
+
 class QDeepinTheme : public QGenericUnixTheme
 {
 public:
@@ -47,6 +75,7 @@ public:
 int main(int argc, char *argv[])
 {
     qw_log::init();
+    defaultQtRhiVkAsyncOffscreenForVulkan();
     DTK_GUI_NAMESPACE::DGuiApplicationHelper::setAttribute(
         DTK_GUI_NAMESPACE::DGuiApplicationHelper::DontSaveApplicationTheme,
         true);

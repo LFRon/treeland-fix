@@ -74,6 +74,8 @@
 #include <wcursorshapemanagerv1.h>
 #include <wextimagecapturesourcev1impl.h>
 #include <wlayersurface.h>
+#include <wlinuxdmabufv1.h>
+#include <wlinuxdrmsyncobjv1.h>
 #include <woutputhelper.h>
 #include <woutputitem.h>
 #include <woutputlayout.h>
@@ -138,6 +140,7 @@
 #include <QPointer>
 #include <QQmlContext>
 #include <QQuickWindow>
+#include <QSGRendererInterface>
 #include <QThreadPool>
 
 #include <functional>
@@ -1703,7 +1706,16 @@ void Helper::init(Treeland::Treeland *treeland)
     }
 
     m_allocator = qw_allocator::autocreate(*m_backend->handle(), *m_renderer);
-    m_renderer->init_wl_display(*m_server->handle());
+    if (!m_renderer->init_wl_shm(*m_server->handle())) {
+        qCFatal(lcTlCore) << "Failed to initialize wl_shm for renderer";
+    }
+    m_server->attach<WLinuxDmabufV1>(m_renderer);
+#if WLR_HAVE_VULKAN_RENDERER
+    if (m_renderer->is_vk()
+        && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan) {
+        m_server->attach<WLinuxDrmSyncobjManagerV1>(m_renderer);
+    }
+#endif
     qw_drm::create(*m_server->handle(), *m_renderer);
 
     // free follow display

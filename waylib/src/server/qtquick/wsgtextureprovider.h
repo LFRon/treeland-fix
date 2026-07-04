@@ -1,6 +1,8 @@
-// Copyright (C) 2024 Yixue Wang <wangyixue@deepin.org>.
+// Copyright (C) 2024-2026 Yixue Wang <wangyixue@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 #pragma once
+
+#include "wrenderhelper.h"
 
 #include <wglobal.h>
 #include <qwglobal.h>
@@ -55,6 +57,8 @@ public:
     QSGTexture *texture() const override;
     virtual QW_NAMESPACE::qw_texture *qwTexture() const;
     virtual QW_NAMESPACE::qw_buffer *qwBuffer() const;
+    bool queueActiveVulkanDmabufTextureRelease(wlr_surface *surface,
+                                               WRenderHelper::VulkanClientReleaseToken *releaseToken) const;
 
     bool smooth() const;
     void setSmooth(bool newSmooth);

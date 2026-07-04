@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Dingyuan Zhang <lxz@mkacg.com>.
+// Copyright (C) 2023-2026 Dingyuan Zhang <lxz@mkacg.com>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "treeland.h"
@@ -10,6 +10,7 @@
 #include "seat/helper.h"
 #include "session/session.h"
 #include "utils/cmdline.h"
+#include "utils/processenvironment.h"
 #include "common/treelandlogging.h"
 #include "common/constants.h"
 
@@ -322,7 +323,7 @@ Treeland::Treeland()
             if (auto cmdline = CmdLine::ref().unescapeExecArgs(runCmd); cmdline) {
                 auto cmdArgs = cmdline.value();
 
-                auto envs = QProcessEnvironment::systemEnvironment();
+                auto envs = ProcessEnvironment::clientSystemEnvironment();
                 envs.insert("WAYLAND_DISPLAY",
                             globalSession->socket()->fullServerName());
                 if (auto currentUserSession = d->helper->sessionManager()->sessionForUid(getuid())) {
