@@ -110,6 +110,8 @@ public:
     void noteBufferSubmittedForPresentation(QW_NAMESPACE::qw_buffer *buffer, const char *presentPath);
     void noteAdaptiveSyncFallback(const char *reason);
     bool bufferAwaitingPresentation(QW_NAMESPACE::qw_buffer *buffer) const;
+    bool tryConsumeAdaptiveSyncRetry();
+    void clearAdaptiveSyncRetry();
 
 Q_SIGNALS:
     void enabledChanged();
@@ -124,6 +126,7 @@ Q_SIGNALS:
     void cursorAdded(WAYLIB_SERVER_NAMESPACE::WCursor *cursor);
     void cursorRemoved(WAYLIB_SERVER_NAMESPACE::WCursor *cursor);
     void cursorListChanged();
+    void adaptiveSyncRetryRequested();
 
 private:
     friend class QWlrootsIntegration;

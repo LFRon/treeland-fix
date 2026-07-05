@@ -520,7 +520,8 @@ static bool applyVulkanAdaptiveSyncOnlyState(qw_renderer *renderer,
                 << "output" << output->name()
                 << "outputId" << outputId
                 << "dconfigSubpath" << dconfigSubpathForOutputId(outputId)
-                << "adaptiveSyncSupported" << nativeOutput->adaptive_sync_supported
+<< "adaptiveSyncSupported" << nativeOutput->adaptive_sync_supported
+        << "(may be stale at startup)"
                 << "adaptiveSyncStatus" << adaptiveSyncStatusName(nativeOutput->adaptive_sync_status)
                 << "reason" << decision.reason
                 << "context" << (context ? context : "unknown");
@@ -545,7 +546,7 @@ static bool reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(qw_renderer *renderer,
     if (!isVulkanRendererActive(renderer) || !decision.enabled || !decision.shouldCommit)
         return true;
 
-    if (!output || !output->isEnabled() || !adaptiveSyncSupported(output))
+    if (!output || !output->isEnabled())
         return true;
 
     auto *nativeOutput = output->nativeHandle();
@@ -941,11 +942,29 @@ void Helper::onOutputAdded(WOutput *output)
                 if (commitOutputStateWithAdaptiveSyncFallback(output->handle(),
                                                               newState,
                                                               "default-adaptive-sync")) {
-                    reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
-                                                                  output,
-                                                                  config,
-                                                                  adaptiveSyncDecision,
-                                                                  "default-adaptive-sync");
+reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
+                                                                   output,
+                                                                   config,
+                                                                   adaptiveSyncDecision,
+                                                                   "default-adaptive-sync");
+                    if (adaptiveSyncDecision.enabled) {
+                        QObject::connect(output, &WOutput::adaptiveSyncRetryRequested,
+                                         output, [renderer = m_renderer,
+                                                  output = QPointer<WOutput>(output),
+                                                  config = QPointer<OutputConfig>(config)] {
+                            if (!output || !config)
+                                return;
+                            bool ok = reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(
+                                renderer, output, config,
+                                {.enabled = true, .shouldCommit = true, .reason = "vulkan-retry"},
+                                "adaptive-sync-frame-retry");
+                            auto *nativeOutput = output->nativeHandle();
+                            if (ok && nativeOutput
+                                && nativeOutput->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED) {
+                                output->clearAdaptiveSyncRetry();
+                            }
+                        }, Qt::QueuedConnection);
+                    }
                 } else {
                     qCWarning(lcTlCore)
                         << "Failed to apply default adaptive sync state on output"
@@ -1019,11 +1038,29 @@ void Helper::onOutputAdded(WOutput *output)
             qCCritical(lcTlCore) << "commit failed on output" << output->name();
             return;
         }
-        reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
-                                                      output,
-                                                      config,
-                                                      adaptiveSyncDecision,
-                                                      "restore-output-config");
+reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
+                                                       output,
+                                                       config,
+                                                       adaptiveSyncDecision,
+                                                       "restore-output-config");
+        if (adaptiveSyncDecision.enabled) {
+            QObject::connect(output, &WOutput::adaptiveSyncRetryRequested,
+                             output, [renderer = m_renderer,
+                                      output = QPointer<WOutput>(output),
+                                      config = QPointer<OutputConfig>(config)] {
+                if (!output || !config)
+                    return;
+                bool ok = reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(
+                    renderer, output, config,
+                    {.enabled = true, .shouldCommit = true, .reason = "vulkan-retry"},
+                    "adaptive-sync-frame-retry");
+                auto *nativeOutput = output->nativeHandle();
+                if (ok && nativeOutput
+                    && nativeOutput->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED) {
+                    output->clearAdaptiveSyncRetry();
+                }
+            }, Qt::QueuedConnection);
+        }
 
         if (auto *outputItem = outputObject->outputItem()) {
             QMetaObject::invokeMethod(outputItem,

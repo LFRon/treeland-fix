@@ -100,6 +100,10 @@ public:
     bool lastVrrGlobalActive = false;
     QByteArray lastVrrPresentPath;
     uint32_t vrrPresentLogCounter = 0;
+
+    bool adaptiveSyncRetryActive = false;
+    int adaptiveSyncRetryAttempt = 0;
+    int adaptiveSyncRetryFrameDelay = 0;
 };
 
 WOutput::WOutput(qw_output *handle, WBackend *backend)
@@ -721,6 +725,9 @@ void WOutput::setForceSoftwareCursor(bool on)
 
 void WOutput::scheduleFrame()
 {
+    W_D(WOutput);
+    if (d->adaptiveSyncRetryActive && tryConsumeAdaptiveSyncRetry())
+        Q_EMIT adaptiveSyncRetryRequested();
     return handle()->schedule_frame();
 }
 
@@ -753,6 +760,42 @@ void WOutput::noteAdaptiveSyncFallback(const char *reason)
         ? QByteArray(reason)
         : QByteArrayLiteral("none");
     d->adaptiveSyncFallbackPending = true;
+    if (!d->adaptiveSyncRetryActive) {
+        d->adaptiveSyncRetryActive = true;
+        d->adaptiveSyncRetryAttempt = 0;
+        d->adaptiveSyncRetryFrameDelay = 30;
+        qCInfo(lcWlOutput) << "Adaptive sync retry activated for output" << name();
+    }
+}
+
+bool WOutput::tryConsumeAdaptiveSyncRetry()
+{
+    W_D(WOutput);
+    if (!d->adaptiveSyncRetryActive)
+        return false;
+    if (--d->adaptiveSyncRetryFrameDelay > 0)
+        return false;
+    d->adaptiveSyncRetryAttempt++;
+    switch (d->adaptiveSyncRetryAttempt) {
+    case 1: d->adaptiveSyncRetryFrameDelay = 60; break;
+    case 2: d->adaptiveSyncRetryFrameDelay = 120; break;
+    case 3: d->adaptiveSyncRetryFrameDelay = 240; break;
+    case 4: d->adaptiveSyncRetryFrameDelay = 480; break;
+    default:
+        d->adaptiveSyncRetryActive = false;
+        qCInfo(lcWlOutput) << "Adaptive sync retry exhausted for output" << name();
+        return false;
+    }
+    qCDebug(lcWlOutput) << "Adaptive sync retry firing attempt"
+                        << d->adaptiveSyncRetryAttempt << "for output" << name();
+    return true;
+}
+
+void WOutput::clearAdaptiveSyncRetry()
+{
+    W_D(WOutput);
+    d->adaptiveSyncRetryActive = false;
+    qCInfo(lcWlOutput) << "Adaptive sync retry cleared for output" << name();
 }
 
 bool WOutput::bufferAwaitingPresentation(qw_buffer *buffer) const
