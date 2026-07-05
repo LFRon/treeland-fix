@@ -52,6 +52,7 @@ Q_LOGGING_CATEGORY(lcWlExtForeignToplevel, "waylib.protocols.extforeigntoplevel"
 Q_LOGGING_CATEGORY(lcWlTextInput, "waylib.protocols.textinput", QtInfoMsg) // Text input v1/v2/v3 protocol
 Q_LOGGING_CATEGORY(lcWlLinuxDmabuf, "waylib.protocols.linuxdmabuf", QtInfoMsg) // linux-dmabuf-v1 renderer-backed global
 Q_LOGGING_CATEGORY(lcWlLinuxDrmSyncobj, "waylib.protocols.linuxdrmsyncobj", QtInfoMsg) // linux-drm-syncobj-v1 explicit sync global
+Q_LOGGING_CATEGORY(lcWlPresentation, "waylib.protocols.presentation", QtInfoMsg) // presentation-time feedback global
 
 // Layer shell
 Q_LOGGING_CATEGORY(lcWlLayerShell, "waylib.layer.shell", QtWarningMsg) // wlr-layer-shell surface requests

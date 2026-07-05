@@ -82,6 +82,7 @@
 #include <woutputmanagerv1.h>
 #include <woutputrenderwindow.h>
 #include <woutputviewport.h>
+#include <wpresentation.h>
 #include <wqmlcreator.h>
 #include <wquickcursor.h>
 #include <wrenderhelper.h>
@@ -226,15 +227,348 @@ static void runWhenTreelandConfigInitialized(TreelandConfig *config,
                      [sharedCallback] { (*sharedCallback)(); });
 }
 
-static bool hasSavedOutputState(OutputConfig *config)
+static bool hasSavedOutputModeState(OutputConfig *config)
 {
     return config && (!config->enabledIsDefaultValue()
                       || !config->widthIsDefaultValue()
                       || !config->heightIsDefaultValue()
                       || !config->refreshIsDefaultValue()
                       || !config->scaleIsDefaultValue()
-                      || !config->transformIsDefaultValue()
-                      || !config->adaptiveSyncEnabledIsDefaultValue());
+                      || !config->transformIsDefaultValue());
+}
+
+static const char *adaptiveSyncStatusName(enum wlr_output_adaptive_sync_status status)
+{
+    switch (status) {
+    case WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED:
+        return "disabled";
+    case WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED:
+        return "enabled";
+    }
+
+    return "unknown";
+}
+
+static bool isVulkanRendererActive(qw_renderer *renderer)
+{
+    return renderer && renderer->is_vk()
+        && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+}
+
+static QString outputIdFor(WOutput *output)
+{
+    if (!output || !output->nativeHandle())
+        return QStringLiteral("<unknown>");
+
+    return WallpaperManager::getOutputId(output->nativeHandle());
+}
+
+static QString dconfigSubpathForOutputId(const QString &outputId)
+{
+    if (outputId.isEmpty() || outputId == QStringLiteral("<unknown>"))
+        return QStringLiteral("<unknown>");
+
+    return QStringLiteral("/") + outputId;
+}
+
+static bool adaptiveSyncSupported(WOutput *output)
+{
+    return output && output->nativeHandle()
+        && output->nativeHandle()->adaptive_sync_supported;
+}
+
+constexpr qlonglong s_adaptiveSyncDefaultPolicyVersion = 1;
+
+struct AdaptiveSyncDecision
+{
+    bool enabled = false;
+    bool shouldCommit = false;
+    const char *reason = "missing-output-config";
+};
+
+static void migrateAdaptiveSyncDefaultRequestForVulkan(WOutput *output,
+                                                       OutputConfig *config,
+                                                       bool vulkanRenderer)
+{
+    if (!config || !vulkanRenderer)
+        return;
+
+    if (config->adaptiveSyncDefaultPolicyVersion() >= s_adaptiveSyncDefaultPolicyVersion)
+        return;
+
+    const bool oldValue = config->adaptiveSyncEnabled();
+    const bool oldDefault = config->adaptiveSyncEnabledIsDefaultValue();
+    if (!oldValue) {
+        const QString outputId = outputIdFor(output);
+        qCInfo(lcTlOutput)
+            << "Migrating adaptive sync default request"
+            << "output" << (output ? output->name() : QStringLiteral("<unknown>"))
+            << "outputId" << outputId
+            << "dconfigSubpath" << dconfigSubpathForOutputId(outputId)
+            << "oldValue" << oldValue
+            << "oldDefault" << oldDefault
+            << "policyVersion" << config->adaptiveSyncDefaultPolicyVersion()
+            << "newPolicyVersion" << s_adaptiveSyncDefaultPolicyVersion;
+        config->setAdaptiveSyncEnabled(true);
+    }
+
+    config->setAdaptiveSyncDefaultPolicyVersion(s_adaptiveSyncDefaultPolicyVersion);
+}
+
+static AdaptiveSyncDecision effectiveAdaptiveSyncDecision(OutputConfig *config, bool vulkanRenderer)
+{
+    if (!config)
+        return {};
+
+    const bool configValue = config->adaptiveSyncEnabled();
+    const bool configDefault = config->adaptiveSyncEnabledIsDefaultValue();
+    if (vulkanRenderer) {
+        if (configValue) {
+            return {
+                .enabled = true,
+                .shouldCommit = true,
+                .reason = configDefault ? "vulkan-default-enabled" : "vulkan-explicit-enabled",
+            };
+        }
+
+        if (configDefault) {
+            return {
+                .enabled = true,
+                .shouldCommit = true,
+                .reason = "vulkan-stale-default-enabled",
+            };
+        }
+
+        return {
+            .enabled = false,
+            .shouldCommit = true,
+            .reason = "vulkan-explicit-disabled",
+        };
+    }
+
+    if (configValue && !configDefault) {
+        return {
+            .enabled = true,
+            .shouldCommit = true,
+            .reason = "explicit-enabled",
+        };
+    }
+
+    if (!configValue && !configDefault) {
+        return {
+            .enabled = false,
+            .shouldCommit = true,
+            .reason = "explicit-disabled",
+        };
+    }
+
+    return {
+        .enabled = false,
+        .shouldCommit = false,
+        .reason = "non-vulkan-default-preserved",
+    };
+}
+
+static void logAdaptiveSyncDecision(WOutput *output,
+                                    OutputConfig *config,
+                                    const AdaptiveSyncDecision &decision,
+                                    bool vulkanRenderer,
+                                    const char *context)
+{
+    if (!vulkanRenderer && !decision.shouldCommit)
+        return;
+
+    const QString outputId = outputIdFor(output);
+    const auto *nativeOutput = output ? output->nativeHandle() : nullptr;
+
+    qCInfo(lcTlOutput)
+        << "Output adaptive sync decision"
+        << "output" << (output ? output->name() : QStringLiteral("<unknown>"))
+        << "outputId" << outputId
+        << "dconfigSubpath" << dconfigSubpathForOutputId(outputId)
+        << "adaptiveSyncSupported" << adaptiveSyncSupported(output)
+        << "adaptiveSyncStatus"
+        << (nativeOutput ? adaptiveSyncStatusName(nativeOutput->adaptive_sync_status) : "unknown")
+        << "context" << (context ? context : "unknown")
+        << "effective" << decision.enabled
+        << "shouldCommit" << decision.shouldCommit
+        << "reason" << decision.reason
+        << "configValue" << (config ? config->adaptiveSyncEnabled() : false)
+        << "configDefault" << (config ? config->adaptiveSyncEnabledIsDefaultValue() : false)
+        << "vulkanRenderer" << vulkanRenderer;
+}
+
+static bool outputStateRequestsAdaptiveSync(const wlr_output_state *state)
+{
+    return state
+        && (state->committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED)
+        && state->adaptive_sync_enabled;
+}
+
+static bool copyOutputStateWithAdaptiveSyncDisabled(wlr_output_state *dst,
+                                                    const wlr_output_state *src)
+{
+    if (!dst || !src)
+        return false;
+
+    wlr_output_state_init(dst);
+    if (!wlr_output_state_copy(dst, src)) {
+        wlr_output_state_finish(dst);
+        return false;
+    }
+
+    wlr_output_state_set_adaptive_sync_enabled(dst, false);
+    return true;
+}
+
+static bool testOutputStateWithAdaptiveSyncFallback(qw_output *output,
+                                                    const wlr_output_state *state,
+                                                    const char *context)
+{
+    if (!output || !state)
+        return false;
+
+    if (output->test_state(state))
+        return true;
+
+    if (!outputStateRequestsAdaptiveSync(state))
+        return false;
+
+    wlr_output_state fallbackState;
+    if (!copyOutputStateWithAdaptiveSyncDisabled(&fallbackState, state))
+        return false;
+
+    const bool ok = output->test_state(&fallbackState);
+    wlr_output_state_finish(&fallbackState);
+    if (ok) {
+        qCInfo(lcTlCore)
+            << "Adaptive sync test failed, falling back to disabled adaptive sync"
+            << "output" << output->handle()->name
+            << "adaptiveSyncSupported" << output->handle()->adaptive_sync_supported
+            << "adaptiveSyncStatus" << adaptiveSyncStatusName(output->handle()->adaptive_sync_status)
+            << "context" << (context ? context : "unknown");
+    }
+    return ok;
+}
+
+static bool commitOutputStateWithAdaptiveSyncFallback(qw_output *output,
+                                                      const wlr_output_state *state,
+                                                      const char *context)
+{
+    if (!output || !state)
+        return false;
+
+    if (output->commit_state(state))
+        return true;
+
+    if (!outputStateRequestsAdaptiveSync(state))
+        return false;
+
+    wlr_output_state fallbackState;
+    if (!copyOutputStateWithAdaptiveSyncDisabled(&fallbackState, state))
+        return false;
+
+    const bool ok = output->commit_state(&fallbackState);
+    wlr_output_state_finish(&fallbackState);
+    if (ok) {
+        if (auto *wrappedOutput = WOutput::fromHandle(output))
+            wrappedOutput->noteAdaptiveSyncFallback("adaptive-sync-commit-fallback");
+        qCInfo(lcTlCore)
+            << "Adaptive sync commit failed, falling back to disabled adaptive sync"
+            << "output" << output->handle()->name
+            << "adaptiveSyncSupported" << output->handle()->adaptive_sync_supported
+            << "adaptiveSyncStatus" << adaptiveSyncStatusName(output->handle()->adaptive_sync_status)
+            << "context" << (context ? context : "unknown");
+    }
+    return ok;
+}
+
+static bool applyVulkanAdaptiveSyncOnlyState(qw_renderer *renderer,
+                                             WOutput *output,
+                                             OutputConfig *config,
+                                             const char *context)
+{
+    const bool vulkanRenderer = isVulkanRendererActive(renderer);
+    if (!vulkanRenderer)
+        return true;
+
+    const AdaptiveSyncDecision decision =
+        effectiveAdaptiveSyncDecision(config, vulkanRenderer);
+    logAdaptiveSyncDecision(output, config, decision, vulkanRenderer, context);
+    if (!decision.shouldCommit)
+        return true;
+
+    if (!output || !output->isEnabled()) {
+        qCInfo(lcTlOutput)
+            << "Skipping adaptive sync live apply for disabled output"
+            << "output" << (output ? output->name() : QStringLiteral("<unknown>"))
+            << "context" << (context ? context : "unknown");
+        return true;
+    }
+
+    qw_output_state newState;
+    newState.set_adaptive_sync_enabled(decision.enabled);
+    if (commitOutputStateWithAdaptiveSyncFallback(output->handle(), newState, context)) {
+        const auto *nativeOutput = output->nativeHandle();
+        if (decision.enabled
+            && nativeOutput
+            && nativeOutput->adaptive_sync_supported
+            && nativeOutput->adaptive_sync_status != WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED) {
+            const QString outputId = outputIdFor(output);
+            qCInfo(lcTlOutput)
+                << "Output adaptive sync runtime remains disabled after adaptive-sync-only commit"
+                << "output" << output->name()
+                << "outputId" << outputId
+                << "dconfigSubpath" << dconfigSubpathForOutputId(outputId)
+                << "adaptiveSyncSupported" << nativeOutput->adaptive_sync_supported
+                << "adaptiveSyncStatus" << adaptiveSyncStatusName(nativeOutput->adaptive_sync_status)
+                << "reason" << decision.reason
+                << "context" << (context ? context : "unknown");
+        }
+        return true;
+    }
+
+    qCWarning(lcTlCore)
+        << "Failed to apply adaptive sync state on output"
+        << output->name()
+        << "requested" << decision.enabled
+        << "context" << (context ? context : "unknown");
+    return false;
+}
+
+static bool reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(qw_renderer *renderer,
+                                                          WOutput *output,
+                                                          OutputConfig *config,
+                                                          const AdaptiveSyncDecision &decision,
+                                                          const char *context)
+{
+    if (!isVulkanRendererActive(renderer) || !decision.enabled || !decision.shouldCommit)
+        return true;
+
+    if (!output || !output->isEnabled() || !adaptiveSyncSupported(output))
+        return true;
+
+    auto *nativeOutput = output->nativeHandle();
+    if (!nativeOutput
+        || nativeOutput->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED) {
+        return true;
+    }
+
+    const QString outputId = outputIdFor(output);
+    qCInfo(lcTlOutput)
+        << "Output adaptive sync runtime disabled after requested enable, retrying adaptive-sync-only commit"
+        << "output" << output->name()
+        << "outputId" << outputId
+        << "dconfigSubpath" << dconfigSubpathForOutputId(outputId)
+        << "adaptiveSyncSupported" << nativeOutput->adaptive_sync_supported
+        << "adaptiveSyncStatus" << adaptiveSyncStatusName(nativeOutput->adaptive_sync_status)
+        << "reason" << decision.reason
+        << "context" << (context ? context : "unknown");
+
+    return applyVulkanAdaptiveSyncOnlyState(renderer,
+                                            output,
+                                            config,
+                                            "adaptive-sync-runtime-reapply");
 }
 
 static bool outputMatchesId(Output *output, const QString &outputId)
@@ -588,7 +922,36 @@ void Helper::onOutputAdded(WOutput *output)
             m_rootSurfaceContainer->setPrimaryOutput(outputObject);
         }
 
-        if (!hasSavedOutputState(config)) {
+        const bool vulkanRenderer =
+            m_renderer && m_renderer->is_vk()
+            && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+        migrateAdaptiveSyncDefaultRequestForVulkan(output, config, vulkanRenderer);
+        const AdaptiveSyncDecision adaptiveSyncDecision =
+            effectiveAdaptiveSyncDecision(config, vulkanRenderer);
+        logAdaptiveSyncDecision(output,
+                                config,
+                                adaptiveSyncDecision,
+                                vulkanRenderer,
+                                "restore-output-config");
+
+        if (!hasSavedOutputModeState(config)) {
+            if (output->isEnabled() && adaptiveSyncDecision.shouldCommit) {
+                qw_output_state newState;
+                newState.set_adaptive_sync_enabled(adaptiveSyncDecision.enabled);
+                if (commitOutputStateWithAdaptiveSyncFallback(output->handle(),
+                                                              newState,
+                                                              "default-adaptive-sync")) {
+                    reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
+                                                                  output,
+                                                                  config,
+                                                                  adaptiveSyncDecision,
+                                                                  "default-adaptive-sync");
+                } else {
+                    qCWarning(lcTlCore)
+                        << "Failed to apply default adaptive sync state on output"
+                        << output->name();
+                }
+            }
             return;
         }
 
@@ -647,13 +1010,20 @@ void Helper::onOutputAdded(WOutput *output)
                                      height,
                                      refresh);
 
-        newState.set_adaptive_sync_enabled(config->adaptiveSyncEnabled());
+        newState.set_adaptive_sync_enabled(adaptiveSyncDecision.enabled);
         newState.set_transform(static_cast<wl_output_transform>(transform));
         newState.set_scale(scale);
-        if (!output->handle()->commit_state(newState)) {
+        if (!commitOutputStateWithAdaptiveSyncFallback(output->handle(),
+                                                       newState,
+                                                       "restore-output-config")) {
             qCCritical(lcTlCore) << "commit failed on output" << output->name();
             return;
         }
+        reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(m_renderer,
+                                                      output,
+                                                      config,
+                                                      adaptiveSyncDecision,
+                                                      "restore-output-config");
 
         if (auto *outputItem = outputObject->outputItem()) {
             QMetaObject::invokeMethod(outputItem,
@@ -668,6 +1038,43 @@ void Helper::onOutputAdded(WOutput *output)
         if (!outputConfig->isInitializeSucceeded()) {
             connect(outputConfig, &OutputConfig::configInitializeFailed, o, publishOutput);
         }
+        runWhenOutputConfigInitialized(outputConfig,
+                                       o,
+                                       [self = QPointer<Helper>(this),
+                                        outputObject = QPointer<Output>(o),
+                                        outputConfig = QPointer<OutputConfig>(outputConfig)] {
+                                           if (!self || !outputObject || !outputConfig) {
+                                               return;
+                                           }
+
+                                           connect(outputConfig,
+                                                   &OutputConfig::adaptiveSyncEnabledChanged,
+                                                   self.data(),
+                                                   [self,
+                                                    outputObject,
+                                                    outputConfig] {
+                                                       if (!self || !outputObject || !outputConfig) {
+                                                           return;
+                                                       }
+
+                                                       QMetaObject::invokeMethod(
+                                                           self.data(),
+                                                           [self,
+                                                            outputObject,
+                                                            outputConfig] {
+                                                               if (!self || !outputObject || !outputConfig) {
+                                                                   return;
+                                                               }
+
+                                                               applyVulkanAdaptiveSyncOnlyState(
+                                                                   self->m_renderer,
+                                                                   outputObject->output(),
+                                                                   outputConfig,
+                                                                   "adaptive-sync-config-changed");
+                                                           },
+                                                           Qt::QueuedConnection);
+                                                   });
+                                       });
         runWhenOutputConfigInitialized(outputConfig,
                                        o,
                                        [this,
@@ -863,7 +1270,9 @@ void Helper::onOutputTestOrApply(qw_output_configuration_v1 *config, bool onlyTe
                 newState.set_transform(static_cast<wl_output_transform>(state.transform));
                 newState.set_scale(state.scale);
             }
-            ok &= state.output->handle()->test_state(newState);
+            ok &= testOutputStateWithAdaptiveSyncFallback(state.output->handle(),
+                                                          newState,
+                                                          "output-management-test");
         }
 
         m_outputManager->sendResult(config, ok);
@@ -1063,7 +1472,9 @@ void Helper::onOutputCommitFinished(qw_output_configuration_v1 *config, bool suc
                 const qlonglong transform = output->output()->nativeHandle()->transform;
                 const double scale = state.scale;
                 const bool adaptiveSyncEnabled = state.adaptiveSyncEnabled;
-                runWhenOutputConfigInitialized(outputConfig, output, [outputConfig = QPointer<OutputConfig>(outputConfig),
+                runWhenOutputConfigInitialized(outputConfig, output, [self = QPointer<Helper>(this),
+                                                                      outputObject = QPointer<Output>(output),
+                                                                      outputConfig = QPointer<OutputConfig>(outputConfig),
                                                                       enabled,
                                                                       x,
                                                                       y,
@@ -1073,7 +1484,7 @@ void Helper::onOutputCommitFinished(qw_output_configuration_v1 *config, bool suc
                                                                       transform,
                                                                       scale,
                                                                       adaptiveSyncEnabled] {
-                    if (!outputConfig) {
+                    if (!self || !outputObject || !outputConfig) {
                         return;
                     }
 
@@ -1090,6 +1501,19 @@ void Helper::onOutputCommitFinished(qw_output_configuration_v1 *config, bool suc
                     outputConfig->setTransform(transform);
                     outputConfig->setScale(scale);
                     outputConfig->setAdaptiveSyncEnabled(adaptiveSyncEnabled);
+
+                    if (adaptiveSyncEnabled) {
+                        reapplyVulkanAdaptiveSyncIfUnexpectedDisabled(
+                            self->m_renderer,
+                            outputObject->output(),
+                            outputConfig,
+                            {
+                                .enabled = true,
+                                .shouldCommit = true,
+                                .reason = "output-management-requested-enabled",
+                            },
+                            "output-management-commit");
+                    }
                 });
             }
         }
@@ -1716,6 +2140,10 @@ void Helper::init(Treeland::Treeland *treeland)
         m_server->attach<WLinuxDrmSyncobjManagerV1>(m_renderer);
     }
 #endif
+    if (m_renderer && m_renderer->is_vk()
+        && WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan) {
+        m_server->attach<WPresentation>(m_backend);
+    }
     qw_drm::create(*m_server->handle(), *m_renderer);
 
     // free follow display

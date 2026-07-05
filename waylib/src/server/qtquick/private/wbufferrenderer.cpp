@@ -407,6 +407,11 @@ bool WBufferRenderer::currentBufferReadyForScanout() const
     return state.scanoutReady;
 }
 
+bool WBufferRenderer::lastBeginRenderSkippedForPendingPresentation() const
+{
+    return m_lastBeginRenderSkippedForPendingPresentation;
+}
+
 QRhiTexture *WBufferRenderer::currentRenderTarget() const
 {
     return getColorTextureFrom(state.sgRenderTarget.rt);
@@ -493,6 +498,7 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 {
     Q_ASSERT(!state.buffer);
     Q_ASSERT(m_output);
+    m_lastBeginRenderSkippedForPendingPresentation = false;
 
     if (pixelSize.isEmpty())
         return nullptr;
@@ -560,6 +566,26 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
     auto buffer = qw_buffer::from(wbuffer);
 
 #ifdef ENABLE_VULKAN_RENDER
+    const bool vulkanDirectPrimary =
+        WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan
+        && m_output->renderer()
+        && m_output->renderer()->is_vk()
+        && flags.testFlag(RedirectOpenGLContextDefaultFrameBufferObject)
+        && !flags.testFlag(DontConfigureSwapchain)
+        && !flags.testFlag(UseCursorFormats);
+    if (vulkanDirectPrimary && m_output->bufferAwaitingPresentation(buffer)) {
+        m_lastBeginRenderSkippedForPendingPresentation = true;
+        qCDebug(lcWlBufferRenderer)
+            << "Skipping Vulkan direct-primary render into buffer still awaiting output present"
+            << "output" << m_output->name()
+            << "buffer" << buffer
+            << "size" << buffer->handle()->width << "x" << buffer->handle()->height
+            << "locks" << buffer->lock_count();
+        buffer->unlock();
+        m_output->scheduleFrame();
+        return nullptr;
+    }
+
     if (m_textureProvider && m_textureProvider->qwBuffer() == buffer) {
         qCDebug(lcWlBufferRenderer)
             << "Vulkan RHI output cache import released before rendering into the same buffer"

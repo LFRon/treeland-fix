@@ -22,12 +22,39 @@
 #include <QCoreApplication>
 #include <QQuickWindow>
 #include <QCursor>
+#include <QByteArray>
+#include <QVector>
 
 #include <xf86drm.h>
 #include <drm_fourcc.h>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+static const char *adaptiveSyncStatusName(enum wlr_output_adaptive_sync_status status)
+{
+    switch (status) {
+    case WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED:
+        return "disabled";
+    case WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED:
+        return "enabled";
+    }
+
+    return "unknown";
+}
+
+static bool commitSeqLessOrEqual(uint32_t lhs, uint32_t rhs)
+{
+    return static_cast<int32_t>(lhs - rhs) <= 0;
+}
+
+struct PendingPresentationBuffer
+{
+    qw_buffer *buffer = nullptr;
+    uint32_t commitSeq = 0;
+    QByteArray presentPath;
+    bool fullOutputCoverage = false;
+};
 
 class Q_DECL_HIDDEN WOutputPrivate : public WWrapObjectPrivate
 {
@@ -64,6 +91,15 @@ public:
 
     WBackend *backend = nullptr;
     WOutputLayout *layout = nullptr;
+    QVector<PendingPresentationBuffer> pendingPresentationBuffers;
+    bool adaptiveSyncCommitKnown = false;
+    bool adaptiveSyncLastRequested = false;
+    QByteArray adaptiveSyncFallbackReason = QByteArrayLiteral("none");
+    bool adaptiveSyncFallbackPending = false;
+    bool lastVrrGlobalStateKnown = false;
+    bool lastVrrGlobalActive = false;
+    QByteArray lastVrrPresentPath;
+    uint32_t vrrPresentLogCounter = 0;
 };
 
 WOutput::WOutput(qw_output *handle, WBackend *backend)
@@ -94,6 +130,89 @@ WOutput::WOutput(qw_output *handle, WBackend *backend)
 
         if (event->state->committed & WLR_OUTPUT_STATE_ENABLED)
             Q_EMIT this->enabledChanged();
+
+        if (event->state->committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED) {
+            W_D(WOutput);
+            d->adaptiveSyncCommitKnown = true;
+            d->adaptiveSyncLastRequested = event->state->adaptive_sync_enabled;
+            if (event->state->adaptive_sync_enabled || !d->adaptiveSyncFallbackPending)
+                d->adaptiveSyncFallbackReason = QByteArrayLiteral("none");
+            d->adaptiveSyncFallbackPending = false;
+
+            qCInfo(lcWlOutput)
+                << "Output adaptive sync state committed"
+                << name()
+                << "requested" << event->state->adaptive_sync_enabled
+                << "status" << adaptiveSyncStatusName(nativeHandle()->adaptive_sync_status);
+        }
+    });
+    connect(handle, qOverload<wlr_output_event_present*>(&qw_output::notify_present),
+            this, [this] (wlr_output_event_present *event) {
+        W_D(WOutput);
+        const int pendingBefore = d->pendingPresentationBuffers.size();
+        int released = 0;
+        QByteArray presentPath = QByteArrayLiteral("unknown");
+        bool fullOutputCoverage = false;
+
+        for (auto it = d->pendingPresentationBuffers.begin();
+             it != d->pendingPresentationBuffers.end();) {
+            if (!commitSeqLessOrEqual(it->commitSeq, event->commit_seq)) {
+                ++it;
+                continue;
+            }
+
+            if (it->commitSeq == event->commit_seq) {
+                presentPath = it->presentPath;
+                fullOutputCoverage = it->fullOutputCoverage;
+            }
+            it = d->pendingPresentationBuffers.erase(it);
+            ++released;
+        }
+
+        if (pendingBefore > 0) {
+            qCDebug(lcWlOutputBuffer)
+                << "Output presented, releasing pending primary buffers up to commit sequence"
+                << name()
+                << "pendingBefore" << pendingBefore
+                << "released" << released
+                << "pendingBuffers" << d->pendingPresentationBuffers.size()
+                << "presented" << event->presented
+                << "commitSeq" << event->commit_seq
+                << "adaptiveSyncStatus" << adaptiveSyncStatusName(nativeHandle()->adaptive_sync_status);
+        }
+
+        const bool rendererIsVulkan = renderer() && renderer()->is_vk();
+        if (rendererIsVulkan) {
+            const bool statusEnabled =
+                nativeHandle()->adaptive_sync_status == WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED;
+            const bool requested =
+                d->adaptiveSyncCommitKnown ? d->adaptiveSyncLastRequested : statusEnabled;
+            const bool globalActive =
+                isEnabled() && statusEnabled && fullOutputCoverage;
+            const bool periodicLog = ++d->vrrPresentLogCounter % 300 == 0;
+            if (!d->lastVrrGlobalStateKnown
+                || d->lastVrrGlobalActive != globalActive
+                || d->lastVrrPresentPath != presentPath
+                || periodicLog) {
+                qCInfo(lcWlOutput)
+                    << "Output VRR global state"
+                    << "outputId" << name()
+                    << "connector" << nativeHandle()->name
+                    << "supported" << nativeHandle()->adaptive_sync_supported
+                    << "requested" << requested
+                    << "committed" << d->adaptiveSyncCommitKnown
+                    << "status" << adaptiveSyncStatusName(nativeHandle()->adaptive_sync_status)
+                    << "globalActive" << globalActive
+                    << "fullOutputCoverage" << fullOutputCoverage
+                    << "presentPath" << presentPath.constData()
+                    << "fallbackReason" << d->adaptiveSyncFallbackReason.constData()
+                    << "presented" << event->presented
+                    << "commitSeq" << event->commit_seq;
+                d->lastVrrGlobalStateKnown = true;
+                d->lastVrrGlobalActive = globalActive;
+                d->lastVrrPresentPath = presentPath;
+            }
+        }
     });
 }
 
@@ -603,6 +722,50 @@ void WOutput::setForceSoftwareCursor(bool on)
 void WOutput::scheduleFrame()
 {
     return handle()->schedule_frame();
+}
+
+void WOutput::noteBufferSubmittedForPresentation(qw_buffer *buffer, const char *presentPath)
+{
+    W_D(WOutput);
+    if (!buffer)
+        return;
+
+    const auto *nativeBuffer = buffer->handle();
+    const auto *nativeOutput = nativeHandle();
+    const bool fullOutputCoverage =
+        nativeBuffer
+        && nativeOutput
+        && nativeBuffer->width == nativeOutput->width
+        && nativeBuffer->height == nativeOutput->height;
+
+    d->pendingPresentationBuffers.append({
+        .buffer = buffer,
+        .commitSeq = nativeOutput ? nativeOutput->commit_seq : 0,
+        .presentPath = presentPath ? QByteArray(presentPath) : QByteArrayLiteral("unknown"),
+        .fullOutputCoverage = fullOutputCoverage,
+    });
+}
+
+void WOutput::noteAdaptiveSyncFallback(const char *reason)
+{
+    W_D(WOutput);
+    d->adaptiveSyncFallbackReason = reason && reason[0]
+        ? QByteArray(reason)
+        : QByteArrayLiteral("none");
+    d->adaptiveSyncFallbackPending = true;
+}
+
+bool WOutput::bufferAwaitingPresentation(qw_buffer *buffer) const
+{
+    W_DC(WOutput);
+    if (!buffer)
+        return false;
+
+    for (const auto &pending : d->pendingPresentationBuffers) {
+        if (pending.buffer == buffer)
+            return true;
+    }
+    return false;
 }
 
 WAYLIB_SERVER_END_NAMESPACE

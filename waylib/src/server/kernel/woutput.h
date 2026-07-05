@@ -24,6 +24,7 @@ QW_BEGIN_NAMESPACE
 class qw_renderer;
 class qw_swapchain;
 class qw_allocator;
+class qw_buffer;
 QW_END_NAMESPACE
 
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -106,6 +107,9 @@ public:
     void setForceSoftwareCursor(bool on);
 
     void scheduleFrame();
+    void noteBufferSubmittedForPresentation(QW_NAMESPACE::qw_buffer *buffer, const char *presentPath);
+    void noteAdaptiveSyncFallback(const char *reason);
+    bool bufferAwaitingPresentation(QW_NAMESPACE::qw_buffer *buffer) const;
 
 Q_SIGNALS:
     void enabledChanged();

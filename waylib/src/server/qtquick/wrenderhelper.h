@@ -80,6 +80,7 @@ public:
     static bool flushVulkanAcquireBatch(const char *reason);
     static void endVulkanAcquireBatch(const char *reason);
     static void beginVulkanClientReleaseBatch(QRhi *rhi);
+    static bool vulkanClientReleaseEarlyEnabled();
     static bool flushVulkanClientReleaseBatch(const char *reason);
     static void endVulkanClientReleaseBatch(const char *reason);
 

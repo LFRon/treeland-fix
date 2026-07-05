@@ -485,6 +485,18 @@ static bool vulkanClientReleaseBatchDisabledInternal()
     return disabled;
 }
 
+static bool vulkanClientReleaseEarlyEnabledInternal()
+{
+    static const bool enabled = [] {
+        QByteArray value = qgetenv("WAYLIB_VK_CLIENT_RELEASE_MODE").trimmed().toLower();
+        if (value.isEmpty())
+            value = qgetenv("TREELAND_VK_CLIENT_RELEASE_MODE").trimmed().toLower();
+
+        return value != "piggyback" && value != "output" && value != "output-release";
+    }();
+    return enabled;
+}
+
 static bool vulkanSyncFileMergeDisabledInternal()
 {
     static const bool disabled = envFlagEnabledForDiagnostics("WAYLIB_VK_DISABLE_SYNC_FILE_MERGE");
@@ -4970,6 +4982,15 @@ bool WRenderHelper::vulkanPerfDiagnosticsEnabled()
 #endif
 }
 
+bool WRenderHelper::vulkanClientReleaseEarlyEnabled()
+{
+#ifdef ENABLE_VULKAN_RENDER
+    return vulkanClientReleaseEarlyEnabledInternal();
+#else
+    return false;
+#endif
+}
+
 void WRenderHelper::noteVulkanRenderControlBeginFrame(qint64 elapsedUsec)
 {
 #ifdef ENABLE_VULKAN_RENDER
@@ -7933,7 +7954,9 @@ bool WRenderHelper::queueVulkanClientTextureRelease(QRhi *rhi,
     tokenState->newLayout = VK_IMAGE_LAYOUT_GENERAL;
     tokenState->srcQueueFamily = static_cast<uint32_t>(handles->gfxQueueFamilyIdx);
     tokenState->dstQueueFamily = VK_QUEUE_FAMILY_FOREIGN_EXT;
-    tokenState->releaseReason = QByteArrayLiteral("queued-for-output-release-piggyback");
+    tokenState->releaseReason = vulkanClientReleaseEarlyEnabledInternal()
+        ? QByteArrayLiteral("queued-for-early-client-release")
+        : QByteArrayLiteral("queued-for-output-release-piggyback");
 
     VulkanClientReleaseBatchItem item;
     item.expectedDevice = imported->device;

@@ -54,6 +54,115 @@ static bool vulkanOutputLayerCompositorDisabled()
     return disabled;
 }
 
+static const char *adaptiveSyncStatusName(enum wlr_output_adaptive_sync_status status)
+{
+    switch (status) {
+    case WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED:
+        return "disabled";
+    case WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED:
+        return "enabled";
+    }
+
+    return "unknown";
+}
+
+static bool outputStateRequestsAdaptiveSync(const wlr_output_state *state)
+{
+    return state
+        && (state->committed & WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED)
+        && state->adaptive_sync_enabled;
+}
+
+static bool copyOutputStateWithAdaptiveSyncDisabled(wlr_output_state *dst,
+                                                    const wlr_output_state *src)
+{
+    if (!dst || !src)
+        return false;
+
+    wlr_output_state_init(dst);
+    if (!wlr_output_state_copy(dst, src)) {
+        wlr_output_state_finish(dst);
+        return false;
+    }
+
+    wlr_output_state_set_adaptive_sync_enabled(dst, false);
+    return true;
+}
+
+static bool testOutputStateWithAdaptiveSyncFallback(qw_output *output,
+                                                    const wlr_output_state *state,
+                                                    const char *context)
+{
+    if (!output || !state)
+        return false;
+
+    if (output->test_state(state))
+        return true;
+
+    if (!outputStateRequestsAdaptiveSync(state))
+        return false;
+
+    wlr_output_state fallbackState;
+    if (!copyOutputStateWithAdaptiveSyncDisabled(&fallbackState, state))
+        return false;
+
+    const bool ok = output->test_state(&fallbackState);
+    wlr_output_state_finish(&fallbackState);
+    if (ok) {
+        qCInfo(lcWlOutputHelper)
+            << "Adaptive sync test failed, falling back to disabled adaptive sync"
+            << "output" << output->handle()->name
+            << "adaptiveSyncSupported" << output->handle()->adaptive_sync_supported
+            << "adaptiveSyncStatus" << adaptiveSyncStatusName(output->handle()->adaptive_sync_status)
+            << "context" << (context ? context : "unknown");
+    }
+    return ok;
+}
+
+static bool commitOutputStateWithAdaptiveSyncFallback(qw_output *output,
+                                                      const wlr_output_state *state,
+                                                      const char *context)
+{
+    if (!output || !state)
+        return false;
+
+    if (output->commit_state(state))
+        return true;
+
+    if (!outputStateRequestsAdaptiveSync(state))
+        return false;
+
+    wlr_output_state fallbackState;
+    if (!copyOutputStateWithAdaptiveSyncDisabled(&fallbackState, state))
+        return false;
+
+    const bool ok = output->commit_state(&fallbackState);
+    wlr_output_state_finish(&fallbackState);
+    if (ok) {
+        if (auto *wrappedOutput = WOutput::fromHandle(output))
+            wrappedOutput->noteAdaptiveSyncFallback("adaptive-sync-commit-fallback");
+        qCInfo(lcWlOutputHelper)
+            << "Adaptive sync commit failed, falling back to disabled adaptive sync"
+            << "output" << output->handle()->name
+            << "adaptiveSyncSupported" << output->handle()->adaptive_sync_supported
+            << "adaptiveSyncStatus" << adaptiveSyncStatusName(output->handle()->adaptive_sync_status)
+            << "context" << (context ? context : "unknown");
+    }
+    return ok;
+}
+
+static void noteCommittedBufferForPresentation(WOutput *output,
+                                               const wlr_output_state *state,
+                                               const char *presentPath)
+{
+    if (!output || !state || !(state->committed & WLR_OUTPUT_STATE_BUFFER)
+        || !state->buffer) {
+        return;
+    }
+
+    output->noteBufferSubmittedForPresentation(qw_buffer::from(state->buffer), presentPath);
+}
+
 class Q_DECL_HIDDEN WOutputHelperPrivate : public WObjectPrivate
 {
 public:
@@ -305,7 +414,9 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
         wlr_output_state_finish(&state);
         wlr_output_state_copy(&state, d->extraState.get());
 
-        const bool ok = d->qwoutput()->commit_state(&state);
+        const bool ok = commitOutputStateWithAdaptiveSyncFallback(d->qwoutput(),
+                                                                  &state,
+                                                                  "vulkan-output-layer-state-only");
         if (!ok) {
             qCCritical(lcWlVulkanCompositor)
                 << "Vulkan output-layer compositor: state-only commit failed on output"
@@ -402,7 +513,11 @@ bool WOutputHelper::commitWithVulkanOutputLayer(qw_buffer *sourceBuffer)
         << "source buffer" << sourceBuffer->handle()->width << "x" << sourceBuffer->handle()->height
         << "source locks" << sourceBuffer->handle()->n_locks;
 
-    const bool ok = d->qwoutput()->commit_state(&state);
+    const bool ok = commitOutputStateWithAdaptiveSyncFallback(d->qwoutput(),
+                                                              &state,
+                                                              "vulkan-output-layer");
+    if (ok)
+        noteCommittedBufferForPresentation(d->output, &state, "output-layer-compositor");
     if (!ok) {
         qCCritical(lcWlVulkanCompositor)
             << "Vulkan output-layer compositor: commit failed on output"
@@ -437,7 +552,11 @@ bool WOutputHelper::commit()
         wlr_output_state_copy(&state, d->extraState.get());
     }
 
-    bool ok = d->qwoutput()->commit_state(&state);
+    bool ok = commitOutputStateWithAdaptiveSyncFallback(d->qwoutput(),
+                                                        &state,
+                                                        "output-helper");
+    if (ok)
+        noteCommittedBufferForPresentation(d->output, &state, "direct-primary");
     if (!ok) {
         qCCritical(lcWlOutputHelper, "commit failed on output %s", d->qwoutput()->handle()->name);
     }
@@ -510,7 +629,9 @@ WOutputHelper::ExtraState WOutputHelper::extraState() const
 bool WOutputHelper::testCommit()
 {
     W_D(WOutputHelper);
-    return d->qwoutput()->test_state(&d->state);
+    return testOutputStateWithAdaptiveSyncFallback(d->qwoutput(),
+                                                   &d->state,
+                                                   "output-helper-test");
 }
 
 bool WOutputHelper::testCommit(qw_buffer *buffer, const wlr_output_layer_state_array &layers)
@@ -523,7 +644,9 @@ bool WOutputHelper::testCommit(qw_buffer *buffer, const wlr_output_layer_state_a
     if (!layers.isEmpty())
         wlr_output_state_set_layers(&state, const_cast<wlr_output_layer_state*>(layers.data()), layers.length());
 
-    bool ok = d->qwoutput()->test_state(&state);
+    bool ok = testOutputStateWithAdaptiveSyncFallback(d->qwoutput(),
+                                                      &state,
+                                                      "output-helper-buffer-test");
     if (state.committed & WLR_OUTPUT_STATE_BUFFER) {
         Q_ASSERT(buffer);
         buffer->unlock();

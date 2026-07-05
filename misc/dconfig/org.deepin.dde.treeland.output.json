@@ -113,15 +113,26 @@
             "visibility": "public"
         },
         "adaptiveSyncEnabled": {
-            "value": false,
-            "serial": 0,
+            "value": true,
+            "serial": 1,
             "flags": ["global"],
             "name": "Adaptive Sync Enabled",
             "name[zh_CN]": "启用自适应同步",
-            "description": "Whether adaptive sync was enabled in the last committed output state.",
-            "description[zh_CN]": "当前输出上次提交的状态是否启用了自适应同步。",
+            "description": "Whether adaptive sync should be requested for this output. Treeland falls back to disabled adaptive sync when the output or backend rejects it.",
+            "description[zh_CN]": "是否为当前输出请求启用自适应同步。当输出或后端拒绝该状态时，Treeland 会回退为关闭自适应同步。",
             "permissions": "readwrite",
             "visibility": "public"
+        },
+        "adaptiveSyncDefaultPolicyVersion": {
+            "value": 0,
+            "serial": 0,
+            "flags": ["global"],
+            "name": "Adaptive Sync Default Policy Version",
+            "name[zh_CN]": "自适应同步默认策略版本",
+            "description": "Internal migration version for the adaptive sync default request policy.",
+            "description[zh_CN]": "自适应同步默认请求策略的内部迁移版本。",
+            "permissions": "readwrite",
+            "visibility": "private"
         }
     }
 }

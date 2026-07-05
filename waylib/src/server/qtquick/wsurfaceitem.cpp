@@ -7,7 +7,9 @@
 #include "woutput.h"
 #include "woutputrenderwindow.h"
 #include "woutputviewport.h"
+#include "wpresentation.h"
 #include "wseat.h"
+#include "wserver.h"
 #include "wsgtextureprovider.h"
 #include "wsurface.h"
 #include "wsurfaceitem_p.h"
@@ -568,6 +570,26 @@ public:
     }
 #endif
 
+    inline void markPresentationTexturedOnOutput() const {
+        if (!surface || !surface->handle())
+            return;
+
+        WOutput *output = surface->framePacingOutput();
+        if (!output)
+            return;
+
+        WServer *server = output->server();
+        if (!server)
+            return;
+
+        auto *presentation = server->findInterface<WPresentation>();
+        if (!presentation)
+            return;
+
+        presentation->surfaceTexturedOnOutput(surface->handle()->handle(),
+                                              output->nativeHandle());
+    }
+
     inline void setDevicePixelRatio(qreal dpr) {
         if (dpr == devicePixelRatio)
             return;
@@ -1016,6 +1038,7 @@ QSGNode *WSurfaceItemContent::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeD
         delete oldNode;
         return nullptr;
     }
+    d->markPresentationTexturedOnOutput();
 
     auto node = dynamic_cast<QSGImageNode *>(oldNode);
     if (Q_UNLIKELY(!node)) {

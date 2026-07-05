@@ -201,6 +201,7 @@ set(SOURCES
     protocols/wxdgdialogmanagerv1.cpp
     protocols/wlinuxdmabufv1.cpp
     protocols/wlinuxdrmsyncobjv1.cpp
+    protocols/wpresentation.cpp
     protocols/wsecuritycontextmanager.cpp
     protocols/wsessionlockmanager.cpp
     protocols/wsessionlock.cpp
@@ -308,6 +309,8 @@ set(HEADERS
     protocols/WLinuxDmabufV1
     protocols/wlinuxdrmsyncobjv1.h
     protocols/WLinuxDrmSyncobjManagerV1
+    protocols/wpresentation.h
+    protocols/WPresentation
     protocols/ext_foreign_toplevel_image_capture_source_manager_v1.h #TODO: Remove after wlroots 0.20
     protocols/qwextforeigntoplevelimagecapturesourcemanagerv1.h #TODO: Move to qwlroots after wlroots 0.20
     protocols/wsecuritycontextmanager.h

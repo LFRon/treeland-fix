@@ -98,6 +98,13 @@ static bool vulkanOutputLayerCompositorDisabled()
         || envFlagEnabledForVulkanRenderer("TREELAND_VK_DISABLE_OUTPUT_LAYER_COMPOSITOR");
     return disabled;
 }
+
+static bool vulkanDirectPrimarySafeFinishEnabled()
+{
+    static const bool enabled = envFlagEnabledForVulkanRenderer("WAYLIB_VK_DIRECT_PRIMARY_SAFE_FINISH")
+        || envFlagEnabledForVulkanRenderer("TREELAND_VK_DIRECT_PRIMARY_SAFE_FINISH");
+    return enabled;
+}
 #endif
 
 // Call it before any wlroots render to clean up the GL state in Qt.
@@ -1785,6 +1792,10 @@ WOutputRenderWindowPrivate::doRenderOutputs(qw_output *needsFrameOutput, const Q
         Q_ASSERT(buffer == helper->bufferRenderer()->currentBuffer());
         if (!buffer) {
 #ifdef ENABLE_VULKAN_RENDER
+            if (helper->bufferRenderer()->lastBeginRenderSkippedForPendingPresentation()) {
+                helper->update();
+                continue;
+            }
             if (!helper->extraState() && helper->noteVulkanRenderFailed(useVulkanLayerCompositor))
                 continue;
 #endif
@@ -1904,6 +1915,38 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     }
 
 #ifdef ENABLE_VULKAN_RENDER
+    if (vulkanFrame && vulkanDirectPrimarySafeFinishEnabled()) {
+        bool hasDirectPrimaryTarget = false;
+        for (const auto &commitTarget : std::as_const(needsCommit)) {
+            if (commitTarget.second->currentBuffer()
+                && !commitTarget.first->currentVulkanRenderUsesOutputLayer()) {
+                hasDirectPrimaryTarget = true;
+                break;
+            }
+        }
+        if (hasDirectPrimaryTarget) {
+            QElapsedTimer finishTimer;
+            if (WRenderHelper::vulkanPerfDiagnosticsEnabled())
+                finishTimer.start();
+            rc()->rhi()->finish();
+            WRenderHelper::noteVulkanFinish(true,
+                                            "direct-primary-safe-finish-diagnostic",
+                                            -1,
+                                            0,
+                                            QByteArray(),
+                                            true,
+                                            false,
+                                            finishTimer.isValid()
+                                                ? finishTimer.nsecsElapsed() / 1000
+                                                : 0);
+        }
+    }
+    if (vulkanFrame && WRenderHelper::vulkanClientReleaseEarlyEnabled()) {
+        if (!WRenderHelper::flushVulkanClientReleaseBatch("before-output-release")) {
+            qCWarning(lcWlRenderHelper)
+                << "Vulkan client release batch flush failed before output release";
+        }
+    }
     for (const auto &commitTarget : std::as_const(needsCommit)) {
         WBufferRenderer *bufferRenderer = commitTarget.second;
         if (bufferRenderer->currentBuffer())

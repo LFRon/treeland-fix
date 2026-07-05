@@ -76,6 +76,7 @@ public:
     QW_NAMESPACE::qw_buffer *currentBuffer() const;
     QW_NAMESPACE::qw_buffer *lastBuffer() const;
     bool currentBufferReadyForScanout() const;
+    bool lastBeginRenderSkippedForPendingPresentation() const;
     QRhiTexture *currentRenderTarget() const;
     const QW_NAMESPACE::qw_damage_ring *damageRing() const;
     QW_NAMESPACE::qw_damage_ring *damageRing();
@@ -132,6 +133,7 @@ private:
     QW_NAMESPACE::qw_swapchain *m_swapchain = nullptr;
     WRenderHelper *m_renderHelper = nullptr;
     QPointer<QW_NAMESPACE::qw_buffer> m_lastBuffer;
+    bool m_lastBeginRenderSkippedForPendingPresentation = false;
 
     struct RenderState {
         RenderFlags flags;
