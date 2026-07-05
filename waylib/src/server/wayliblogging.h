@@ -65,6 +65,7 @@ Q_DECLARE_LOGGING_CATEGORY(lcWlOutputHelper)
 // QtQuick extras
 Q_DECLARE_LOGGING_CATEGORY(lcWlQmlCreator)
 Q_DECLARE_LOGGING_CATEGORY(lcWlQuickCursor)
+Q_DECLARE_LOGGING_CATEGORY(lcWlDetachedCursor)
 
 // Platform & Rendering
 Q_DECLARE_LOGGING_CATEGORY(lcWlPlatform)

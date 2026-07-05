@@ -17,10 +17,12 @@ OutputItem {
         id: cursorItem
 
         required property QtObject outputCursor
-        readonly property point rawPosition: parent.mapFromGlobal(cursor.position.x, cursor.position.y)
         readonly property real effectiveScale: rootOutputItem.devicePixelRatio || 1.0
         readonly property bool useCursorOutputLayer: GraphicsInfo.api !== GraphicsInfo.Vulkan
                 && GraphicsInfo.api !== GraphicsInfo.VulkanRhi
+                && !outputCursor.output.forceSoftwareCursor
+        readonly property bool useDetachedCursor: (GraphicsInfo.api === GraphicsInfo.Vulkan
+                || GraphicsInfo.api === GraphicsInfo.VulkanRhi)
                 && !outputCursor.output.forceSoftwareCursor
 
         // Align cursor position to pixel grid to prevent blur on fractional DPR displays
@@ -28,16 +30,17 @@ OutputItem {
             return Math.round(value * effectiveScale) / effectiveScale
         }
 
-        readonly property point position: Qt.point(
-            alignToPixelGrid(rawPosition.x),
-            alignToPixelGrid(rawPosition.y)
-        )
+        function cursorPosition() {
+            const rawPosition = parent.mapFromGlobal(cursor.position.x, cursor.position.y)
+            return Qt.point(alignToPixelGrid(rawPosition.x), alignToPixelGrid(rawPosition.y))
+        }
 
         cursor: outputCursor.cursor
         output: outputCursor.output.output
-        x: position.x - hotSpot.x
-        y: position.y - hotSpot.y
-        visible: valid && outputCursor.visible
+        detachedPresentation: useDetachedCursor
+        x: detachedPresentationActive ? 0 : cursorPosition().x - hotSpot.x
+        y: detachedPresentationActive ? 0 : cursorPosition().y - hotSpot.y
+        visible: !detachedPresentationActive && valid && outputCursor.visible
         OutputLayer.enabled: useCursorOutputLayer
         OutputLayer.keepLayer: true
         OutputLayer.outputs: [screenViewport]

@@ -161,6 +161,13 @@ void WOutputItemPrivate::updateCursors()
 
                 updateCursorVisible(safeOc.data());
             });
+            QObject::connect(cursor, &WCursor::visibleChanged, q, [this, safeOc] {
+                if (!safeOc) {
+                    return;
+                }
+
+                updateCursorVisible(safeOc.data());
+            });
         }
 
         tmpCursors.append(std::make_pair(cursor, oc));

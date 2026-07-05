@@ -5,6 +5,7 @@
 #include "wayliblogging.h"
 #include "woutputrenderwindow.h"
 #include "woutputitem.h"
+#include "woutput.h"
 #include "wcursorimage.h"
 #include "wsgtextureprovider.h"
 #include "wimagebuffer.h"
@@ -14,16 +15,36 @@
 
 #include <qwxcursormanager.h>
 #include <qwbuffer.h>
+#include <qwcursor.h>
+#include <qwoutput.h>
 #include <qwrenderer.h>
 #include <qwtexture.h>
 #include <qwcompositor.h>
 
+#include <QElapsedTimer>
+#include <QHash>
 #include <QSGImageNode>
+#include <QSGRendererInterface>
 #include <private/qquickitem_p.h>
 #include <private/qsgplaintexture_p.h>
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+static bool envFlagEnabled(const char *name, bool defaultValue)
+{
+    if (!qEnvironmentVariableIsSet(name))
+        return defaultValue;
+
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return !(value == "0" || value == "false" || value == "no" || value == "off");
+}
+
+static bool detachedCursorDiagnosticsEnabled()
+{
+    static const bool enabled = envFlagEnabled("WAYLIB_VK_DETACHED_CURSOR_DIAGNOSTICS", false);
+    return enabled;
+}
 
 class Q_DECL_HIDDEN CursorTextureProvider : public WSGTextureProvider
 {
@@ -246,6 +267,16 @@ public:
     void updateCursor();
     void updateImplicitSize();
     void setHotSpot(const QPoint &newHotSpot);
+    void setDetachedPresentationActive(bool active);
+    void resetDetachedFallback();
+    void updateDetachedCursor();
+    void releaseDetachedCursor();
+    bool detachedCursorAllowed() const;
+    bool cursorOnOutput() const;
+    bool takeDetachedCursorOwnership();
+    bool updateDetachedCursorImage();
+    bool updateDetachedCursorSurface();
+    void maybeLogDetachedCursorDiagnostics();
 
     inline quint32 getCursorSize() const {
         return qMax(cursorSize.width(), cursorSize.height());
@@ -264,7 +295,31 @@ public:
     QString xcursorThemeName;
     QSize cursorSize = QSize(24, 24);
     QPoint hotSpot;
+    bool detachedPresentation = false;
+    bool detachedPresentationActive = false;
+    bool detachedCursorUnavailable = false;
+    QByteArray detachedCursorFallbackReason = QByteArrayLiteral("none");
+    std::unique_ptr<qw_buffer, qw_buffer::droper> detachedCursorBuffer;
+    qint64 detachedCursorImageKey = 0;
+    QSize detachedCursorImageSize;
+    qreal detachedCursorImageDevicePixelRatio = 0;
+    QImage::Format detachedCursorImageFormat = QImage::Format_Invalid;
+    QPointer<WSurface> detachedCursorSurface;
+    QPoint detachedCursorSurfaceHotSpot;
+    QElapsedTimer detachedCursorDiagnosticsTimer;
+    quint64 detachedCursorMoveOnlyCount = 0;
+    quint64 detachedCursorBufferUpdateCount = 0;
+    quint64 detachedCursorSurfaceUpdateCount = 0;
+    quint64 detachedCursorFallbackCount = 0;
+    QMetaObject::Connection outputForceSoftwareCursorConnection;
+    QMetaObject::Connection outputScaleConnection;
 };
+
+static QHash<WCursor *, QPointer<WQuickCursor>> &detachedCursorOwners()
+{
+    static QHash<WCursor *, QPointer<WQuickCursor>> owners;
+    return owners;
+}
 
 void WQuickCursorPrivate::setHotSpot(const QPoint &newHotSpot)
 {
@@ -274,6 +329,267 @@ void WQuickCursorPrivate::setHotSpot(const QPoint &newHotSpot)
 
     W_Q(WQuickCursor);
     Q_EMIT q->hotSpotChanged();
+}
+
+void WQuickCursorPrivate::setDetachedPresentationActive(bool active)
+{
+    if (detachedPresentationActive == active)
+        return;
+
+    detachedPresentationActive = active;
+
+    W_Q(WQuickCursor);
+    Q_EMIT q->detachedPresentationActiveChanged();
+}
+
+void WQuickCursorPrivate::resetDetachedFallback()
+{
+    detachedCursorUnavailable = false;
+    detachedCursorFallbackReason = QByteArrayLiteral("none");
+}
+
+bool WQuickCursorPrivate::detachedCursorAllowed() const
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!detachedPresentation)
+        return false;
+
+    if (!envFlagEnabled("WAYLIB_VK_DETACHED_CURSOR", true))
+        return false;
+
+    if (!cursor || !output || !cursor->layout())
+        return false;
+
+    if (!cursor->isVisible())
+        return false;
+
+    if (output->forceSoftwareCursor())
+        return false;
+
+    if (WRenderHelper::getGraphicsApi() != QSGRendererInterface::Vulkan)
+        return false;
+
+    const auto renderer = output->renderer();
+    if (!renderer || !renderer->is_vk())
+        return false;
+
+    const auto nativeOutput = output->nativeHandle();
+    return nativeOutput
+        && nativeOutput->software_cursor_locks == 0;
+#else
+    return false;
+#endif
+}
+
+bool WQuickCursorPrivate::cursorOnOutput() const
+{
+    if (!cursor || !output || !output->isEnabled())
+        return false;
+
+    const QRectF outputGeometry(QPointF(output->position()),
+                                QSizeF(output->effectiveSize()));
+    return outputGeometry.contains(cursor->position());
+}
+
+bool WQuickCursorPrivate::takeDetachedCursorOwnership()
+{
+    if (!cursor)
+        return false;
+
+    W_Q(WQuickCursor);
+    auto &owners = detachedCursorOwners();
+    if (auto owner = owners.value(cursor)) {
+        if (owner == q)
+            return true;
+
+        auto ownerPrivate = WQuickCursorPrivate::get(owner);
+        if (ownerPrivate->cursorOnOutput()
+            && ownerPrivate->detachedPresentationActive) {
+            return false;
+        }
+
+        ownerPrivate->releaseDetachedCursor();
+    }
+
+    owners.insert(cursor, q);
+    return true;
+}
+
+void WQuickCursorPrivate::releaseDetachedCursor()
+{
+    W_Q(WQuickCursor);
+    if (cursor && detachedCursorOwners().value(cursor) == q) {
+        cursor->handle()->unset_image();
+        detachedCursorOwners().remove(cursor);
+    }
+
+    detachedCursorBuffer.reset();
+    detachedCursorImageKey = 0;
+    detachedCursorImageSize = {};
+    detachedCursorImageDevicePixelRatio = 0;
+    detachedCursorImageFormat = QImage::Format_Invalid;
+    detachedCursorSurface.clear();
+    detachedCursorSurfaceHotSpot = {};
+    setDetachedPresentationActive(false);
+}
+
+bool WQuickCursorPrivate::updateDetachedCursorImage()
+{
+    if (!cursor || !cursorImage)
+        return false;
+
+    const QImage image = cursorImage->image();
+    if (image.isNull())
+        return false;
+
+    const qreal imageScale = image.devicePixelRatio() > 0
+        ? image.devicePixelRatio()
+        : 1.0;
+    const bool imageChanged = detachedCursorImageKey != image.cacheKey()
+        || detachedCursorImageSize != image.size()
+        || !qFuzzyCompare(detachedCursorImageDevicePixelRatio, image.devicePixelRatio())
+        || detachedCursorImageFormat != image.format();
+
+    if (imageChanged || !detachedPresentationActive || !detachedCursorBuffer) {
+        QImage ownedImage = image.copy();
+        ownedImage.setDevicePixelRatio(image.devicePixelRatio());
+        detachedCursorBuffer.reset(qw_buffer::create(new WImageBufferImpl(ownedImage),
+                                                     ownedImage.width(),
+                                                     ownedImage.height()));
+        if (!detachedCursorBuffer)
+            return false;
+
+        detachedCursorImageKey = image.cacheKey();
+        detachedCursorImageSize = image.size();
+        detachedCursorImageDevicePixelRatio = image.devicePixelRatio();
+        detachedCursorImageFormat = image.format();
+        detachedCursorSurface.clear();
+        detachedCursorSurfaceHotSpot = {};
+
+        const QPoint logicalHotSpot(qRound(cursorImage->hotSpot().x() / imageScale),
+                                    qRound(cursorImage->hotSpot().y() / imageScale));
+        cursor->handle()->set_buffer(detachedCursorBuffer->handle(),
+                                     logicalHotSpot.x(),
+                                     logicalHotSpot.y(),
+                                     imageScale);
+        ++detachedCursorBufferUpdateCount;
+    }
+
+    return true;
+}
+
+bool WQuickCursorPrivate::updateDetachedCursorSurface()
+{
+    if (!cursor)
+        return false;
+
+    const auto requestedSurface = cursor->requestedCursorSurface();
+    WSurface *surface = requestedSurface.first;
+    if (!surface || !surface->handle())
+        return false;
+
+    if (detachedCursorSurface != surface
+        || detachedCursorSurfaceHotSpot != requestedSurface.second
+        || !detachedPresentationActive) {
+        cursor->handle()->set_surface(surface->handle()->handle(),
+                                      requestedSurface.second.x(),
+                                      requestedSurface.second.y());
+        detachedCursorSurface = surface;
+        detachedCursorSurfaceHotSpot = requestedSurface.second;
+        detachedCursorBuffer.reset();
+        detachedCursorImageKey = 0;
+        detachedCursorImageSize = {};
+        detachedCursorImageDevicePixelRatio = 0;
+        detachedCursorImageFormat = QImage::Format_Invalid;
+        ++detachedCursorSurfaceUpdateCount;
+    }
+
+    return true;
+}
+
+void WQuickCursorPrivate::updateDetachedCursor()
+{
+    if (!detachedCursorAllowed() || !cursorOnOutput()) {
+        releaseDetachedCursor();
+        maybeLogDetachedCursorDiagnostics();
+        return;
+    }
+
+    if (detachedCursorUnavailable) {
+        setDetachedPresentationActive(false);
+        maybeLogDetachedCursorDiagnostics();
+        return;
+    }
+
+    if (!takeDetachedCursorOwnership()) {
+        setDetachedPresentationActive(false);
+        maybeLogDetachedCursorDiagnostics();
+        return;
+    }
+
+    bool imageUpdated = false;
+    if (WGlobal::isClientResourceCursor(cursor->cursor())
+        && cursor->requestedCursorShape() == WGlobal::CursorShape::Invalid) {
+        imageUpdated = updateDetachedCursorSurface();
+    } else {
+        imageUpdated = updateDetachedCursorImage();
+    }
+
+    if (!imageUpdated) {
+        releaseDetachedCursor();
+        maybeLogDetachedCursorDiagnostics();
+        return;
+    }
+
+    const auto nativeOutput = output->nativeHandle();
+    const bool hardwareCursorActive = nativeOutput
+        && nativeOutput->hardware_cursor
+        && nativeOutput->hardware_cursor->enabled
+        && nativeOutput->software_cursor_locks == 0;
+    if (!hardwareCursorActive) {
+        detachedCursorUnavailable = true;
+        detachedCursorFallbackReason = QByteArrayLiteral("hardware-cursor-unavailable");
+        ++detachedCursorFallbackCount;
+        releaseDetachedCursor();
+        maybeLogDetachedCursorDiagnostics();
+        return;
+    }
+
+    setDetachedPresentationActive(true);
+    maybeLogDetachedCursorDiagnostics();
+}
+
+void WQuickCursorPrivate::maybeLogDetachedCursorDiagnostics()
+{
+    if (!detachedCursorDiagnosticsEnabled())
+        return;
+
+    if (!detachedCursorDiagnosticsTimer.isValid()) {
+        detachedCursorDiagnosticsTimer.start();
+        return;
+    }
+
+    if (detachedCursorDiagnosticsTimer.elapsed() < 1000)
+        return;
+
+    qCInfo(lcWlDetachedCursor)
+        << "Detached cursor summary"
+        << "cursor" << cursor.data()
+        << "output" << (output ? output->name() : QString())
+        << "requested" << detachedPresentation
+        << "active" << detachedPresentationActive
+        << "unavailable" << detachedCursorUnavailable
+        << "fallbackReason" << detachedCursorFallbackReason.constData()
+        << "moveOnly" << detachedCursorMoveOnlyCount
+        << "bufferUpdates" << detachedCursorBufferUpdateCount
+        << "surfaceUpdates" << detachedCursorSurfaceUpdateCount
+        << "fallbacks" << detachedCursorFallbackCount;
+
+    detachedCursorMoveOnlyCount = 0;
+    detachedCursorBufferUpdateCount = 0;
+    detachedCursorSurfaceUpdateCount = 0;
+    detachedCursorFallbackCount = 0;
+    detachedCursorDiagnosticsTimer.restart();
 }
 
 WQuickCursorPrivate::WQuickCursorPrivate(WQuickCursor *)
@@ -341,6 +657,9 @@ void WQuickCursorPrivate::setSurface(WSurface *surface)
     updateImplicitSize();
     if (q->flags().testFlag(QQuickItem::ItemHasContents))
         q->update();
+
+    resetDetachedFallback();
+    updateDetachedCursor();
 }
 
 void WQuickCursorPrivate::enterOutput(WOutput *output)
@@ -379,7 +698,10 @@ void WQuickCursorPrivate::onImageChanged()
 
     if (!cursorSurfaceItem) {
         setHotSpot(cursorImage->hotSpot());
-        q_func()->update();
+        resetDetachedFallback();
+        updateDetachedCursor();
+        if (!detachedPresentationActive)
+            q_func()->update();
     }
 }
 
@@ -412,6 +734,8 @@ void WQuickCursorPrivate::updateCursor()
     }
 
     Q_EMIT q_func()->validChanged();
+    resetDetachedFallback();
+    updateDetachedCursor();
 }
 
 void WQuickCursorPrivate::updateImplicitSize()
@@ -444,6 +768,7 @@ WQuickCursor::WQuickCursor(QQuickItem *parent)
 
 WQuickCursor::~WQuickCursor()
 {
+    d_func()->releaseDetachedCursor();
     // `d->window` will become nullptr in ~QQuickItem
     // cleanTextureProvider in ~WQuickCursorPrivate is too late
     d_func()->cleanTextureProvider();
@@ -514,6 +839,7 @@ void WQuickCursor::setCursor(WCursor *cursor)
         return;
 
     if (d->cursor) {
+        d->releaseDetachedCursor();
         Q_ASSERT(d->cursor->eventWindow() == window());
         d->cursor->setEventWindow(nullptr);
         bool ok = QObject::disconnect(d->cursor, nullptr, this, nullptr);
@@ -530,6 +856,23 @@ void WQuickCursor::setCursor(WCursor *cursor)
         Q_ASSERT(ok);
         ok = QObject::connect(d->cursor, SIGNAL(requestedCursorSurfaceChanged()),
                               this, SLOT(updateCursor()));
+        Q_ASSERT(ok);
+        ok = QObject::connect(d->cursor, &WCursor::visibleChanged,
+                              this, [d] {
+            if (!d->detachedPresentation && !d->detachedPresentationActive)
+                return;
+            d->resetDetachedFallback();
+            d->updateDetachedCursor();
+        });
+        Q_ASSERT(ok);
+        ok = QObject::connect(d->cursor, &WCursor::positionChanged,
+                              this, [d] {
+            if (!d->detachedPresentation && !d->detachedPresentationActive)
+                return;
+            if (d->detachedPresentationActive)
+                ++d->detachedCursorMoveOnlyCount;
+            d->updateDetachedCursor();
+        });
         Q_ASSERT(ok);
 
         if (isComponentComplete()) {
@@ -605,13 +948,66 @@ void WQuickCursor::setOutput(WOutput *newOutput)
     if (d->output == newOutput)
         return;
 
+    d->releaseDetachedCursor();
+    if (d->outputForceSoftwareCursorConnection)
+        QObject::disconnect(d->outputForceSoftwareCursorConnection);
+    if (d->outputScaleConnection)
+        QObject::disconnect(d->outputScaleConnection);
+
     if (isVisible()) {
         d->enterOutput(newOutput);
         d->leaveOutput(d->output);
     }
 
     d->output = newOutput;
+    if (d->output) {
+        d->outputForceSoftwareCursorConnection =
+            QObject::connect(d->output, &WOutput::forceSoftwareCursorChanged,
+                             this, [d] {
+            d->resetDetachedFallback();
+            d->updateDetachedCursor();
+        });
+        d->outputScaleConnection =
+            QObject::connect(d->output, &WOutput::scaleChanged,
+                             this, [d] {
+            d->resetDetachedFallback();
+            d->updateXCursorManager();
+            d->updateDetachedCursor();
+        });
+    }
+
     Q_EMIT outputChanged();
+    d->resetDetachedFallback();
+    d->updateDetachedCursor();
+}
+
+bool WQuickCursor::detachedPresentation() const
+{
+    W_DC(WQuickCursor);
+    return d->detachedPresentation;
+}
+
+void WQuickCursor::setDetachedPresentation(bool enabled)
+{
+    W_D(WQuickCursor);
+    if (d->detachedPresentation == enabled)
+        return;
+
+    d->detachedPresentation = enabled;
+    if (!enabled)
+        d->releaseDetachedCursor();
+    else {
+        d->resetDetachedFallback();
+        d->updateDetachedCursor();
+    }
+
+    Q_EMIT detachedPresentationChanged();
+}
+
+bool WQuickCursor::detachedPresentationActive() const
+{
+    W_DC(WQuickCursor);
+    return d->detachedPresentationActive;
 }
 
 void WQuickCursor::invalidateSceneGraph()
@@ -646,10 +1042,12 @@ void WQuickCursor::itemChange(ItemChange change, const ItemChangeData &data)
         d->updateXCursorManager();
     } else if (change == ItemVisibleHasChanged) {
         // The visible state is set by compositor(following WOutputCursor::visible property on default)
-        if (data.boolValue) {
-            d->enterOutput(d->output);
-        } else {
-            d->leaveOutput(d->output);
+        if (!d->detachedPresentationActive) {
+            if (data.boolValue) {
+                d->enterOutput(d->output);
+            } else {
+                d->leaveOutput(d->output);
+            }
         }
     }
 

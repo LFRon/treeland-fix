@@ -70,6 +70,7 @@ Q_LOGGING_CATEGORY(lcWlOutputHelper, "waylib.output.helper", QtWarningMsg) // Ou
 // QtQuick extras
 Q_LOGGING_CATEGORY(lcWlQmlCreator, "waylib.qml.creator", QtWarningMsg)     // QML component creation
 Q_LOGGING_CATEGORY(lcWlQuickCursor, "waylib.cursor.quick", QtWarningMsg)   // QtQuick cursor texture provider
+Q_LOGGING_CATEGORY(lcWlDetachedCursor, "waylib.cursor.detached", QtInfoMsg) // Backend-presented cursor diagnostics
 
 // Platform & Rendering
 Q_LOGGING_CATEGORY(lcWlPlatform, "waylib.platform", QtWarningMsg)          // QPA integration

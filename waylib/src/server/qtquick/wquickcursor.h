@@ -45,6 +45,8 @@ class WAYLIB_SERVER_EXPORT WQuickCursor : public QQuickItem
     Q_PROPERTY(QString themeName READ themeName WRITE setThemeName NOTIFY themeNameChanged)
     Q_PROPERTY(QSize sourceSize READ sourceSize WRITE setSourceSize NOTIFY sourceSizeChanged)
     Q_PROPERTY(QPointF hotSpot READ hotSpot NOTIFY hotSpotChanged FINAL)
+    Q_PROPERTY(bool detachedPresentation READ detachedPresentation WRITE setDetachedPresentation NOTIFY detachedPresentationChanged FINAL)
+    Q_PROPERTY(bool detachedPresentationActive READ detachedPresentationActive NOTIFY detachedPresentationActiveChanged FINAL)
     QML_NAMED_ELEMENT(Cursor)
     QML_ATTACHED(WQuickCursorAttached)
 
@@ -74,6 +76,10 @@ public:
     WOutput *output() const;
     void setOutput(WOutput *newOutput);
 
+    bool detachedPresentation() const;
+    void setDetachedPresentation(bool enabled);
+    bool detachedPresentationActive() const;
+
 Q_SIGNALS:
     void validChanged();
     void cursorChanged();
@@ -82,6 +88,8 @@ Q_SIGNALS:
     void currentRenderWindowChanged();
     void hotSpotChanged();
     void outputChanged();
+    void detachedPresentationChanged();
+    void detachedPresentationActiveChanged();
 
 private Q_SLOTS:
     void invalidateSceneGraph();
