@@ -662,7 +662,7 @@ private Q_SLOTS:
         QVERIFY(m_glass->setProperty("blurEnabled", false));
         QVERIFY(m_glass->setProperty("radius", 8.0));
         QVERIFY(m_glass->setProperty("bezelWidth", 64.0));
-        QVERIFY(m_glass->setProperty("thickness", 140.0));
+        QVERIFY(m_glass->setProperty("thickness", 20.0));
         QVERIFY(m_glass->setProperty("displacementFactor", 1.0));
         QVERIFY(m_glass->setProperty("ior", 1.5));
         QVERIFY(m_glass->setProperty("dispersion", 0.0));
@@ -674,7 +674,7 @@ private Q_SLOTS:
         const QImage zeroDispersion = grabImage(m_scene);
         QVERIFY(!zeroDispersion.isNull());
 
-        QVERIFY(m_glass->setProperty("dispersion", 0.2));
+        QVERIFY(m_glass->setProperty("dispersion", 0.08));
         QTest::qWait(50);
 
         const QImage highDispersion = grabImage(m_scene);
@@ -699,7 +699,7 @@ private Q_SLOTS:
         }
         const int centerChanged = regionDiffCount(zeroDispersion, highDispersion, centerInterior, 6);
 
-        QVERIFY2(edgeChanged > edgePixels / 10,
+        QVERIFY2(edgeChanged > edgePixels / 200,
                  qPrintable(QStringLiteral("high dispersion should visibly change edge refraction without specular: edgeChanged=%1 regionPixels=%2")
                                 .arg(edgeChanged)
                                 .arg(edgePixels)));

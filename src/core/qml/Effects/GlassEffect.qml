@@ -17,10 +17,10 @@ Item {
 
     // Glass material parameters (aligned with liquid-dom naming)
     property real bezelWidth: 30        // edge bevel width (px)
-    property real thickness: 50         // base glass thickness (px)
+    property real thickness: 20         // base glass thickness (px)
     property real displacementFactor: 1 // scalar on displacement
-    property real ior: 1.2              // refractive index
-    property real dispersion: 0.02     // RGB channel separation
+    property real ior: 1.5              // refractive index
+    property real dispersion: 0.08     // RGB channel separation
 
     // Colour controls — applied to the backdrop BEFORE refraction, so the
     // glass specular / rim highlights stay sharp and uncoloured.
