@@ -4,17 +4,24 @@
 import QtQuick
 import QtQuick.Effects
 import org.deepin.dtk 1.0 as D
+import Waylib.Server
+import Treeland
 
 D.BoxShadow {
     id: shadow
+
+    required property SurfaceWrapper surface
+
     readonly property rect boundingRect: Qt.rect(-shadow.shadowBlur, -shadow.shadowBlur,
                                              width + 2 * shadow.shadowBlur,
                                              height + 2 * shadow.shadowBlur)
 
+    visible: surface.shadow.radius > 0
     width: parent.width
     height: parent.height
-    shadowColor: Qt.rgba(0, 0, 0, 0.4)
-    shadowOffsetY: 10
-    shadowBlur: 40
+    shadowColor: surface.shadow.color
+    shadowOffsetX: surface.shadow.offsetX
+    shadowOffsetY: surface.shadow.offsetY
+    shadowBlur: surface.shadow.radius
     hollow: true
 }
