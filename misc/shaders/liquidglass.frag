@@ -165,8 +165,10 @@ void main()
     // exactly `bw` pixels along the straight edges!
     vec2 refractionNormal = roundedRectNormal(centered, halfSize, ubuf.radius + bw);
 
-    // Surface slope from analytical derivative, clamped to ~85°.
-    float surfaceDerivative = (inwardDistance > bw) ? 0.0 : profileResult.y;
+    // Surface slope from analytical derivative, smoothly fading to zero at the
+    // bevel boundary to avoid C0 discontinuity (sudden normal jump → jaggedness).
+    float bevelFade = 1.0 - smoothstep(bw * 0.85, bw, inwardDistance);
+    float surfaceDerivative = profileResult.y * bevelFade;
     float clampedSlope = min(surfaceDerivative, 11.43); // tan(1.4835) ≈ 85°
     vec2 surfaceSlope = refractionNormal * clampedSlope;
 
@@ -195,52 +197,57 @@ void main()
     vec3 refractedRayRed = refract(
         vec3(0.0, 0.0, -1.0), surfaceNormal,
         1.0 / max(baseIor - disp, 1.0001));
-    vec3 refractedRayGreen = refract(
-        vec3(0.0, 0.0, -1.0), surfaceNormal,
-        1.0 / baseIor);
     vec3 refractedRayBlue = refract(
         vec3(0.0, 0.0, -1.0), surfaceNormal,
         1.0 / max(baseIor + disp, 1.0001));
 
-    // Per-channel pixel displacement (zero outside the shape).
-    float displaceScale = fillMask > 0.0 ? 1.0 : 0.0;
+    // Per-channel pixel displacement. Use smoothstep on fillMask so the
+    // displacement fades to zero across the SDF antialiasing band instead
+    // of a hard binary cutoff — prevents tearing/jaggedness at the boundary,
+    // especially on rounded corners where the normal rotates rapidly.
+    float displaceScale = smoothstep(0.0, max(shapeAntialiasWidth, 1.0), fillMask);
     vec2 displacementRed = refractedRayRed.xy
         / max(-refractedRayRed.z, 0.0001)
-        * surfaceHeight * ubuf.displacementFactor * directionalOpticalStrength * displaceScale;
-    vec2 displacementGreen = refractedRayGreen.xy
-        / max(-refractedRayGreen.z, 0.0001)
         * surfaceHeight * ubuf.displacementFactor * directionalOpticalStrength * displaceScale;
     vec2 displacementBlue = refractedRayBlue.xy
         / max(-refractedRayBlue.z, 0.0001)
         * surfaceHeight * ubuf.displacementFactor * directionalOpticalStrength * displaceScale;
 
     vec2 refractedUvRed   = texCoord + displacementRed   * pixelSize;
-    vec2 refractedUvGreen = texCoord + displacementGreen * pixelSize;
     vec2 refractedUvBlue  = texCoord + displacementBlue  * pixelSize;
 
-    // Sample backdrop with refraction. Bilinear filtering smoothly blends 
-    // the small sub-pixel RGB splits into continuous cyan/red fringes.
+    // Directional dispersion: R on horizontal edges (normal.y dominant),
+    // B on vertical edges (normal.x dominant), both at corners, G never.
+    // No gate needed — displacement is ~0 in the flat interior (normal ≈ (0,0,1))
+    // so all UVs converge to texCoord and the mix is a no-op there.
+    float rWeight = abs(refractionNormal.y);
+    float bWeight = abs(refractionNormal.x);
+    vec3 centerSample = sampleBackdrop(texCoord).rgb;
     vec3 refractedColor = vec3(
-        sampleBackdrop(refractedUvRed).r,
-        sampleBackdrop(refractedUvGreen).g,
-        sampleBackdrop(refractedUvBlue).b
+        mix(centerSample.r, sampleBackdrop(refractedUvRed).r, rWeight),
+        centerSample.g,
+        mix(centerSample.b, sampleBackdrop(refractedUvBlue).b, bWeight)
     );
 
     float edgeInfluence = 1.0 - smoothstep(0.0, bw, inwardDistance);
 
     // ── Environment reflection (luminance-gated with internal dispersion) ──
-    // Edge reflections in thick curved glass exhibit color separation due to 
-    // multiple internal reflections and high curvature. We simulate this by 
+    // Edge reflections in thick curved glass exhibit color separation due to
+    // multiple internal reflections and high curvature. We simulate this by
     // applying a scaled dispersion to the reflection offset.
-    float refDisp = max(ubuf.dispersion, 0.0) * 2.0; 
+    float refDisp = max(ubuf.dispersion, 0.0) * 2.0;
     vec2 reflectedUvRed   = texCoord + normal * (ubuf.reflectionOffset * (1.0 - refDisp)) * pixelSize;
-    vec2 reflectedUvGreen = texCoord + normal * ubuf.reflectionOffset * pixelSize;
     vec2 reflectedUvBlue  = texCoord + normal * (ubuf.reflectionOffset * (1.0 + refDisp)) * pixelSize;
-
+    vec2 reflectedUvCenter = texCoord + normal * ubuf.reflectionOffset * pixelSize;
+    // Same directional weighting as refraction — no gate needed because
+    // reflectionBlend ≈ 0 in the flat interior makes reflectedColor invisible.
+    float reflRWeight = abs(normal.y);
+    float reflBWeight = abs(normal.x);
+    vec3 reflCenter = sampleBackdrop(reflectedUvCenter).rgb;
     vec3 reflectedColor = vec3(
-        sampleBackdrop(reflectedUvRed).r,
-        sampleBackdrop(reflectedUvGreen).g,
-        sampleBackdrop(reflectedUvBlue).b
+        mix(reflCenter.r, sampleBackdrop(reflectedUvRed).r, reflRWeight),
+        reflCenter.g,
+        mix(reflCenter.b, sampleBackdrop(reflectedUvBlue).b, reflBWeight)
     );
 
     vec3 glass = refractedColor;
