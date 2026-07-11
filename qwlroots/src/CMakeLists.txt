@@ -82,6 +82,7 @@ set(HEADERS
     qwsession.h
     render/qwrenderer.h
     render/qwtexture.h
+    render/qwvulkan.h
     render/qwallocator.h
     render/qwegl.h
     render/qwswapchain.h
