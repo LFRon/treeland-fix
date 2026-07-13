@@ -479,6 +479,115 @@ public:
 #endif
 
     QStack<WBufferRenderer*> rendererList;
+
+    // Dirty item info captured from QQuickWindowPrivate::dirtyItemList before
+    // rc()->sync() clears it. dirtyAttributes is captured alongside the item
+    // pointer because updateDirtyNodes() (called during sync) clears the
+    // dirtyAttributes bits, making post-sync reads unreliable.
+    //
+    // dirtyItemList, nextDirtyItem, and dirtyAttributes are public members of
+    // QQuickWindowPrivate / QQuickItemPrivate (Qt private headers). They are
+    // accessed via direct inheritance from QQuickWindowPrivate, not through
+    // offset-based macros like W_DECLARE_PRIVATE_MEMBER, so no static_assert
+    // layout fingerprint is needed — the compiler guarantees correct offsets.
+    struct DirtyItemInfo {
+        QPointer<QQuickItem> item;
+        quint32 dirtyAttributes;
+    };
+    QList<DirtyItemInfo> m_frameDirtyItems;
+
+    // Dirty attributes that require add_whole fallback: the item's previous
+    // geometry cannot be determined before sync clears the scene graph, so
+    // stale content at the old position would be missed. TransformUpdateMask
+    // covers TransformOrigin/Transform/BasicTransform/Position/Window; Size
+    // covers width/height changes; ParentChanged covers reparenting.
+    static constexpr quint32 kFallbackDirtyAttributes =
+        QQuickItemPrivate::TransformUpdateMask
+        | QQuickItemPrivate::Size
+        | QQuickItemPrivate::ParentChanged;
+
+    // Collect current dirty items from QQuickWindowPrivate::dirtyItemList.
+    // Must be called before rc()->sync(), which clears the list and
+    // dirtyAttributes.
+    void collectDirtyItems() {
+        m_frameDirtyItems.clear();
+        QQuickItem *item = dirtyItemList;
+        while (item) {
+            auto priv = QQuickItemPrivate::get(item);
+            m_frameDirtyItems.append({item, priv->dirtyAttributes});
+            item = priv->nextDirtyItem;
+        }
+    }
+
+    // Compute per-output damage region (in output logical coordinates) from
+    // the captured dirty items. Returns an empty region if no dirty items
+    // intersect the output, signalling the caller to fall back to add_whole.
+    QRegion computeOutputDamage(OutputHelper *helper) {
+        QRegion damage;
+        auto vp = helper->output();
+        for (const auto &info : std::as_const(m_frameDirtyItems)) {
+            auto item = info.item.data();
+            if (!item || !item->parentItem())
+                continue;
+            // If the item moved or resized, its previous geometry also needs
+            // to be damaged, but we cannot determine it before sync. Fall
+            // back to add_whole for this output.
+            if (info.dirtyAttributes & kFallbackDirtyAttributes)
+                return QRegion();
+            QRectF itemRect(0, 0, item->width(), item->height());
+            if (!itemRect.isValid())
+                continue;
+            QRectF outputRect = vp->mapToOutput(item, itemRect);
+            if (!outputRect.isValid() || outputRect.isEmpty())
+                continue;
+            damage += outputRect.toAlignedRect();
+        }
+        return damage;
+    }
+
+    // Mark only outputs whose area intersects a dirty item, instead of
+    // unconditionally marking all outputs. Returns false to signal the
+    // caller to fall back to full update (empty list, or moved/resized/
+    // reparented items whose old position is unknown). Returns true
+    // otherwise — either outputs were marked, or dirty items did not
+    // intersect any output (nothing to render, suppress full update).
+    bool updateDirtyOutputs() {
+        if (outputs.isEmpty() || !dirtyItemList)
+            return false;
+
+        // If any item moved, resized, or reparented, its previous position
+        // may have been on a different output. Since we cannot determine the
+        // old position before sync, fall back to updating all outputs.
+        QQuickItem *checkItem = dirtyItemList;
+        while (checkItem) {
+            auto priv = QQuickItemPrivate::get(checkItem);
+            if (priv->dirtyAttributes & kFallbackDirtyAttributes)
+                return false;
+            checkItem = priv->nextDirtyItem;
+        }
+
+        QQuickItem *item = dirtyItemList;
+        while (item) {
+            QRectF itemRect(0, 0, item->width(), item->height());
+            for (OutputHelper *helper : std::as_const(outputs)) {
+                if (helper->contentIsDirty())
+                    continue;
+                // Skip 0x0 items — they have no visible area to damage.
+                if (!itemRect.isValid() || itemRect.isEmpty())
+                    continue;
+                QRectF outputRect = helper->output()->mapToOutput(item, itemRect);
+                if (outputRect.isValid() && !outputRect.isEmpty())
+                    helper->update();
+            }
+            item = QQuickItemPrivate::get(item)->nextDirtyItem;
+        }
+
+        // We always return true here: either some outputs were marked
+        // (targeted update suffices), or the dirty items do not intersect
+        // any output (nothing to render). Full update is only triggered by
+        // the early-return false paths above (empty list or moved items).
+        return true;
+    }
 };
 
 WOutputRenderWindowPrivate *OutputHelper::renderWindowD() const
@@ -1303,14 +1412,17 @@ void WOutputRenderWindowPrivate::init()
     6. QQuickRenderControlPrivate::maybeUpdate
     7. QQuickRenderControl::sceneChanged
     */
-    // TODO: Get damage regions from the Qt, and use WOutputDamage::add instead of WOutput::update.
     QObject::connect(rc(), &QQuickRenderControl::renderRequested,
                      q, qOverload<>(&WOutputRenderWindow::update));
     QObject::connect(rc(), &QQuickRenderControl::sceneChanged,
                      q, [q, this] {
         if (inRendering)
             return;
-        q->update();
+        // Mark only outputs whose area intersects a dirty item, instead
+        // of unconditionally updating all outputs. Falls back to full
+        // update when items moved/resized/reparented or no output matched.
+        if (!updateDirtyOutputs())
+            q->update();
     });
 
     // for WSeat::filterUnacceptedEvent
@@ -1488,6 +1600,11 @@ WOutputRenderWindowPrivate::doRenderOutputs(qw_output *needsFrameOutput, const Q
                                                 WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject);
         Q_ASSERT(buffer == helper->bufferRenderer()->currentBuffer());
         if (buffer) {
+            // Set per-output frame damage for the RHI path. This replaces the
+            // previous m_damageRing.add_whole() with a region derived from
+            // QQuickWindowPrivate dirty items. The software path ignores this
+            // field and uses flushRegion() instead.
+            helper->bufferRenderer()->state.frameDamage = computeOutputDamage(helper);
             helper->render(helper->bufferRenderer(), 0, renderMatrix,
                            helper->output()->effectiveSourceRect(),
                            helper->output()->targetRect(),
@@ -1544,6 +1661,10 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     }
 
     rc()->polishItems();
+
+    // Capture dirty items before sync clears QQuickWindowPrivate::dirtyItemList.
+    // Used by computeOutputDamage() to set per-output damage on the damage ring.
+    collectDirtyItems();
 
     if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
         rc()->beginFrame();

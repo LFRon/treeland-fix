@@ -402,6 +402,10 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
         }
     } else {
         state.dirty = QRegion();
+        // Clear per-frame damage; will be set by WOutputRenderWindowPrivate
+        // before render() if dirty items are available. Remains empty for
+        // layer renderers, causing add_whole() fallback in render().
+        state.frameDamage = QRegion();
 
         Q_ASSERT(rtd->type == QQuickRenderTargetPrivate::Type::RhiRenderTarget);
         sgRT.rt = rtd->u.rhiRt;
@@ -577,8 +581,26 @@ void WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
 
     { // after render
         if (!softwareRenderer) {
-            // TODO: get damage area from QRhi renderer
-            m_damageRing.add_whole();
+            // Use the per-frame damage region collected from QQuickWindowPrivate
+            // dirty items (set by WOutputRenderWindowPrivate before render) to
+            // replace the previous add_whole() call. frameDamage is in output
+            // logical coordinates; scale by DPR to get pixel coordinates.
+            if (state.frameDamage.isEmpty()) {
+                m_damageRing.add_whole();
+            } else {
+                const auto scaleTF = QTransform::fromScale(devicePixelRatio, devicePixelRatio);
+                QRegion pixelDamage = scaleTF.map(state.frameDamage);
+                pixelDamage &= QRect(QPoint(0, 0), state.pixelSize);
+                if (pixelDamage.isEmpty()) {
+                    m_damageRing.add_whole();
+                } else {
+                    WPixmanRegion damage;
+                    if (WTools::toPixmanRegion(pixelDamage, damage))
+                        m_damageRing.add(damage);
+                    else
+                        m_damageRing.add_whole();
+                }
+            }
             // ###: maybe Qt bug? Before executing QRhi::endOffscreenFrame, we may
             // use the same QSGRenderer for multiple drawings. This can lead to
             // rendering the same content for different QSGRhiRenderTarget instances

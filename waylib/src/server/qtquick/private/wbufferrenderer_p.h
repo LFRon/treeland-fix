@@ -143,6 +143,10 @@ private:
         QQuickRenderTarget renderTarget;
         QSGRenderTarget sgRenderTarget;
         QRegion dirty;
+        // Per-frame damage region in output logical coordinates,
+        // computed from QQuickWindowPrivate dirty items. Used by the
+        // RHI render path to replace add_whole() on the damage ring.
+        QRegion frameDamage;
     } state;
 
     QPointer<WOutput> m_output;
