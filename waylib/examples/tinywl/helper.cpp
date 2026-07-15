@@ -1,4 +1,4 @@
-// Copyright (C) 2023 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "helper.h"
@@ -338,7 +338,7 @@ void Helper::init()
 
     // for xwayland
     auto *xwaylandOutputManager = m_server->attach<WXdgOutputManager>(m_surfaceContainer->outputLayout());
-    xwaylandOutputManager->setScaleOverride(1.0);
+    xwaylandOutputManager->setOutputScale(1.0);
 
     auto xwayland_lazy = true;
     m_xwayland = m_server->attach<WXWayland>(m_compositor, xwayland_lazy);

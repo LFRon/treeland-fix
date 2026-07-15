@@ -1903,6 +1903,12 @@ bool WOutputRenderWindow::inRendering() const
     return d->inRendering;
 }
 
+qreal WOutputRenderWindow::effectiveDevicePixelRatio() const
+{
+    Q_D(const WOutputRenderWindow);
+    return d->platformWindow ? d->platformWindow->devicePixelRatio() : 1.0;
+}
+
 void WOutputRenderWindow::setRenderEnabled(bool enabled) {
     Q_D(WOutputRenderWindow);
     d->renderEnabled = enabled;

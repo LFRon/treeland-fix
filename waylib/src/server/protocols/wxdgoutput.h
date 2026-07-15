@@ -1,4 +1,4 @@
-// Copyright (C) 2024 Lu YaNing <luyaning@uniontech.org>.
+// Copyright (C) 2024-2026 Lu YaNing <luyaning@uniontech.org>.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #pragma once
@@ -19,14 +19,14 @@ public:
 
     WOutputLayout *layout() const;
 
-    void setScaleOverride(qreal scaleOverride);
-    qreal scaleOverride() const;
-    void resetScaleOverride();
+    void setOutputScale(qreal outputScale);
+    qreal outputScale() const;
+    void resetOutputScale();
 
     QByteArrayView interfaceName() const override;
 
 Q_SIGNALS:
-    void scaleOverrideChanged();
+    void outputScaleChanged();
 
 protected:
     void create(WServer *wserver) override;
