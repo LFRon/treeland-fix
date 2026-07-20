@@ -7,6 +7,7 @@
 #include "common/treelandlogging.h"
 #include "seat/helper.h"
 #include "seat/seatsmanager.h"
+#include "core/shellhandler.h"
 
 #include <winputdevice.h>
 #include <woutput.h>
@@ -17,6 +18,8 @@
 #include <wxdgpopupsurface.h>
 
 #include <qwoutput.h>
+#include <WInputMethodHelper>
+
 #include <qwseat.h>
 #include <qwxdgshell.h>
 
@@ -330,12 +333,37 @@ void SeatSurfaceManager::dismissPopups()
 
 void SeatSurfaceManager::onKeyboardGrabBegin()
 {
-
     if (m_hasPopupGrab) {
-        // Already tracking; nested popups reuse the same grab.
+        // Already tracking a popup grab; nested popups share the same flag.
         return;
     }
-    // TODO(rewine): Should the impact of IME and drag be considered?
+
+    auto *seatNative = m_seat->nativeHandle();
+    auto *grab = seatNative->keyboard_state.grab;
+    if (!grab) {
+        qCWarning(lcTlPopupFocus) << "keyboard_state.grab is null";
+        return;
+    }
+
+    // Detect IME keyboard grab:
+    // WInputMethodHelper::handleNewKGV2 sets activeKeyboardGrab before
+    // calling keyboard_start_grab, so it is already non-null when we get here.
+    // Use isActiveKeyboardGrabOwner() to check if the seat's current grab
+    // is the one installed by the IME helper.
+    if (auto *imHelper = Helper::instance()->shellHandler()->inputMethodHelper()) {
+        if (imHelper->isActiveKeyboardGrabOwner()) {
+            qCDebug(lcTlPopupFocus) << "IME keyboard grab started (not popup)";
+            return;
+        }
+    }
+
+    // Detect DnD drag keyboard grab:
+    // wlr_seat_start_drag() sets seat->drag before calling wlr_seat_keyboard_start_grab(),
+    // and for drag grabs, grab->data points to the wlr_drag which equals seat->drag.
+    if (seatNative->drag && grab->data == static_cast<void *>(seatNative->drag)) {
+        qCDebug(lcTlPopupFocus) << "Drag keyboard grab started (not popup)";
+        return;
+    }
 
     m_hasPopupGrab = true;
     qCDebug(lcTlPopupFocus) << "Popup keyboard grab started";
