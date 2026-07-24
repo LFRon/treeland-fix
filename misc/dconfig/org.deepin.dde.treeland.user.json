@@ -613,8 +613,8 @@
             "flags": [],
             "name": "Glass Refraction Max Tangent",
             "name[zh_CN]": "玻璃折射最大正切值",
-            "description": "Cap on the geometric surface slope tangent near the silhouette. Lower values reduce edge distortion. Range: 0.1-10.0.",
-            "description[zh_CN]": "轮廓附近几何表面斜率正切值的上限。值越小边缘变形越小。范围：0.1-10.0。",
+            "description": "Cap on the geometric surface slope tangent near the silhouette. Lower values reduce edge distortion. Range: 0.1-20.0.",
+            "description[zh_CN]": "轮廓附近几何表面斜率正切值的上限。值越小边缘变形越小。范围：0.1-20.0。",
             "permissions": "readwrite",
             "visibility": "public"
         },

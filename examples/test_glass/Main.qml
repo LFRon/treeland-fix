@@ -261,7 +261,7 @@ Item {
                             Column {
                                 spacing: 2
                                 Label { text: "max tan " + root.glassRefractionMaxTan.toFixed(2); color: "white" }
-                                Slider { from: 0.5; to: 6; stepSize: 0.05; value: root.glassRefractionMaxTan; onMoved: root.glassRefractionMaxTan = value }
+                                Slider { from: 0.5; to: 20; stepSize: 0.05; value: root.glassRefractionMaxTan; onMoved: root.glassRefractionMaxTan = value }
                             }
                             Column {
                                 spacing: 2
