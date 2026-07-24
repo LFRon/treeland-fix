@@ -1,7 +1,7 @@
 # Copyright (C) 2026 UnionTech Software Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
-find_package(Qt6 COMPONENTS Quick QuickControls2 ShaderTools REQUIRED)
+find_package(Qt6 COMPONENTS Quick QuickControls2 Quick3D ShaderTools REQUIRED)
 qt_standard_project_setup(REQUIRES 6.4)
 
 if(QT_KNOWN_POLICY_QTP0001) # this policy was introduced in Qt 6.5
@@ -73,6 +73,8 @@ target_link_libraries(treeland_stub PUBLIC
 # ── test_glass executable ────────────────────────────────────────────────
 add_executable(test_glass
     main.cpp
+    glassgeometry.cpp
+    glassgeometry.h
 )
 qt_add_qml_module(test_glass
     URI GlassExample
@@ -92,6 +94,7 @@ target_link_libraries(test_glass
     PRIVATE
     Qt6::Quick
     Qt6::QuickControls2
+    Qt6::Quick3D
     treeland_stub
     PkgConfig::PIXMAN
     PkgConfig::WAYLAND
