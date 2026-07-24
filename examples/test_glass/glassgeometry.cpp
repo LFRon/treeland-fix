@@ -24,6 +24,24 @@ static float clampFloat(float value, float lo, float hi)
     return std::max(lo, std::min(value, hi));
 }
 
+static float profileHeight(float t, float power)
+{
+    const float p = std::max(power, 1.0f);
+    const float s = clampFloat(t, 0.0f, 1.0f);
+    const float inside = 1.0f - std::pow(1.0f - s, p);
+    return std::pow(std::max(inside, 0.0f), 1.0f / p);
+}
+
+static QVector3D normalFromProfile(const QVector2D &direction, float t, float power, float thickness, float bezel)
+{
+    const float eps = 0.01f;
+    const float h0 = profileHeight(clampFloat(t - eps, 0.0f, 1.0f), power) * thickness;
+    const float h1 = profileHeight(clampFloat(t + eps, 0.0f, 1.0f), power) * thickness;
+    const float slope = (h1 - h0) / std::max(2.0f * eps * bezel, 1.0f);
+    return QVector3D(-direction.x() * slope, -direction.y() * slope, 1.0f).normalized();
+}
+
+
 static std::vector<QVector2D> roundedRectOutline(float width, float height, float radius)
 {
     const float hx = std::max(width * 0.5f, 1.0f);
@@ -71,33 +89,80 @@ void GlassGeometry::rebuild()
 {
     const float w = std::max(float(m_width), 1.0f);
     const float h = std::max(float(m_height), 1.0f);
-    const float zTop = std::max(float(m_thickness), 1.0f) * 0.5f;
-    const float zBottom = -zTop;
-    const auto outline = roundedRectOutline(w, h, float(m_radius));
+    const float thickness = std::max(float(m_thickness), 1.0f);
+    const float zBottom = -thickness * 0.5f;
+    const float zTop = thickness * 0.5f;
+    const float bezel = clampFloat(float(m_bezelWidth), 1.0f, std::min(w, h) * 0.5f - 1.0f);
+    const float radius = clampFloat(float(m_radius), 0.0f, std::min(w, h) * 0.5f - 1.0f);
+    const float edgeLift = std::min(thickness * 0.08f, bezel * 0.25f);
+    const int rings = 16;
+    const auto outerOutline = roundedRectOutline(w, h, radius);
+    const int pointsPerRing = int(outerOutline.size());
 
     std::vector<Vertex> vertices;
     std::vector<quint32> indices;
-    vertices.reserve(outline.size() * 2 + 2);
+    std::vector<quint32> ringStarts;
+    vertices.reserve(pointsPerRing * (rings + 1) + 2);
+    ringStarts.reserve(rings + 1);
 
-    const quint32 topCenter = quint32(vertices.size());
-    vertices.push_back({ QVector3D(0, 0, zTop), QVector3D(0, 0, 1), QVector2D(0.5f, 0.5f) });
     const quint32 bottomCenter = quint32(vertices.size());
     vertices.push_back({ QVector3D(0, 0, zBottom), QVector3D(0, 0, -1), QVector2D(0.5f, 0.5f) });
 
-    const quint32 topStart = quint32(vertices.size());
-    for (const QVector2D &p : outline)
-        vertices.push_back({ QVector3D(p.x(), p.y(), zTop), QVector3D(0, 0, 1), QVector2D((p.x() / w) + 0.5f, (p.y() / h) + 0.5f) });
-
     const quint32 bottomStart = quint32(vertices.size());
-    for (const QVector2D &p : outline)
-        vertices.push_back({ QVector3D(p.x(), p.y(), zBottom), QVector3D(0, 0, -1), QVector2D((p.x() / w) + 0.5f, (p.y() / h) + 0.5f) });
+    for (const QVector2D &p : outerOutline) {
+        vertices.push_back({ QVector3D(p.x(), p.y(), zBottom),
+                             QVector3D(0, 0, -1),
+                             QVector2D((p.x() / w) + 0.5f, (p.y() / h) + 0.5f) });
+    }
 
-    const int n = int(outline.size());
-    for (int i = 0; i < n; ++i) {
-        const int j = (i + 1) % n;
-        indices.insert(indices.end(), { topCenter, topStart + quint32(i), topStart + quint32(j) });
+    for (int ring = 0; ring < rings; ++ring) {
+        const float ringT = float(ring) / float(rings - 1);
+        const float inset = bezel * ringT;
+        const float ringWidth = std::max(w - inset * 2.0f, 2.0f);
+        const float ringHeight = std::max(h - inset * 2.0f, 2.0f);
+        const float ringRadius = std::max(radius - inset, 0.0f);
+        const float z = zBottom + edgeLift + profileHeight(ringT, float(m_profilePower)) * (thickness - edgeLift);
+        const auto outline = roundedRectOutline(ringWidth, ringHeight, ringRadius);
+        ringStarts.push_back(quint32(vertices.size()));
+
+        for (const QVector2D &p : outline) {
+            QVector2D direction(p.x() / std::max(w * 0.5f, 1.0f), p.y() / std::max(h * 0.5f, 1.0f));
+            if (!direction.isNull())
+                direction.normalize();
+            vertices.push_back({ QVector3D(p.x(), p.y(), z),
+                                 normalFromProfile(direction, ringT, float(m_profilePower), thickness, bezel),
+                                 QVector2D((p.x() / w) + 0.5f, (p.y() / h) + 0.5f) });
+        }
+    }
+
+    const quint32 topCenter = quint32(vertices.size());
+    vertices.push_back({ QVector3D(0, 0, zTop), QVector3D(0, 0, 1), QVector2D(0.5f, 0.5f) });
+
+    for (int i = 0; i < pointsPerRing; ++i) {
+        const int j = (i + 1) % pointsPerRing;
         indices.insert(indices.end(), { bottomCenter, bottomStart + quint32(j), bottomStart + quint32(i) });
-        indices.insert(indices.end(), { topStart + quint32(i), bottomStart + quint32(i), bottomStart + quint32(j), topStart + quint32(i), bottomStart + quint32(j), topStart + quint32(j) });
+    }
+
+    for (int i = 0; i < pointsPerRing; ++i) {
+        const int j = (i + 1) % pointsPerRing;
+        indices.insert(indices.end(), { bottomStart + quint32(j), bottomStart + quint32(i), ringStarts[0] + quint32(i) });
+        indices.insert(indices.end(), { bottomStart + quint32(j), ringStarts[0] + quint32(i), ringStarts[0] + quint32(j) });
+    }
+
+    for (int ring = 0; ring < rings - 1; ++ring) {
+        const quint32 current = ringStarts[ring];
+        const quint32 next = ringStarts[ring + 1];
+        for (int i = 0; i < pointsPerRing; ++i) {
+            const int j = (i + 1) % pointsPerRing;
+            indices.insert(indices.end(), { current + quint32(i), next + quint32(i), next + quint32(j) });
+            indices.insert(indices.end(), { current + quint32(i), next + quint32(j), current + quint32(j) });
+        }
+    }
+
+    const quint32 inner = ringStarts.back();
+    for (int i = 0; i < pointsPerRing; ++i) {
+        const int j = (i + 1) % pointsPerRing;
+        indices.insert(indices.end(), { topCenter, inner + quint32(i), inner + quint32(j) });
     }
 
     QByteArray vertexData(reinterpret_cast<const char *>(vertices.data()), qsizetype(vertices.size() * sizeof(Vertex)));
