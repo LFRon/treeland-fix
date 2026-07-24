@@ -5,6 +5,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import QtQuick3D
 import Waylib.Server
 import GlassExample
 import Treeland
@@ -36,6 +37,15 @@ Item {
     property real glassContrast: 0.0
     property real glassSaturation: 0.04
     property bool advancedExpanded: false
+    property bool preview3DEnabled: false
+    property real previewYaw: 0
+    property real previewPitch: 0
+
+    function resetPreview3D() {
+        previewYaw = 0
+        previewPitch = 0
+    }
+
 
     Shortcut {
         sequences: [StandardKey.Quit]
@@ -159,6 +169,10 @@ Item {
                             Button {
                                 text: root.glassMode ? "Switch to Blur" : "Switch to Glass"
                                 onClicked: root.glassMode = !root.glassMode
+                            }
+                            Button {
+                                text: root.preview3DEnabled ? "2D Effect" : "3D Preview"
+                                onClicked: root.preview3DEnabled = !root.preview3DEnabled
                             }
                             Button {
                                 text: "Grab Glass"
@@ -393,6 +407,7 @@ Item {
 
             MouseArea {
                 anchors.fill: parent
+                enabled: !root.preview3DEnabled
                 drag.target: effectPanel
                 drag.axis: Drag.XAndYAxis
                 drag.minimumX: 0
@@ -403,7 +418,7 @@ Item {
 
             Loader {
                 anchors.fill: parent
-                sourceComponent: root.glassMode ? globalGlassComponent : globalBlurComponent
+                sourceComponent: root.preview3DEnabled ? glass3DComponent : (root.glassMode ? globalGlassComponent : globalBlurComponent)
             }
 
             Component {
@@ -434,6 +449,94 @@ Item {
                         brightness: root.glassBrightness
                         contrast: root.glassContrast
                         saturation: root.glassSaturation
+                    }
+                }
+            }
+
+            Component {
+                id: glass3DComponent
+
+                Item {
+                    anchors.fill: parent
+
+                    View3D {
+                        id: view3d
+                        anchors.fill: parent
+                        camera: camera3d
+                        environment: SceneEnvironment {
+                            clearColor: "transparent"
+                            backgroundMode: SceneEnvironment.Transparent
+                        }
+
+                        PerspectiveCamera {
+                            id: camera3d
+                            z: Math.max(root.effectWidth, root.effectHeight) * 2.0
+                        }
+
+                        DirectionalLight {
+                            eulerRotation.x: -35
+                            eulerRotation.y: 35
+                            brightness: 2.0
+                        }
+
+                        Model {
+                            id: glassModel3d
+                            eulerRotation.x: root.previewPitch
+                            eulerRotation.y: root.previewYaw
+                            geometry: GlassGeometry {
+                                width: root.effectWidth
+                                height: root.effectHeight
+                                radius: root.effectRadius
+                                bezelWidth: root.glassBezelWidth
+                                thickness: root.glassThickness
+                                profilePower: root.glassProfilePower
+                            }
+                            materials: PrincipledMaterial {
+                                baseColor: Qt.rgba(0.75, 0.9, 1.0, Math.max(0.18, 0.62 - root.glassTint))
+                                alphaMode: PrincipledMaterial.Blend
+                                specularAmount: Math.max(0.0, Math.min(1.0, root.glassSpecular))
+                                roughness: 0.12
+                                cullMode: PrincipledMaterial.NoCulling
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        radius: 4
+                        color: "#66000000"
+                        border.color: "#55ffffff"
+                        width: angleLabel.implicitWidth + 16
+                        height: angleLabel.implicitHeight + 10
+
+                        Text {
+                            id: angleLabel
+                            anchors.centerIn: parent
+                            color: "white"
+                            font.pixelSize: 12
+                            text: "yaw " + root.previewYaw.toFixed(1) + "°  pitch " + root.previewPitch.toFixed(1) + "°"
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        property real lastX: 0
+                        property real lastY: 0
+                        onPressed: mouse => {
+                            lastX = mouse.x
+                            lastY = mouse.y
+                        }
+                        onPositionChanged: mouse => {
+                            if (!pressed)
+                                return
+                            root.previewYaw += (mouse.x - lastX) * 0.45
+                            root.previewPitch = Math.max(-75, Math.min(75, root.previewPitch + (mouse.y - lastY) * 0.45))
+                            lastX = mouse.x
+                            lastY = mouse.y
+                        }
+                        onDoubleClicked: root.resetPreview3D()
                     }
                 }
             }
