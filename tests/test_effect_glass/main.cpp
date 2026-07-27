@@ -153,6 +153,8 @@ private:
             "smallRadiusSoftensRefractionAtSilhouette",
             "smallRadiusCapsWholeRefractionBand",
             "contentEdgePullChangesSilhouetteRefraction",
+            "refractionMaxTanAboveOneChangesEdgeRefraction",
+            "refractionMaxTanChangesExpandingCornerRefraction",
             "radiusLargerThanBezelDoesNotIntroduceCornerDiagonalSeam",
             "tintControlChangesRenderedColor",
             "zeroBlurMultiplierStillAppliesGaussianBlur",
@@ -697,6 +699,73 @@ private Q_SLOTS:
                  qPrintable(QStringLiteral("contentEdgePull must visibly change silhouette refraction: changed=%1 regionPixels=%2")
                                 .arg(changed)
                                 .arg(rightEdgeBand.width() * rightEdgeBand.height())));
+    }
+
+    void refractionMaxTanAboveOneChangesEdgeRefraction()
+    {
+        setSmallRadiusLargeBezel();
+        m_glass->setProperty("contentRampEnd", 0.15);
+        m_glass->setProperty("contentEdgePull", 1.0);
+        m_glass->setProperty("refractionMaxTan", 1.0);
+        QTest::qWait(50);
+
+        const QImage cappedAtOne = grabImage(m_scene);
+        QVERIFY(!cappedAtOne.isNull());
+
+        m_glass->setProperty("refractionMaxTan", 20.0);
+        QTest::qWait(50);
+
+        const QImage cappedAtTwenty = grabImage(m_scene);
+        QVERIFY(!cappedAtTwenty.isNull());
+
+        const QRect rightEdgeBand(cappedAtTwenty.width() - 56, 32, 48, 192);
+        const int changed = regionDiffCount(cappedAtOne, cappedAtTwenty, rightEdgeBand, 4);
+        m_glass->setProperty("contentEdgePull", 0.0);
+        m_glass->setProperty("refractionMaxTan", 2.75);
+        QTest::qWait(50);
+        QVERIFY2(changed > rightEdgeBand.width() * rightEdgeBand.height() / 8,
+                 qPrintable(QStringLiteral("refractionMaxTan above 1 must visibly change edge refraction: changed=%1 regionPixels=%2")
+                                .arg(changed)
+                                .arg(rightEdgeBand.width() * rightEdgeBand.height())));
+    }
+
+    void refractionMaxTanChangesExpandingCornerRefraction()
+    {
+        m_scene->setProperty("fineCornerProbeVisible", true);
+        setSmallRadiusLargeBezel();
+        m_glass->setProperty("contentRampEnd", 0.15);
+        m_glass->setProperty("contentEdgePull", 1.0);
+        m_glass->setProperty("ior", 1.0001);
+        m_glass->setProperty("refractionMaxTan", 2.75);
+        QTest::qWait(50);
+
+        const QImage neutral = grabImage(m_scene);
+        QVERIFY(!neutral.isNull());
+
+        m_glass->setProperty("ior", 1.45);
+        QTest::qWait(50);
+
+        const QImage defaultMaxTan = grabImage(m_scene);
+        QVERIFY(!defaultMaxTan.isNull());
+
+        m_glass->setProperty("refractionMaxTan", 20.0);
+        QTest::qWait(50);
+
+        const QImage highMaxTan = grabImage(m_scene);
+        QVERIFY(!highMaxTan.isNull());
+
+        const QRect topRightCorner(highMaxTan.width() - 56, 0, 56, 56);
+        const int defaultCoverage = regionDiffCount(neutral, defaultMaxTan, topRightCorner, 4);
+        const int highCoverage = regionDiffCount(neutral, highMaxTan, topRightCorner, 4);
+        m_scene->setProperty("fineCornerProbeVisible", false);
+        m_glass->setProperty("contentEdgePull", 0.0);
+        m_glass->setProperty("refractionMaxTan", 2.75);
+        QTest::qWait(50);
+        QVERIFY2(highCoverage > defaultCoverage + topRightCorner.width() * topRightCorner.height() / 8,
+                 qPrintable(QStringLiteral("refractionMaxTan must expand covered radius<bezel corner area: default=%1 high=%2 regionPixels=%3")
+                                .arg(defaultCoverage)
+                                .arg(highCoverage)
+                                .arg(topRightCorner.width() * topRightCorner.height())));
     }
 
     void radiusLargerThanBezelDoesNotIntroduceCornerDiagonalSeam()

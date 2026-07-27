@@ -169,7 +169,10 @@ void main()
         n2 = roundedRectNormal(p, halfSize, outerRadius);
     }
 
-    if (expandingCorners && t >= 1.0 && (ubuf.specular <= 1e-4 || distFromEdge >= 5.0)) {
+    float maxTan = max(ubuf.refractionMaxTan, 0.1);
+    float cornerRefractionScale = expandingCorners ? max(maxTan / 2.75, 1.0) : 1.0;
+
+    if (expandingCorners && t >= cornerRefractionScale && (ubuf.specular <= 1e-4 || distFromEdge >= 5.0)) {
         vec3 color = sampleBg(texCoord);
         if (ubuf.tint > 1e-4)
             color = mix(color, vec3(1.0), clamp(ubuf.tint, 0.0, 1.0));
@@ -178,7 +181,7 @@ void main()
         return;
     }
 
-    vec2 profile = surfaceProfile(t);
+    vec2 profile = surfaceProfile(clamp(t / cornerRefractionScale, 0.0, 1.0));
     float h = profile.x;
 
     float thick = max(ubuf.thickness, 0.0);
@@ -190,14 +193,13 @@ void main()
     float outerSoft = smoothstep(0.0, max(2.5 * edgeAA, 2.5), distFromEdge);
     float slopeSoft = mix(outerSoft, 1.0, edgePull);
     float rawTan = profile.y * (thick / localBezel);
-    float maxTan = max(ubuf.refractionMaxTan, 0.1);
     float slopeMag = min(rawTan, maxTan) * slopeSoft;
 
     float H = h * thick;
 
     float rampEnd = clamp(ubuf.contentRampEnd, 0.05, 1.0);
     float contentRamp = mix(edgePull, 1.0, smoothstep(0.0, rampEnd, t));
-    float maxDisp = min(min(bezel * 0.85, thick * 0.75), 48.0);
+    float maxDisp = min(min(bezel * 0.85, thick * 0.75), 48.0) * max(maxTan / 2.75, 1.0);
 
     float iorG = max(ubuf.ior, 1.0001);
 
