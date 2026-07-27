@@ -56,9 +56,11 @@ void MultitaskViewPlugin::toggleMultitaskView(IMultitaskView::ActiveReason reaso
             updatePartialFactor(1.0);
     } else {
         if (reason == IMultitaskView::Gesture) {
+            // Already in the gesture preview phase: only the first enter() may have
+            // happened, subsequent updates flow through updatePartialFactor().
             if (m_multitaskview->status() == Multitaskview::Exited) {
                 m_multitaskview->exit(nullptr);
-            } else {
+            } else if (qFuzzyIsNull(m_multitaskview->partialFactor())) {
                 m_multitaskview->enter(static_cast<Multitaskview::ActiveReason>(reason));
             }
         } else {
@@ -92,5 +94,12 @@ void MultitaskViewPlugin::immediatelyExit()
 {
     if (m_multitaskview) {
         m_multitaskview->exit(nullptr, true);
+    }
+}
+
+void MultitaskViewPlugin::commitGesture(bool triggered)
+{
+    if (m_multitaskview) {
+        m_multitaskview->commitGesture(triggered);
     }
 }

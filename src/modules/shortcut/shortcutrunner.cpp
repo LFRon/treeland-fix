@@ -186,7 +186,8 @@ void ShortcutRunner::onActionProgress(ShortcutAction action, qreal progress, con
         auto helper = Helper::instance();
         if (!helper->m_multitaskView)
             break;
-        if (helper->currentMode() == Helper::CurrentMode::Normal) {
+        if (helper->currentMode() == Helper::CurrentMode::Normal
+            && qFuzzyIsNull(helper->m_multitaskView->partialFactor())) {
             helper->m_multitaskView->toggleMultitaskView(IMultitaskView::ActiveReason::Gesture);
         }
         if (qFuzzyCompare(helper->m_multitaskView->partialFactor(), 1.0)) {
@@ -224,11 +225,11 @@ void ShortcutRunner::onActionFinish(ShortcutAction action, const QString &name, 
         auto helper = Helper::instance();
         if (!helper->m_multitaskView)
             break;
-        if (!isTriggered)
-            helper->m_multitaskView->setStatus(IMultitaskView::Exited);
-        else
-            helper->m_multitaskView->setStatus(IMultitaskView::Active);
+        const bool triggered = helper->m_multitaskView->partialFactor() > 0.5;
+        helper->m_multitaskView->setStatus(triggered ? IMultitaskView::Active
+                                                    : IMultitaskView::Exited);
         helper->m_multitaskView->toggleMultitaskView(IMultitaskView::ActiveReason::Gesture);
+        helper->m_multitaskView->commitGesture(triggered);
         break;
     }
     case ShortcutAction::CloseMultiTaskView:
@@ -236,11 +237,11 @@ void ShortcutRunner::onActionFinish(ShortcutAction action, const QString &name, 
         auto helper = Helper::instance();
         if (!helper->m_multitaskView || helper->currentMode() == Helper::CurrentMode::Normal)
             break;
-        if (!isTriggered)
-            helper->m_multitaskView->setStatus(IMultitaskView::Active);
-        else
-            helper->m_multitaskView->setStatus(IMultitaskView::Exited);
+        const bool triggered = (1.0 - helper->m_multitaskView->partialFactor()) > 0.5;
+        helper->m_multitaskView->setStatus(triggered ? IMultitaskView::Exited
+                                                    : IMultitaskView::Active);
         helper->m_multitaskView->toggleMultitaskView(IMultitaskView::ActiveReason::Gesture);
+        helper->m_multitaskView->commitGesture(!triggered);
         break;
     }
     default:

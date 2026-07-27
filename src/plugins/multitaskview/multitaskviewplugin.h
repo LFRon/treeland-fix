@@ -42,6 +42,7 @@ public:
     void updatePartialFactor(qreal progress) override;
     void toggleMultitaskView(IMultitaskView::ActiveReason reason) override;
     void immediatelyExit() override;
+    void commitGesture(bool triggered) override;
 
 private:
     QQuickItem *createMultitaskview(QQuickItem *parent);

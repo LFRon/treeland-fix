@@ -65,11 +65,18 @@ Q_SIGNALS:
 public Q_SLOTS:
     void exit(SurfaceWrapper *surface = nullptr, bool immediately = false);
     void enter(ActiveReason reason);
+    // Commit a touchpad gesture decision: triggered=true commits the entry,
+    // triggered=false lets the gesture bounce back. This is the single place
+    // where the global CurrentMode transitions to/from Multitaskview for the
+    // gesture path; the existing enter()/exit() slots are unchanged for
+    // shortcut-key callers.
+    void commitGesture(bool triggered);
 
 private:
     Status m_status;
     ActiveReason m_activeReason;
     qreal m_partialFactor{ 0.0 };
+    bool m_gestureCommitted{ false };
 };
 
 class MultitaskviewSurfaceModel : public QAbstractListModel
