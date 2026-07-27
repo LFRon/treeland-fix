@@ -33,10 +33,9 @@ Multitaskview::Status Multitaskview::status() const
 
 void Multitaskview::setStatus(Status status)
 {
-    if (status == m_status)
-        return;
-    m_status = status;
-    Q_EMIT statusChanged();
+    if (status != m_status)
+        m_status = status;
+    Q_EMIT actionFinished();
 }
 
 Multitaskview::ActiveReason Multitaskview::activeReason() const
@@ -57,9 +56,9 @@ qreal Multitaskview::partialFactor() const
     return m_partialFactor;
 }
 
-void Multitaskview::updatePartialFactor(qreal delta)
+void Multitaskview::updatePartialFactor(qreal progress)
 {
-    qreal newPartialFactor = qBound(0.0, m_partialFactor + delta, 1.0);
+    qreal newPartialFactor = qBound(0.0, progress, 1.0);
     if (qFuzzyCompare(newPartialFactor, m_partialFactor))
         return;
     m_partialFactor = newPartialFactor;

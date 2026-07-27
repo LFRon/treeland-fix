@@ -18,7 +18,7 @@ class Multitaskview : public QQuickItem
 {
     Q_OBJECT
     QML_ELEMENT
-    Q_PROPERTY(Status status READ status NOTIFY statusChanged FINAL)
+    Q_PROPERTY(Status status READ status NOTIFY actionFinished FINAL)
     Q_PROPERTY(ActiveReason activeReason READ activeReason NOTIFY activeReasonChanged FINAL)
     Q_PROPERTY(qreal partialFactor READ partialFactor NOTIFY partialFactorChanged FINAL)
 
@@ -57,7 +57,7 @@ public:
     void setActiveReason(ActiveReason activeReason);
 
 Q_SIGNALS:
-    void statusChanged();
+    void actionFinished();
     void activeReasonChanged();
     void partialFactorChanged();
     void aboutToExit(); // Focus has been updated, waiting for exit

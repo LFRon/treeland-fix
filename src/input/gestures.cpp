@@ -250,14 +250,7 @@ void GestureRecognizer::updateSwipeGesture(const QPointF &delta)
             std::remove_if(m_activeSwipeGestures.begin(),
                            m_activeSwipeGestures.end(),
                            [direction](SwipeGesture *g) {
-                               if (g->direction() != direction) {
-                                   if (!g->minimumXIsRelevant() || !g->maximumXIsRelevant()
-                                       || !g->minimumYIsRelevant() || !g->maximumYIsRelevant()) {
-                                       Q_EMIT g->cancelled();
-                                       return true;
-                                   }
-                               }
-                               return false;
+                               return g->direction() != direction;
                            }),
             m_activeSwipeGestures.end());
     }
