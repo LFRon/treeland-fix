@@ -225,6 +225,7 @@ private Q_SLOTS:
         QCOMPARE(m_glass->property("radius").toReal(), 60.0);
         QCOMPARE(m_glass->property("thickness").toReal(), 50.0);
         QCOMPARE(m_glass->property("bezelWidth").toReal(), 60.0);
+        QCOMPARE(m_glass->property("virtualRadius").toReal(), -1.0);
         QCOMPARE(m_glass->property("ior").toReal(), 1.5);
         QCOMPARE(m_glass->property("specular").toReal(), 0.0);
         QCOMPARE(m_glass->property("tint").toReal(), 0.0);
@@ -300,6 +301,7 @@ private Q_SLOTS:
             "blurMultiplier",
             "blurMax",
             "bezelWidth",
+            "virtualRadius",
             "thickness",
             "ior",
             "brightness",
@@ -314,6 +316,7 @@ private Q_SLOTS:
         }
 
         QVERIFY(m_glass->setProperty("bezelWidth", 47.0));
+        QVERIFY(m_glass->setProperty("virtualRadius", 30.0));
         QVERIFY(m_glass->setProperty("thickness", 133.0));
         QVERIFY(m_glass->setProperty("ior", 1.37));
         QVERIFY(m_glass->setProperty("blurEnabled", true));
@@ -323,6 +326,7 @@ private Q_SLOTS:
         QTest::qWait(10);
 
         QCOMPARE(shader->property("bezelWidth").toReal(), 47.0);
+        QCOMPARE(shader->property("virtualRadius").toReal(), 30.0);
         QCOMPARE(shader->property("thickness").toReal(), 133.0);
         QCOMPARE(shader->property("ior").toReal(), 1.37);
         QCOMPARE(m_glass->property("multiEffectEnabled").toBool(), true);

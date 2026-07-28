@@ -486,6 +486,17 @@
             "permissions": "readwrite",
             "visibility": "public"
         },
+        "glassVirtualRadius": {
+            "value": -1.0,
+            "serial": 0,
+            "flags": [],
+            "name": "Glass Virtual Radius",
+            "name[zh_CN]": "玻璃虚拟圆角半径",
+            "description": "Virtual corner radius in pixels used for Liquid Glass optical sampling. -1 follows glassBezel, which keeps the optical field smooth when the visible radius is smaller than the bevel width. Range: -1.0-200.0.",
+            "description[zh_CN]": "液态玻璃光学采样使用的虚拟圆角半径（像素）。-1 表示跟随 glassBezel，可在可见圆角半径小于倒角宽度时保持光学场平滑。范围：-1.0-200.0。",
+            "permissions": "readwrite",
+            "visibility": "public"
+        },
         "glassThickness": {
             "value": 50,
             "serial": 0,

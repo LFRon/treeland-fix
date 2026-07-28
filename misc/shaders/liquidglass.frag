@@ -13,6 +13,7 @@ layout(std140, binding = 0) uniform buf {
     vec2 lightDirection;
     float radius;
     float bezelWidth;
+    float virtualRadius;
     float thickness;
     float ior;
     float specular;
@@ -75,20 +76,87 @@ float getFieldT(vec2 p, vec2 halfSize, float outerRadius, float bezel)
 vec4 expandingCornerBezelField(vec2 p, vec2 halfSize, float outerRadius, float bezel)
 {
     float t = getFieldT(p, halfSize, outerRadius, bezel);
-    
+
     float eps = 0.5;
     float tx = getFieldT(p + vec2(eps, 0.0), halfSize, outerRadius, bezel);
     float tnx = getFieldT(p - vec2(eps, 0.0), halfSize, outerRadius, bezel);
     float ty = getFieldT(p + vec2(0.0, eps), halfSize, outerRadius, bezel);
     float tny = getFieldT(p - vec2(0.0, eps), halfSize, outerRadius, bezel);
-    
+
     vec2 grad = vec2(tx - tnx, ty - tny) / (2.0 * eps);
     float gradLen = length(grad);
-    
+
     float localBezel = gradLen > 1e-5 ? 1.0 / gradLen : bezel;
     vec2 normal = gradLen > 1e-5 ? -(grad / gradLen) : roundedRectNormal(p, halfSize, outerRadius);
-    
+
     return vec4(t, localBezel, normal);
+}
+
+float actualCornerOuterDistance(vec2 u, float rr, float extent)
+{
+    float best = 1e6;
+    if (u.y < -1e-5) {
+        float t = extent / -u.y;
+        float x = extent + u.x * t;
+        if (x >= rr - 1e-4)
+            best = min(best, t);
+    }
+    if (u.x < -1e-5) {
+        float t = extent / -u.x;
+        float y = extent + u.y * t;
+        if (y >= rr - 1e-4)
+            best = min(best, t);
+    }
+    if (rr > 1e-5) {
+        vec2 center = vec2(extent - rr);
+        float bq = 2.0 * dot(u, center);
+        float cq = dot(center, center) - rr * rr;
+        float disc = bq * bq - 4.0 * cq;
+        if (disc >= 0.0) {
+            float t0 = (-bq - sqrt(disc)) * 0.5;
+            float t1 = (-bq + sqrt(disc)) * 0.5;
+            vec2 d0 = vec2(extent) + u * t0;
+            vec2 d1 = vec2(extent) + u * t1;
+            if (t0 > 1e-5 && d0.x <= rr + 1e-4 && d0.y <= rr + 1e-4)
+                best = min(best, t0);
+            if (t1 > 1e-5 && d1.x <= rr + 1e-4 && d1.y <= rr + 1e-4)
+                best = min(best, t1);
+        }
+    }
+    return max(best, 1e-4);
+}
+
+float resolveVirtualRadius(float value, float bezel, vec2 halfSize)
+{
+    float requested = value >= 0.0 ? value : bezel;
+    return clamp(requested, 0.0, min(halfSize.x, halfSize.y));
+}
+
+vec2 warpBetweenRadiiPoint(vec2 p, vec2 halfSize, float fromRadius, float toRadius, float bezel)
+{
+    float fromR = clamp(fromRadius, 0.0, min(halfSize.x, halfSize.y));
+    float toR = clamp(toRadius, 0.0, min(halfSize.x, halfSize.y));
+    if (abs(fromR - toR) <= 1e-4)
+        return p;
+
+    float extent = clamp(max(max(max(bezel, fromR), toR), 1.0),
+                         1.0,
+                         max(min(halfSize.x, halfSize.y), 1.0));
+    vec2 signP = vec2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+    vec2 d = halfSize - abs(p);
+    if (d.x >= extent || d.y >= extent)
+        return p;
+
+    vec2 v = d - vec2(extent);
+    float rho = length(v);
+    if (rho <= 1e-5)
+        return p;
+
+    vec2 u = v / rho;
+    float fromOuter = actualCornerOuterDistance(u, fromR, extent);
+    float toOuter = actualCornerOuterDistance(u, toR, extent);
+    vec2 qd = vec2(extent) + v * (toOuter / fromOuter);
+    return signP * (halfSize - qd);
 }
 
 vec2 surfaceProfile(float t)
@@ -135,10 +203,13 @@ void main()
     float outerRadius = min(max(ubuf.radius, 0.0), min(halfSize.x, halfSize.y));
     float maxSizeBezel = max(min(halfSize.x, halfSize.y) - 1.0, 1.0);
     float sizeLimitedBezel = min(configuredBezel, maxSizeBezel);
-    
-    bool expandingCorners = outerRadius < sizeLimitedBezel;
+    float opticalRadius = resolveVirtualRadius(ubuf.virtualRadius, sizeLimitedBezel, halfSize);
+    bool geometryWarp = abs(outerRadius - opticalRadius) > 1e-4;
+    vec2 shadePoint = geometryWarp ? warpBetweenRadiiPoint(p, halfSize, outerRadius, opticalRadius, sizeLimitedBezel) : p;
+    vec2 baseUv = shadePoint / size + 0.5;
+
+    bool expandingCorners = opticalRadius < sizeLimitedBezel;
     float effectExtent = expandingCorners ? sizeLimitedBezel * 1.5 : sizeLimitedBezel;
-    
     if (ubuf.specular > 1e-4)
         effectExtent = max(effectExtent, 5.0);
 
@@ -158,15 +229,16 @@ void main()
 
     if (expandingCorners) {
         bezel = sizeLimitedBezel;
-        vec4 field = expandingCornerBezelField(p, halfSize, outerRadius, bezel);
+        vec4 field = expandingCornerBezelField(shadePoint, halfSize, opticalRadius, bezel);
         t = field.x;
         localBezel = field.y;
         n2 = field.zw;
     } else {
         bezel = sizeLimitedBezel;
-        t = clamp(distFromEdge / bezel, 0.0, 1.0);
+        float opticalDistFromEdge = -sdRoundedRect(shadePoint, halfSize, opticalRadius);
+        t = clamp(opticalDistFromEdge / bezel, 0.0, 1.0);
         localBezel = bezel;
-        n2 = roundedRectNormal(p, halfSize, outerRadius);
+        n2 = roundedRectNormal(shadePoint, halfSize, opticalRadius);
     }
 
     float maxTan = max(ubuf.refractionMaxTan, 0.1);
@@ -213,7 +285,7 @@ void main()
     vec2 inward = -n2;
     vec2 offG = inward * magG;
 
-    vec2 uvG = clamp(texCoord + offG / size, vec2(0.002), vec2(0.998));
+    vec2 uvG = clamp(baseUv + offG / size, vec2(0.002), vec2(0.998));
     vec3 color = sampleBg(uvG);
 
 

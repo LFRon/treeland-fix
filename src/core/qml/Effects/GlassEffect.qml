@@ -14,6 +14,7 @@ Item {
     property real radius: 60
     property real thickness: 50
     property real bezelWidth: 60
+    property real virtualRadius: -1.0
     property real ior: 1.5
     property real specular: 0.0
     property real tint: 0.0
@@ -73,6 +74,7 @@ Item {
         readonly property vector2d lightDirection: effect.lightDirection
         readonly property real radius: effect.radius
         readonly property real bezelWidth: effect.bezelWidth
+        readonly property real virtualRadius: effect.virtualRadius
         readonly property real thickness: effect.thickness
         readonly property real ior: effect.ior
         readonly property real specular: Math.max(0, Math.min(1, effect.specular))

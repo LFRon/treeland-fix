@@ -46,6 +46,7 @@ RenderBufferBlitter {
             blurAmount: blitter.blurAmount
             blurMultiplier: blitter.multiplier
             bezelWidth: Helper.config.glassBezel
+            virtualRadius: Helper.config.glassVirtualRadius
             thickness: Helper.config.glassThickness
             ior: Helper.config.glassIor
             specular: blitter.glassSpecular
