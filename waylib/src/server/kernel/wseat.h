@@ -80,6 +80,7 @@ public:
     WSurface *requestedCursorSurface() const;
     QPoint requestedCursorSurfaceHotspot() const;
     WSurface *requestedDragSurface() const;
+    void setCursorShape(WGlobal::CursorShape shape);
 
     void attachInputDevice(WInputDevice *device);
     void detachInputDevice(WInputDevice *device);

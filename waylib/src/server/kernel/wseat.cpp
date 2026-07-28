@@ -833,6 +833,11 @@ WSurface *WSeat::requestedDragSurface() const
     return d->dragSurface;
 }
 
+void WSeat::setCursorShape(WGlobal::CursorShape shape)
+{
+    setCursorShape(nullptr, shape);
+}
+
 void WSeat::attachInputDevice(WInputDevice *device)
 {
     Q_ASSERT(!device->seat());
