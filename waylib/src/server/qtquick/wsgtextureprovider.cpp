@@ -86,8 +86,12 @@ public:
     WSGTextureProviderPrivate(WSGTextureProvider *qq, WOutputRenderWindow *window)
         : WObjectPrivate(qq)
         , window(window)
-        , vulkanRhi(window && window->rhi()
-                    && window->rhi()->backend() == QRhi::Vulkan)
+        , vulkanRhi(window
+                    && ((window->rhi()
+                         && window->rhi()->backend() == QRhi::Vulkan)
+                        || (!window->rhi()
+                            && QQuickWindow::graphicsApi()
+                                == QSGRendererInterface::Vulkan)))
     {
         qtTexture.setOwnsTexture(false);
         qtTexture.setFiltering(smooth ? QSGTexture::Linear
@@ -191,6 +195,38 @@ public:
 
     void cleanTexture()
     {
+        if (!isVulkanRhi()) {
+            if (rhiTexture) {
+                Q_ASSERT(window);
+                class TextureCleanupJob : public QRunnable
+                {
+                public:
+                    explicit TextureCleanupJob(QRhiTexture *texture)
+                        : texture(texture)
+                    {
+                    }
+
+                    void run() override
+                    {
+                        texture->deleteLater();
+                    }
+
+                    QRhiTexture *texture;
+                };
+
+                // Preserve the established GLES2/Pixman cleanup point.
+                window->scheduleRenderJob(new TextureCleanupJob(rhiTexture),
+                                          QQuickWindow::AfterSynchronizingStage);
+                rhiTexture = nullptr;
+            }
+
+            if (ownsTexture && texture)
+                delete texture;
+            texture = nullptr;
+            ownsTexture = false;
+            return;
+        }
+
         auto oldRhiTexture = rhiTexture;
         auto oldTexture = texture;
         const bool oldOwnsTexture = ownsTexture;
@@ -290,6 +326,20 @@ public:
         return true;
     }
 
+    void updateLegacyRhiTexture()
+    {
+        Q_ASSERT(texture);
+        const bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture);
+        if (Q_UNLIKELY(!ok)) {
+            qCWarning(lcWlQtQuickTexture) << "Failed to make texture:" << texture
+                                          << ", width height:" << texture->handle()->width
+                                          << texture->handle()->height;
+            return;
+        }
+
+        rhiTexture = qtTexture.rhiTexture();
+    }
+
     W_DECLARE_PUBLIC(WSGTextureProvider)
 
     QPointer<WOutputRenderWindow> window;
@@ -299,6 +349,7 @@ public:
     qw_texture *texture = nullptr;
     bool ownsTexture = false;
     BufferRef buffer;
+    qw_buffer *legacyBuffer = nullptr;
 
     // qt resources
     QSGPlainTexture qtTexture;
@@ -323,8 +374,8 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 {
     W_D(WSGTextureProvider);
 
-    if (buffer == qwBuffer()) {
-        if (!d->isVulkanRhi()) {
+    if (!d->isVulkanRhi()) {
+        if (buffer == d->legacyBuffer) {
             // Preserve the established GLES2/Pixman same-buffer behavior.
             // The buffer object is unchanged, but its content may have changed.
             if (buffer)
@@ -332,6 +383,37 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
             return;
         }
 
+        d->cleanTexture();
+        d->legacyBuffer = buffer;
+
+        if (buffer) {
+            Q_ASSERT(d->window);
+            if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
+                // Acquire texture from client buffer. wlroots already generate texture for us if this is a client buffer.
+                // By the way, there is something wrong with getting texture from a client buffer using wlr_texture_from_buffer,
+                // See: https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/3897
+                // Possible patch:  https://gitlab.freedesktop.org/wlroots/wlroots/-/merge_requests/4889
+                d->texture = qw_texture::from(clientBuffer->handle()->texture);
+                d->ownsTexture = false;
+            } else {
+                d->texture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
+                d->ownsTexture = true;
+            }
+            if (Q_UNLIKELY(!d->texture)) {
+                qCWarning(lcWlQtQuickTexture) << "Failed to update texture from buffer:" << buffer
+                                              << ", width height:" << buffer->handle()->width
+                                              << buffer->handle()->height
+                                              << ", n_locks:" << buffer->handle()->n_locks;
+            } else {
+                d->updateLegacyRhiTexture();
+            }
+        }
+
+        Q_EMIT textureChanged();
+        return;
+    }
+
+    if (buffer == d->buffer.get()) {
         if (!buffer)
             return;
 
@@ -364,108 +446,73 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 
     Q_ASSERT(d->window);
 
-    if (d->isVulkanRhi()) {
-        BufferRef candidateBuffer;
-        candidateBuffer.reset(buffer);
+    BufferRef candidateBuffer;
+    candidateBuffer.reset(buffer);
 
-        qw_texture *candidateTexture = nullptr;
-        bool candidateOwnsTexture = false;
-        if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
-            // wlroots owns and updates client textures. Qt only wraps the
-            // resulting VkImage for read-only sampling.
-            candidateTexture = qw_texture::from(clientBuffer->texture());
-        } else {
-            candidateTexture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
-            candidateOwnsTexture = true;
-        }
+    qw_texture *candidateTexture = nullptr;
+    bool candidateOwnsTexture = false;
+    if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
+        // wlroots owns and updates client textures. Qt only wraps the
+        // resulting VkImage for read-only sampling.
+        candidateTexture = qw_texture::from(clientBuffer->texture());
+    } else {
+        candidateTexture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
+        candidateOwnsTexture = true;
+    }
 
-        if (Q_UNLIKELY(!candidateTexture)) {
-            qCWarning(lcWlQtQuickTexture) << "Failed to update texture from buffer:" << buffer
-                                        << ", width height:" << buffer->handle()->width
-                                        << buffer->handle()->height
-                                        << ", n_locks:" << buffer->handle()->n_locks;
-            return;
-        }
-
-        WVulkanTrace::providerBind(this, d->window, candidateBuffer.get(), candidateTexture);
-        QSGPlainTexture candidateQtTexture;
-        if (!d->updateRhiTexture(candidateTexture, candidateBuffer.get(), &candidateQtTexture)) {
-            WVulkanTrace::providerDiscard(this, d->window, candidateTexture,
-                                          "qt-wrap-failed");
-            if (candidateOwnsTexture)
-                delete candidateTexture;
-            return;
-        }
-
-        // Immediately prepare new texture for sampling if we're in an active render frame.
-        // This is critical for textures created during updatePaintNode() (e.g., cursor textures)
-        // which would otherwise miss the prepareTextureSamplingForRenderPass() call that
-        // happens before renderNextFrame().
-        const bool prepareOk = d->window->prepareTextureForCurrentRenderPass(candidateTexture,
-                                                                             "setbuffer-immediate");
-        if (!prepareOk) {
-            qCWarning(lcWlQtQuickTexture)
-                << "Immediate texture preparation failed; keeping the previous Vulkan texture"
-                << "provider" << this
-                << "qwTexture" << candidateTexture
-                << "wlrTexture" << candidateTexture->handle();
-            WVulkanTrace::providerDiscard(this, d->window, candidateTexture,
-                                          "sampling-prepare-failed");
-            auto *candidateRhiTexture = candidateQtTexture.rhiTexture();
-            candidateQtTexture.setOwnsTexture(false);
-            d->scheduleCleanup(candidateRhiTexture,
-                               candidateTexture,
-                               candidateOwnsTexture,
-                               std::move(candidateBuffer));
-            return;
-        }
-
-        // During an active pass publish the candidate only after wlroots
-        // sampling ownership has been acquired. Outside a pass it will be
-        // acquired by the normal prepass before the next draw. Until this point
-        // scene-graph nodes continue to see the old, valid texture.
-        auto *candidateRhiTexture = candidateQtTexture.rhiTexture();
-        Q_ASSERT(candidateRhiTexture);
-        candidateQtTexture.setOwnsTexture(false);
-        d->qtTexture.setTexture(candidateRhiTexture);
-        d->qtTexture.setHasAlphaChannel(candidateQtTexture.hasAlphaChannel());
-        d->qtTexture.setTextureSize(candidateQtTexture.textureSize());
-        d->adoptTexture(candidateTexture,
-                        candidateOwnsTexture,
-                        std::move(candidateBuffer));
-
-        Q_EMIT textureChanged();
+    if (Q_UNLIKELY(!candidateTexture)) {
+        qCWarning(lcWlQtQuickTexture) << "Failed to update texture from buffer:" << buffer
+                                      << ", width height:" << buffer->handle()->width
+                                      << buffer->handle()->height
+                                      << ", n_locks:" << buffer->handle()->n_locks;
         return;
     }
 
-    // Keep the established eager replacement behavior for GLES2 and Pixman.
-    d->cleanTexture();
-    d->buffer.reset(buffer);
-    if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
-        // Acquire texture from client buffer. wlroots already generate texture for us if this is a client buffer.
-        // By the way, there is something wrong with getting texture from a client buffer using wlr_texture_from_buffer,
-        // See: https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/3897
-        // Possible patch:  https://gitlab.freedesktop.org/wlroots/wlroots/-/merge_requests/4889
-        d->texture = qw_texture::from(clientBuffer->texture());
-        d->ownsTexture = false;
-    } else {
-        d->texture = qw_texture::from_buffer(*d->window->renderer(), *buffer);
-        d->ownsTexture = true;
+    WVulkanTrace::providerBind(this, d->window, candidateBuffer.get(), candidateTexture);
+    QSGPlainTexture candidateQtTexture;
+    if (!d->updateRhiTexture(candidateTexture, candidateBuffer.get(), &candidateQtTexture)) {
+        WVulkanTrace::providerDiscard(this, d->window, candidateTexture,
+                                      "qt-wrap-failed");
+        if (candidateOwnsTexture)
+            delete candidateTexture;
+        return;
     }
-    if (Q_UNLIKELY(!d->texture)) {
-        qCWarning(lcWlQtQuickTexture) << "Failed to update texture from buffer:" << buffer
-                                    << ", width height:" << buffer->handle()->width
-                                    << buffer->handle()->height
-                                    << ", n_locks:" << buffer->handle()->n_locks;
-    } else {
-        WVulkanTrace::providerBind(this, d->window, d->buffer.get(), d->texture);
-        if (!d->updateRhiTexture(d->texture, d->buffer.get())) {
-            d->cleanTexture();
-        } else {
-            d->rhiTexture = d->qtTexture.rhiTexture();
-            d->updateMipmapFiltering();
-        }
+
+    // Immediately prepare a texture created during updatePaintNode() when a render
+    // pass is already active. Otherwise it would miss the preparation performed
+    // before renderNextFrame().
+    const bool prepareOk = d->window->prepareTextureForCurrentRenderPass(candidateTexture,
+                                                                         "setbuffer-immediate");
+    if (!prepareOk) {
+        qCWarning(lcWlQtQuickTexture)
+            << "Immediate texture preparation failed; keeping the previous Vulkan texture"
+            << "provider" << this
+            << "qwTexture" << candidateTexture
+            << "wlrTexture" << candidateTexture->handle();
+        WVulkanTrace::providerDiscard(this, d->window, candidateTexture,
+                                      "sampling-prepare-failed");
+        auto *candidateRhiTexture = candidateQtTexture.rhiTexture();
+        candidateQtTexture.setOwnsTexture(false);
+        d->scheduleCleanup(candidateRhiTexture,
+                           candidateTexture,
+                           candidateOwnsTexture,
+                           std::move(candidateBuffer));
+        return;
     }
+
+    // During an active pass publish the candidate only after wlroots
+    // sampling ownership has been acquired. Outside a pass it will be
+    // acquired by the normal prepass before the next draw. Until this point
+    // scene-graph nodes continue to see the old, valid texture.
+    auto *candidateRhiTexture = candidateQtTexture.rhiTexture();
+    Q_ASSERT(candidateRhiTexture);
+    candidateQtTexture.setOwnsTexture(false);
+    d->qtTexture.setTexture(candidateRhiTexture);
+    d->qtTexture.setHasAlphaChannel(candidateQtTexture.hasAlphaChannel());
+    d->qtTexture.setTextureSize(candidateQtTexture.textureSize());
+    d->adoptTexture(candidateTexture,
+                    candidateOwnsTexture,
+                    std::move(candidateBuffer));
 
     Q_EMIT textureChanged();
 }
@@ -474,7 +521,19 @@ void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
 {
     W_D(WSGTextureProvider);
 
-    if (d->isVulkanRhi() && texture) {
+    if (!d->isVulkanRhi()) {
+        d->cleanTexture();
+        d->texture = texture;
+        d->legacyBuffer = srcBuffer;
+        d->ownsTexture = false;
+        if (texture)
+            d->updateLegacyRhiTexture();
+
+        Q_EMIT textureChanged();
+        return;
+    }
+
+    if (texture) {
         const char *rejectReason = nullptr;
         auto *clientBuffer = srcBuffer ? qw_client_buffer::get(*srcBuffer) : nullptr;
         if (!srcBuffer)
@@ -551,7 +610,7 @@ qw_texture *WSGTextureProvider::qwTexture() const
 qw_buffer *WSGTextureProvider::qwBuffer() const
 {
     W_DC(WSGTextureProvider);
-    return d->buffer.get();
+    return d->isVulkanRhi() ? d->buffer.get() : d->legacyBuffer;
 }
 
 bool WSGTextureProvider::smooth() const

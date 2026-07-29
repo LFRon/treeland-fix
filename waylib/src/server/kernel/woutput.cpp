@@ -72,7 +72,6 @@ WOutput::WOutput(qw_output *handle, WBackend *backend)
     d_func()->backend = backend;
     connect(handle, qOverload<wlr_output_event_commit*>(&qw_output::notify_commit),
             this, [this] (wlr_output_event_commit *event) {
-        WVulkanTrace::outputCommitState(this->handle(), event->state->committed);
         if (event->state->committed & WLR_OUTPUT_STATE_SCALE) {
             Q_EMIT this->scaleChanged();
             Q_EMIT this->effectiveSizeChanged();
@@ -96,14 +95,20 @@ WOutput::WOutput(qw_output *handle, WBackend *backend)
         if (event->state->committed & WLR_OUTPUT_STATE_ENABLED)
             Q_EMIT this->enabledChanged();
     });
-    connect(handle, &qw_output::notify_present,
-            this, [this] (wlr_output_event_present *event) {
-        WVulkanTrace::outputPresented(this->handle(), event);
-    }, Qt::DirectConnection);
-    connect(handle, &qw_output::before_destroy,
-            this, [handle] {
-        WVulkanTrace::outputDestroyed(handle);
-    }, Qt::DirectConnection);
+    if (WVulkanTrace::enabled()) {
+        connect(handle, qOverload<wlr_output_event_commit *>(&qw_output::notify_commit),
+                this, [this] (wlr_output_event_commit *event) {
+            WVulkanTrace::outputCommitState(this->handle(), event->state->committed);
+        });
+        connect(handle, &qw_output::notify_present,
+                this, [this] (wlr_output_event_present *event) {
+            WVulkanTrace::outputPresented(this->handle(), event);
+        }, Qt::DirectConnection);
+        connect(handle, &qw_output::before_destroy,
+                this, [handle] {
+            WVulkanTrace::outputDestroyed(handle);
+        }, Qt::DirectConnection);
+    }
 }
 
 WOutput::~WOutput()
