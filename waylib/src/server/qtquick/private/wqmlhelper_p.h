@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #pragma once
@@ -63,12 +63,14 @@ class WAYLIB_SERVER_EXPORT WQmlHelper : public QObject
     Q_OBJECT
     QML_NAMED_ELEMENT(WaylibHelper)
     Q_PROPERTY(bool hasXWayland READ hasXWayland CONSTANT)
+    Q_PROPERTY(bool isVulkanBackend READ isVulkanBackend CONSTANT)
     QML_SINGLETON
 
 public:
     explicit WQmlHelper(QObject *parent = nullptr);
 
     bool hasXWayland() const;
+    bool isVulkanBackend() const;
 
     static QSGRootNode *getRootNode(QQuickItem *item);
     static int &QSGNode_subtreeRenderableCount(QSGNode *node);

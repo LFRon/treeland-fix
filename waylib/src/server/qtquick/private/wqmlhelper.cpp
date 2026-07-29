@@ -1,7 +1,8 @@
-// Copyright (C) 2023-2026 JiDe Zhang <zhangjide@deepin.org>.
+// Copyright (C) 2023-2026 UnionTech Software Technology Co., Ltd.
 // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
 
 #include "wqmlhelper_p.h"
+#include "wrenderhelper.h"
 
 #include <QSGNode>
 #include <QQuickItem>
@@ -65,6 +66,11 @@ bool WQmlHelper::hasXWayland() const
 #else
     return true;
 #endif
+}
+
+bool WQmlHelper::isVulkanBackend() const
+{
+    return WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
 }
 
 void WQmlHelper::itemStackToTop(QQuickItem *item)
