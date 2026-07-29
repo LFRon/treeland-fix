@@ -75,20 +75,17 @@ public:
         connect(qmlEngine, &QQmlEngine::quit, q, &Treeland::quit, Qt::QueuedConnection);
         helper = qmlEngine->singletonInstance<Helper *>("Treeland", "Helper");
         connect(helper, &Helper::requestQuit, q, &Treeland::quit, Qt::QueuedConnection);
-        connect(helper->window(),
-                &QQuickWindow::sceneGraphError,
-                q,
-                [] (QQuickWindow::SceneGraphError error, const QString &message) {
-                    // The Vulkan render path emits this signal for an
-                    // unrecoverable frame transaction. Preserve the existing
-                    // GLES2 error policy unchanged.
-                    if (QQuickWindow::graphicsApi() != QSGRendererInterface::Vulkan)
-                        return;
-                    qCCritical(lcTlCore) << "Scene graph rendering failed; exiting compositor"
-                                         << "error" << error
-                                         << "message" << message;
-                    QCoreApplication::exit(EXIT_FAILURE);
-                });
+        if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan) {
+            connect(helper->window(),
+                    &QQuickWindow::sceneGraphError,
+                    q,
+                    [] (QQuickWindow::SceneGraphError error, const QString &message) {
+                        qCCritical(lcTlCore) << "Scene graph rendering failed; exiting compositor"
+                                             << "error" << error
+                                             << "message" << message;
+                        QCoreApplication::exit(EXIT_FAILURE);
+                    });
+        }
 
         qputenv("WLR_XWAYLAND", QByteArray(LIBEXEC_DIR) + "/treeland-xwayland");
         helper->init(q);

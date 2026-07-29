@@ -1993,25 +1993,28 @@ void Helper::init(Treeland::Treeland *treeland)
     }
 
     m_allocator = qw_allocator::autocreate(*m_backend->handle(), *m_renderer);
-    if (!m_renderer->init_wl_shm(*m_server->handle()))
-        qCFatal(lcTlCore) << "Failed to initialize wl_shm for renderer";
+    const bool vulkanRenderer =
+        WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+    if (vulkanRenderer) {
+        if (!m_renderer->init_wl_shm(*m_server->handle()))
+            qCFatal(lcTlCore) << "Failed to initialize wl_shm for Vulkan renderer";
 
-    qCInfo(lcTlCore) << "Initialized wl_shm for renderer";
-    m_server->attach<WLinuxDmabufV1>(m_renderer);
-    if (WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan) {
+        m_server->attach<WLinuxDmabufV1>(m_renderer);
         auto *presentation = m_server->attach<WPresentation>(m_backend->handle());
         m_renderWindow->setPresentation(presentation);
-        qCInfo(lcTlCore) << "Attached presentation-time protocol for Vulkan renderer";
-    }
 
-    if (m_renderer->supports_implicit_dmabuf_texture_formats()) {
-        if (qw_drm::create(*m_server->handle(), *m_renderer)) {
-            qCInfo(lcTlCore) << "Created legacy wl_drm global for implicit DMA-BUF clients";
+        if (m_renderer->supports_implicit_dmabuf_texture_formats()) {
+            if (!qw_drm::create(*m_server->handle(), *m_renderer)) {
+                qCWarning(lcTlCore)
+                    << "Failed to create legacy wl_drm global despite implicit DMA-BUF support";
+            }
         } else {
-            qCWarning(lcTlCore) << "Failed to create legacy wl_drm global despite implicit DMA-BUF support";
+            qCInfo(lcTlCore)
+                << "Skipping legacy wl_drm global: Vulkan renderer does not support implicit DMA-BUF modifiers";
         }
     } else {
-        qCInfo(lcTlCore) << "Skipping legacy wl_drm global: renderer does not support implicit DMA-BUF modifiers";
+        m_renderer->init_wl_display(*m_server->handle());
+        qw_drm::create(*m_server->handle(), *m_renderer);
     }
 
     // free follow display
