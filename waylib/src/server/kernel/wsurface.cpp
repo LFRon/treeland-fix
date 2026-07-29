@@ -45,22 +45,18 @@ void WSurfacePrivate::on_commit()
 {
     W_Q(WSurface);
 
-    const quint32 committedState = nativeHandle()->current.committed;
-
     needsFrame = !wl_list_empty(&nativeHandle()->current.frame_callback_list);
 
-    if (committedState & WLR_SURFACE_STATE_BUFFER)
+    if (nativeHandle()->current.committed & WLR_SURFACE_STATE_BUFFER)
         updateBuffer();
 
-    if (committedState & WLR_SURFACE_STATE_OFFSET)
+    if (nativeHandle()->current.committed & WLR_SURFACE_STATE_OFFSET)
         updateBufferOffset();
 
     if (hasSubsurface) // Will make to true when qw_surface::newSubsurface
         updateHasSubsurface();
 
-    WVulkanTrace::surfaceCommit(q, q->pid(), nativeHandle()->current.seq,
-                                committedState, q->buffer());
-    Q_EMIT q->commit(committedState);
+    Q_EMIT q->commit(nativeHandle()->current.committed);
 }
 
 void WSurfacePrivate::init()
@@ -90,6 +86,13 @@ void WSurfacePrivate::connect()
     QObject::connect(handle(), &qw_surface::notify_commit, q, [this] {
         on_commit();
     });
+    if (WVulkanTrace::enabled()) {
+        QObject::connect(handle(), &qw_surface::notify_commit, q, [q, this] {
+            WVulkanTrace::surfaceCommit(q, q->pid(), nativeHandle()->current.seq,
+                                        nativeHandle()->current.committed,
+                                        q->buffer());
+        });
+    }
     QObject::connect(handle(), &qw_surface::notify_map, q, &WSurface::mappedChanged);
     QObject::connect(handle(), &qw_surface::notify_unmap, q, &WSurface::mappedChanged);
     QObject::connect(handle(), &qw_surface::notify_new_subsurface, q, [q, this] (wlr_subsurface *sub) {
