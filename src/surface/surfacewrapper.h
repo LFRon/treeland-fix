@@ -465,6 +465,9 @@ public Q_SLOTS:
     bool stackAfter(QQuickItem *item);
     void stackToLast();
     void stackToFirst();
+#ifndef DISABLE_XWAYLAND
+    void applyXWaylandStacking();
+#endif
 
     void updateSurfaceSizeRatio();
 
@@ -611,6 +614,10 @@ private:
     void updateActivateCapability();
     void updateFocusCapability();
     void completeSplashTransition(const QSizeF &targetImplicitSize, bool hideDecoration = false);
+#ifndef DISABLE_XWAYLAND
+    void lowerXWaylandStacking();
+    void scheduleXWaylandStackingUpdate();
+#endif
 
     // wayland set by treeland-dde-shell, x11 set by bypassManager/windowTypes
     void setSkipDockPreView(bool skip);

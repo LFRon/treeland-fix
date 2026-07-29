@@ -89,16 +89,17 @@ bool xwayland_user_event_handler(wlr_xwayland *xwayland, xcb_generic_event_t *ev
         return false;
 
     const uint8_t response_type = event->response_type & ~0x80;
-    if (response_type != XCB_PROPERTY_NOTIFY)
-        return false;
-
-    auto *pe = reinterpret_cast<const xcb_property_notify_event_t *>(event);
     auto *self = WXWayland::fromHandle(xwayland);
 
     if (!self)
         return false;
 
     auto *d = self->d_func();
+
+    if (response_type != XCB_PROPERTY_NOTIFY)
+        return false;
+
+    auto *pe = reinterpret_cast<const xcb_property_notify_event_t *>(event);
 
     // Trigger async property reading infrastructure if this window is being tracked.
     if (!d->asyncProps.isEmpty()) {

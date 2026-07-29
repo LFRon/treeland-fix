@@ -28,6 +28,41 @@
 
 #include <QDateTime>
 
+#ifndef DISABLE_XWAYLAND
+namespace {
+
+void lowerDeactivatedXWayland(SurfaceWrapper *oldSurface, SurfaceWrapper *newSurface)
+{
+    if (!oldSurface || oldSurface == newSurface || oldSurface->isAboutToRemove())
+        return;
+
+    auto *oldXWayland = qobject_cast<WXWaylandSurface *>(oldSurface->shellSurface());
+    if (!oldXWayland || oldXWayland->isBypassManager()
+        || !oldXWayland->isX11Mapped() || oldXWayland->isAbove()
+        || oldXWayland->isBelow()) {
+        return;
+    }
+
+    auto *newXWayland =
+        newSurface ? qobject_cast<WXWaylandSurface *>(newSurface->shellSurface()) : nullptr;
+    if (!newXWayland || newXWayland->isBypassManager()
+        || !newXWayland->isX11Mapped()) {
+        return;
+    }
+
+    if (!newSurface->surface() || !newSurface->surface()->mapped())
+        return;
+
+    // A BELOW window must stay underneath the window that just became active.
+    if (!newXWayland->isAbove() && newXWayland->isBelow())
+        return;
+
+    oldXWayland->restack(newXWayland, WXWaylandSurface::XCB_STACK_MODE_BELOW);
+}
+
+}
+#endif
+
 FocusController::FocusController(WaylandServer *server)
     : QObject(server)
     , m_server(server)
@@ -187,6 +222,12 @@ void FocusController::setActivatedSurface(SurfaceWrapper *newActivateSurface, WS
     }
 
     if (seatContainer->activatedSurface() == newActivateSurface) {
+        // A prelaunch wrapper can already be active when its real X11 window
+        // maps; reapply the stacking policy for this window only.
+#ifndef DISABLE_XWAYLAND
+        if (raise && newActivateSurface)
+            newActivateSurface->applyXWaylandStacking();
+#endif
         return;
     }
 
@@ -201,15 +242,19 @@ void FocusController::setActivatedSurface(SurfaceWrapper *newActivateSurface, WS
     if (newActivateSurface) {
         Q_ASSERT(newActivateSurface->showOnWorkspace(m_server->workspace()->current()->id()));
         if (raise) {
-            newActivateSurface->stackToLast();
+            bool keepAtBottom = false;
 #ifndef DISABLE_XWAYLAND
             if (newActivateSurface->type() == SurfaceWrapper::Type::XWayland) {
-                auto xwaylandSurface =
+                auto *xwaylandSurface =
                     qobject_cast<WXWaylandSurface *>(newActivateSurface->shellSurface());
-                Q_ASSERT(!xwaylandSurface->isBypassManager());
-                xwaylandSurface->restack(nullptr, WXWaylandSurface::XCB_STACK_MODE_ABOVE);
+                keepAtBottom = xwaylandSurface && !xwaylandSurface->isAbove()
+                    && xwaylandSurface->isBelow();
             }
 #endif
+            if (keepAtBottom)
+                newActivateSurface->stackToFirst();
+            else
+                newActivateSurface->stackToLast();
         }
     }
 
@@ -238,6 +283,17 @@ void FocusController::setActivatedSurface(SurfaceWrapper *newActivateSurface, WS
         newActivateSurface->setActivate(true);
     }
 
+#ifndef DISABLE_XWAYLAND
+    if (raise && newActivateSurface)
+        newActivateSurface->applyXWaylandStacking();
+
+    // Focus fallback after minimize/show-desktop can deactivate a window
+    // without raising the next one; the hidden window must still be lowered.
+    if (raise || (oldPrimarySurface
+                  && (!oldPrimarySurface->isVisible() || oldPrimarySurface->isMinimized()))) {
+        lowerDeactivatedXWayland(oldPrimarySurface, newActivateSurface);
+    }
+#endif
 }
 
 void FocusController::onRenderWindowActiveFocusItemChanged()
