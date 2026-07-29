@@ -9,6 +9,7 @@
 #include "wtools.h"
 #include "wsgtextureprovider.h"
 #include "private/wprivateaccessor_p.h"
+#include "utils/private/wvulkantrace_p.h"
 
 #include <qwbuffer.h>
 #include <qwtexture.h>
@@ -109,9 +110,32 @@ WBufferRenderer::~WBufferRenderer()
 {
     cleanTextureProvider();
     resetSources();
+    cleanupRetiredResources(true);
 
     delete m_renderHelper;
     delete m_swapchain;
+}
+
+void WBufferRenderer::retireSwapchain(qw_swapchain *swapchain, bool defer)
+{
+    if (!swapchain)
+        return;
+
+    if (!defer) {
+        delete swapchain;
+        return;
+    }
+
+    m_retiredSwapchains.append(swapchain);
+}
+
+void WBufferRenderer::cleanupRetiredResources(bool force)
+{
+    if (m_renderHelper)
+        m_renderHelper->cleanupRetiredRenderResources(force);
+
+    qDeleteAll(m_retiredSwapchains);
+    m_retiredSwapchains.clear();
 }
 
 WOutput *WBufferRenderer::output() const
@@ -368,6 +392,9 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 
     Q_EMIT beforeRendering();
 
+    auto wd = QQuickWindowPrivate::get(window());
+    const bool isVulkanRhi = wd->rhi && wd->rhi->backend() == QRhi::Vulkan;
+
     // configure swapchain
     if (flags.testFlag(RenderFlag::DontConfigureSwapchain)) {
         auto renderFormat = pickFormat(m_output->renderer(), format);
@@ -378,17 +405,22 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
 
         if (!m_swapchain || QSize(m_swapchain->handle()->width, m_swapchain->handle()->height) != pixelSize
             || m_swapchain->handle()->format.format != renderFormat->format) {
-            if (m_swapchain)
-                delete m_swapchain;
+            retireSwapchain(m_swapchain, isVulkanRhi);
             m_swapchain = qw_swapchain::create(m_output->allocator()->handle(), pixelSize.width(), pixelSize.height(), renderFormat);
         }
     } else if (flags.testFlag(RenderFlag::UseCursorFormats)) {
-        bool ok = m_output->configureCursorSwapchain(pixelSize, format, &m_swapchain);
+        qw_swapchain *replacedSwapchain = nullptr;
+        bool ok = m_output->configureCursorSwapchain(pixelSize, format, &m_swapchain,
+                                                     isVulkanRhi ? &replacedSwapchain : nullptr);
+        retireSwapchain(replacedSwapchain, isVulkanRhi);
         if (!ok)
             return nullptr;
     } else {
+        qw_swapchain *replacedSwapchain = nullptr;
         bool ok = m_output->configurePrimarySwapchain(pixelSize, format, &m_swapchain,
-                                                      !flags.testFlag(DontTestSwapchain));
+                                                      !flags.testFlag(DontTestSwapchain),
+                                                      isVulkanRhi ? &replacedSwapchain : nullptr);
+        retireSwapchain(replacedSwapchain, isVulkanRhi);
         if (!ok)
             return nullptr;
     }
@@ -403,7 +435,6 @@ qw_buffer *WBufferRenderer::beginRender(const QSize &pixelSize, qreal devicePixe
         m_renderHelper = new WRenderHelper(m_output->renderer());
     m_renderHelper->setSize(pixelSize);
 
-    auto wd = QQuickWindowPrivate::get(window());
     Q_ASSERT(wd->renderControl);
     auto lastRT = m_renderHelper->lastRenderTarget();
     auto rt = m_renderHelper->acquireRenderTarget(wd->renderControl, buffer);
@@ -664,10 +695,14 @@ bool WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
 
     QVector<qw_texture *> preparedTextures;
     auto outputWindow = renderWindow();
-    const auto activeTextureProviders = activeTextureProvidersForPass(isRootItem(source.source)
-                                                                          ? wd->contentItem
-                                                                          : source.source);
+    const auto activeTextureProviders = isVulkanRhi
+        ? activeTextureProvidersForPass(isRootItem(source.source)
+                                            ? wd->contentItem
+                                            : source.source)
+        : QVector<WSGTextureProvider *> {};
     constexpr const char *samplingPurpose = "qt-render-pass-texture";
+    WVulkanTrace::beginPass(outputWindow, this, state.buffer.get(), samplingPurpose,
+                            sourceIndex, activeTextureProviders.size());
     if (outputWindow
         && !outputWindow->prepareTextureSamplingForRenderPass(state.buffer.get(),
                                                               activeTextureProviders,
@@ -679,6 +714,7 @@ bool WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
                                       << "sourceIndex" << sourceIndex
                                       << "currentBuffer" << state.buffer.get()
                                       << "wlrBuffer" << (state.buffer ? state.buffer->handle() : nullptr);
+        WVulkanTrace::endPass(outputWindow, false);
         return false;
     }
 
@@ -737,6 +773,22 @@ bool WBufferRenderer::render(int sourceIndex, const QMatrix4x4 &renderMatrix,
         QRhiResourceUpdateBatch *resourceUpdates = wd->rhi->nextResourceUpdateBatch();
         dr->currentFrameCommandBuffer()->resourceUpdate(resourceUpdates);
     }
+
+    if (outputWindow
+        && !outputWindow->finishTextureSamplingForRenderPass(preparedTextures,
+                                                             samplingPurpose,
+                                                             sourceIndex)) {
+        qCWarning(lcWlBufferRenderer) << "Skipping render pass because Vulkan texture sampling finish failed"
+                                      << "renderer" << this
+                                      << "sourceIndex" << sourceIndex
+                                      << "currentBuffer" << state.buffer.get()
+                                      << "wlrBuffer" << (state.buffer ? state.buffer->handle() : nullptr)
+                                      << "preparedTextureCount" << preparedTextures.size();
+        WVulkanTrace::endPass(outputWindow, false);
+        return false;
+    }
+
+    WVulkanTrace::endPass(outputWindow, true);
 
     if (shouldCacheBuffer() && !isVulkanRhi) {
         wTextureProvider()->setBuffer(state.buffer.get());
@@ -843,12 +895,14 @@ void WBufferRenderer::invalidateSceneGraph()
 {
     if (m_textureProvider)
         m_textureProvider.reset();
+    cleanupRetiredResources(true);
     resetSources();
 }
 
 void WBufferRenderer::releaseResources()
 {
     cleanTextureProvider();
+    cleanupRetiredResources(true);
     resetSources();
 }
 
