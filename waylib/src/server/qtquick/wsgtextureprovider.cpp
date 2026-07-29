@@ -14,7 +14,67 @@
 #include <rhi/qrhi.h>
 #include <private/qsgplaintexture_p.h>
 
+extern "C" {
+#include <wlr/types/wlr_buffer.h>
+}
+
 WAYLIB_SERVER_BEGIN_NAMESPACE
+
+class Q_DECL_HIDDEN BufferRef
+{
+public:
+    BufferRef() = default;
+    ~BufferRef() { reset(); }
+
+    BufferRef(const BufferRef &) = delete;
+    BufferRef &operator=(const BufferRef &) = delete;
+
+    BufferRef(BufferRef &&other) noexcept
+    {
+        std::swap(m_buffer, other.m_buffer);
+    }
+
+    BufferRef &operator=(BufferRef &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+
+        reset();
+        std::swap(m_buffer, other.m_buffer);
+        return *this;
+    }
+
+    void reset(qw_buffer *buffer = nullptr)
+    {
+        if (m_buffer == buffer)
+            return;
+
+        if (buffer) {
+            buffer->lock();
+            if (auto clientBuffer = qw_client_buffer::get(*buffer))
+                clientBuffer->handle()->n_ignore_locks++;
+        }
+
+        release();
+        m_buffer = buffer;
+    }
+
+    qw_buffer *get() const { return m_buffer; }
+
+private:
+    void release()
+    {
+        if (!m_buffer)
+            return;
+
+        if (auto clientBuffer = qw_client_buffer::get(*m_buffer))
+            clientBuffer->handle()->n_ignore_locks--;
+        m_buffer->unlock();
+        m_buffer = nullptr;
+    }
+
+    qw_buffer *m_buffer = nullptr;
+};
 
 class Q_DECL_HIDDEN WSGTextureProviderPrivate : public WObjectPrivate
 {
@@ -34,42 +94,96 @@ public:
         cleanTexture();
     }
 
-    void cleanTexture() {
-        if (rhiTexture) {
-            Q_ASSERT(window);
-            class TextureCleanupJob : public QRunnable
-            {
-            public:
-                TextureCleanupJob(QRhiTexture *texture)
-                    : texture(texture) { }
-                void run() override {
-                    texture->deleteLater();
-                }
-                QRhiTexture *texture;
-            };
+    void cleanTexture()
+    {
+        auto oldRhiTexture = rhiTexture;
+        auto oldTexture = texture;
+        const bool oldOwnsTexture = ownsTexture;
+        auto oldBuffer = std::move(buffer);
 
-            // Delay clean the qt rhi textures.
-            window->scheduleRenderJob(new TextureCleanupJob(rhiTexture),
-                                      QQuickWindow::AfterSynchronizingStage);
-            rhiTexture = nullptr;
-        }
-
-        if (ownsTexture && texture)
-            delete texture;
+        rhiTexture = nullptr;
         texture = nullptr;
-    }
+        ownsTexture = false;
 
-    void updateRhiTexture() {
-        Q_ASSERT(texture);
-        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture);
-        if (Q_UNLIKELY(!ok)) {
-            qCWarning(lcWlQtQuickTexture) << "Failed to make texture:" << texture
-                                        << ", width height:" << texture->handle()->width
-                                        << texture->handle()->height;
+        if (!oldRhiTexture && !oldTexture && !oldBuffer.get())
+            return;
+
+        class TextureCleanupJob : public QRunnable
+        {
+        public:
+            TextureCleanupJob(QRhiTexture *rhiTexture,
+                              qw_texture *texture,
+                              bool ownsTexture,
+                              BufferRef buffer)
+                : rhiTexture(rhiTexture)
+                , texture(texture)
+                , ownsTexture(ownsTexture)
+                , buffer(std::move(buffer))
+            {
+            }
+
+            void run() override
+            {
+                if (rhiTexture)
+                    rhiTexture->deleteLater();
+                if (ownsTexture && texture)
+                    delete texture;
+            }
+
+            QRhiTexture *rhiTexture = nullptr;
+            qw_texture *texture = nullptr;
+            bool ownsTexture = false;
+            BufferRef buffer;
+        };
+
+        if (window) {
+            window->scheduleRenderJob(new TextureCleanupJob(oldRhiTexture,
+                                                            oldTexture,
+                                                            oldOwnsTexture,
+                                                            std::move(oldBuffer)),
+                                      QQuickWindow::AfterRenderingStage);
             return;
         }
 
+        if (oldRhiTexture)
+            oldRhiTexture->deleteLater();
+        if (oldOwnsTexture && oldTexture)
+            delete oldTexture;
+    }
+
+    bool isVulkanRhi() const
+    {
+        return window && window->rhi() && window->rhi()->backend() == QRhi::Vulkan;
+    }
+
+    void updateMipmapFiltering()
+    {
+        qtTexture.setMipmapFiltering(isVulkanRhi()
+                                         ? QSGTexture::None
+                                         : (smooth ? QSGTexture::Linear : QSGTexture::Nearest));
+    }
+
+    bool updateRhiTexture() {
+        Q_ASSERT(texture);
+        const bool forceShaderReadOnlyLayout = isVulkanRhi();
+        bool ok = WRenderHelper::makeTexture(window->rhi(), texture, &qtTexture, forceShaderReadOnlyLayout);
+        if (Q_UNLIKELY(!ok)) {
+            auto bufferHandle = buffer.get();
+            qCWarning(lcWlQtQuickTexture) << "Failed to make Qt texture from wlroots texture"
+                                          << "provider" << q_func()
+                                          << "qwTexture" << texture
+                                          << "wlrTexture" << texture->handle()
+                                          << "qwBuffer" << bufferHandle
+                                          << "wlrBuffer" << (bufferHandle ? bufferHandle->handle() : nullptr)
+                                          << "bufferSize" << (bufferHandle ? QSize(bufferHandle->handle()->width,
+                                                                                   bufferHandle->handle()->height)
+                                                                          : QSize());
+            return false;
+        }
+
         rhiTexture = qtTexture.rhiTexture();
+        updateMipmapFiltering();
+        return true;
     }
 
     W_DECLARE_PUBLIC(WSGTextureProvider)
@@ -79,7 +193,7 @@ public:
     // wlroots resources
     qw_texture *texture = nullptr;
     bool ownsTexture = false;
-    qw_buffer *buffer = nullptr;
+    BufferRef buffer;
 
     // qt resources
     QSGPlainTexture qtTexture;
@@ -90,7 +204,6 @@ public:
 WSGTextureProvider::WSGTextureProvider(WOutputRenderWindow *window)
     : WObject(*new WSGTextureProviderPrivate(this, window))
 {
-
 }
 
 WOutputRenderWindow *WSGTextureProvider::window() const
@@ -111,7 +224,7 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
 
     W_D(WSGTextureProvider);
     d->cleanTexture();
-    d->buffer = buffer;
+    d->buffer.reset(buffer);
 
     if (buffer) {
         Q_ASSERT(d->window);
@@ -132,7 +245,8 @@ void WSGTextureProvider::setBuffer(qw_buffer *buffer)
                                         << buffer->handle()->height
                                         << ", n_locks:" << buffer->handle()->n_locks;
         } else {
-            d->updateRhiTexture();
+            if (!d->updateRhiTexture())
+                d->cleanTexture();
         }
     }
 
@@ -144,10 +258,10 @@ void WSGTextureProvider::setTexture(qw_texture *texture, qw_buffer *srcBuffer)
     W_D(WSGTextureProvider);
     d->cleanTexture();
     d->texture = texture;
-    d->buffer = srcBuffer;
+    d->buffer.reset(srcBuffer);
     d->ownsTexture = false;
-    if (texture)
-        d->updateRhiTexture();
+    if (texture && !d->updateRhiTexture())
+        d->cleanTexture();
 
     Q_EMIT textureChanged();
 }
@@ -167,6 +281,12 @@ QSGTexture *WSGTextureProvider::texture() const
     return d->texture ? const_cast<QSGPlainTexture*>(&d->qtTexture) : nullptr;
 }
 
+bool WSGTextureProvider::hasTexture() const
+{
+    W_DC(WSGTextureProvider);
+    return d->texture && d->rhiTexture;
+}
+
 qw_texture *WSGTextureProvider::qwTexture() const
 {
     W_DC(WSGTextureProvider);
@@ -176,7 +296,7 @@ qw_texture *WSGTextureProvider::qwTexture() const
 qw_buffer *WSGTextureProvider::qwBuffer() const
 {
     W_DC(WSGTextureProvider);
-    return d->buffer;
+    return d->buffer.get();
 }
 
 bool WSGTextureProvider::smooth() const
@@ -193,8 +313,7 @@ void WSGTextureProvider::setSmooth(bool newSmooth)
     d->smooth = newSmooth;
     d->qtTexture.setFiltering(newSmooth ? QSGTexture::Linear
                                         : QSGTexture::Nearest);
-    d->qtTexture.setMipmapFiltering(newSmooth ? QSGTexture::Linear
-                                              : QSGTexture::Nearest);
+    d->updateMipmapFiltering();
 
     Q_EMIT smoothChanged();
 }
