@@ -836,3 +836,43 @@ bool wlr_vk_texture_has_alpha(struct wlr_texture *texture) {
 	struct wlr_vk_texture *vk_texture = vulkan_get_texture(texture);
 	return vk_texture->has_alpha;
 }
+
+bool waylib_vk_renderer_import_dmabuf(struct wlr_renderer *wlr_renderer,
+		const struct wlr_dmabuf_attributes *attribs,
+		struct waylib_vk_imported_image *out) {
+	assert(wlr_renderer_is_vk(wlr_renderer));
+	assert(attribs && out);
+
+	*out = (struct waylib_vk_imported_image){
+		.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	bool using_mutable_srgb = false;
+	out->image = vulkan_import_dmabuf(renderer, attribs, out->memories,
+		&out->n_memories, true, &using_mutable_srgb);
+	if (out->image == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	const struct wlr_vk_format_props *fmt =
+		vulkan_format_props_from_drm(renderer->dev, attribs->format);
+	assert(fmt);
+	out->format = fmt->format.vk;
+	return true;
+}
+
+void waylib_vk_imported_image_finish(struct wlr_renderer *wlr_renderer,
+		struct waylib_vk_imported_image *image) {
+	assert(wlr_renderer_is_vk(wlr_renderer));
+	if (!image || image->image == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkDevice dev = vulkan_get_renderer(wlr_renderer)->dev->dev;
+	vkDestroyImage(dev, image->image, NULL);
+	for (uint32_t i = 0; i < image->n_memories; ++i) {
+		vkFreeMemory(dev, image->memories[i], NULL);
+	}
+	*image = (struct waylib_vk_imported_image){0};
+}

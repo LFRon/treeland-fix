@@ -413,6 +413,15 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer) {
 	return vulkan_wait_command_buffer(cb, renderer);
 }
 
+bool waylib_vk_renderer_flush_stage(struct wlr_renderer *wlr_renderer) {
+	assert(wlr_renderer_is_vk(wlr_renderer));
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	if (renderer->stage.cb == NULL) {
+		return true;
+	}
+	return vulkan_submit_stage_wait(renderer);
+}
+
 struct wlr_vk_format_props *vulkan_format_props_from_drm(
 		struct wlr_vk_device *dev, uint32_t drm_fmt) {
 	for (size_t i = 0u; i < dev->format_prop_count; ++i) {
