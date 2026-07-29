@@ -496,6 +496,8 @@ public:
                                              const char *purpose,
                                              int sourceIndex,
                                              QVector<qw_texture *> *preparedTextures);
+    bool prepareTextureForCurrentRenderPass(qw_texture *texture,
+                                            const char *purpose);
     bool finishTextureSamplingForRenderPass(const QVector<qw_texture *> &preparedTextures,
                                             const char *purpose,
                                             int sourceIndex);
@@ -559,6 +561,8 @@ public:
 #endif
 
     QStack<WBufferRenderer*> rendererList;
+    QVector<qw_texture *> *m_currentPreparedTextures = nullptr;
+    QSet<qw_texture *> m_currentPreparedTextureSet;
 };
 
 WOutputRenderWindowPrivate *OutputHelper::renderWindowD() const
@@ -679,6 +683,14 @@ bool OutputHelper::render(WBufferRenderer *renderer, int sourceIndex, const QMat
                           const QRectF &sourceRect, const QRectF &targetRect, bool preserveColorContents)
 {
     auto *windowPrivate = renderWindowD();
+    if (WRenderHelper::getGraphicsApi(windowPrivate->rc())
+        != QSGRendererInterface::Vulkan) {
+        windowPrivate->pushRenderer(renderer);
+        renderer->render(sourceIndex, renderMatrix, sourceRect, targetRect,
+                         preserveColorContents);
+        return true;
+    }
+
     auto *presentationOutput = m_output ? m_output->output() : nullptr;
     windowPrivate->setCurrentPresentationOutput(presentationOutput);
     windowPrivate->pushRenderer(renderer);
@@ -854,33 +866,57 @@ qw_buffer *OutputHelper::renderLayer(LayerData *layer, bool *dontEndRenderAndRet
         if (buffer) {
             const QRectF sr = QRectF(layer->mapRect.topLeft() - layer->noClipMapRect.topLeft(), layer->mapRect.size());
             const QRectF tr(QPointF(0, 0), layer->mapRect.size());
+            const bool vulkanRenderer =
+                WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                == QSGRendererInterface::Vulkan;
 
-            bool renderOk = render(layer->renderer, 0, layer->renderMatrix, sr, tr,
-                                   layer->layer->layer->flags().testFlag(WOutputLayer::PreserveColorContents));
+            if (!vulkanRenderer) {
+                render(layer->renderer, 0, layer->renderMatrix, sr, tr,
+                       layer->layer->layer->flags().testFlag(
+                           WOutputLayer::PreserveColorContents));
 
-            if (visualizeLayers())
-                renderOk = renderOk && render(layer->renderer, 1, layer->renderMatrix, sr, tr, true);
+                if (visualizeLayers())
+                    render(layer->renderer, 1, layer->renderMatrix, sr, tr, true);
 
-            if (!renderOk) {
-                qCWarning(lcWlBufferRenderer) << "Skipping layer buffer because render pass failed"
-                                              << "renderer" << layer->renderer
-                                              << "currentBuffer" << layer->renderer->currentBuffer()
-                                              << "layer" << layer->layer;
-                (void)renderWindowD()->releaseRenderBuffer(layer->renderer, "layer-render-buffer-abort");
-                layer->renderer->endRender();
-                if (dontEndRenderAndReturnNeedsEndRender)
-                    *dontEndRenderAndReturnNeedsEndRender = false;
-                return nullptr;
-            }
-
-            if (dontEndRenderAndReturnNeedsEndRender) {
-                *dontEndRenderAndReturnNeedsEndRender = true;
-            } else {
-                if (!renderWindowD()->releaseRenderBuffer(layer->renderer, "layer-render-buffer")) {
+                if (dontEndRenderAndReturnNeedsEndRender) {
+                    *dontEndRenderAndReturnNeedsEndRender = true;
+                } else {
                     layer->renderer->endRender();
+                }
+            } else {
+                bool renderOk = render(
+                    layer->renderer, 0, layer->renderMatrix, sr, tr,
+                    layer->layer->layer->flags().testFlag(
+                        WOutputLayer::PreserveColorContents));
+
+                if (visualizeLayers())
+                    renderOk = renderOk
+                        && render(layer->renderer, 1, layer->renderMatrix, sr, tr, true);
+
+                if (!renderOk) {
+                    qCWarning(lcWlBufferRenderer)
+                        << "Skipping layer buffer because render pass failed"
+                        << "renderer" << layer->renderer
+                        << "currentBuffer" << layer->renderer->currentBuffer()
+                        << "layer" << layer->layer;
+                    (void)renderWindowD()->releaseRenderBuffer(
+                        layer->renderer, "layer-render-buffer-abort");
+                    layer->renderer->endRender();
+                    if (dontEndRenderAndReturnNeedsEndRender)
+                        *dontEndRenderAndReturnNeedsEndRender = false;
                     return nullptr;
                 }
-                layer->renderer->endRender();
+
+                if (dontEndRenderAndReturnNeedsEndRender) {
+                    *dontEndRenderAndReturnNeedsEndRender = true;
+                } else {
+                    if (!renderWindowD()->releaseRenderBuffer(
+                            layer->renderer, "layer-render-buffer")) {
+                        layer->renderer->endRender();
+                        return nullptr;
+                    }
+                    layer->renderer->endRender();
+                }
             }
         } else if (dontEndRenderAndReturnNeedsEndRender) {
             *dontEndRenderAndReturnNeedsEndRender = false;
@@ -929,6 +965,8 @@ WBufferRenderer *OutputHelper::afterRender()
             continue;
 
         if (needsEndBuffer
+            && WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                == QSGRendererInterface::Vulkan
             && !renderWindowD()->releaseRenderBuffer(i->renderer, "layer-render-buffer")) {
             i->renderer->endRender();
             continue;
@@ -1163,6 +1201,16 @@ WBufferRenderer *OutputHelper::compositeLayers(const QList<LayerData*> layers, b
                                     WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject);
 
         if (ok) {
+            if (WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                != QSGRendererInterface::Vulkan) {
+                // stop primary render
+                if (bufferRenderer()->currentBuffer())
+                    bufferRenderer()->endRender();
+                render(bufferRenderer2(), 0, {}, m_output->effectiveSourceRect(),
+                       m_output->targetRect(), true);
+                return bufferRenderer2();
+            }
+
             // stop primary render
             if (bufferRenderer()->currentBuffer()) {
                 if (!renderWindowD()->releaseRenderBuffer(bufferRenderer(), "shadow-source-render-buffer")) {
@@ -1185,6 +1233,13 @@ WBufferRenderer *OutputHelper::compositeLayers(const QList<LayerData*> layers, b
         }
     } else {
         if (bufferRenderer()->currentBuffer()) {
+            if (WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                != QSGRendererInterface::Vulkan) {
+                render(bufferRenderer(), 1, {}, m_output->effectiveSourceRect(),
+                       m_output->targetRect(), true);
+                return bufferRenderer();
+            }
+
             if (!render(bufferRenderer(), 1, {}, m_output->effectiveSourceRect(), m_output->targetRect(), true)) {
                 qCWarning(lcWlBufferRenderer) << "Skipping layer composite into output because render pass failed"
                                               << "renderer" << bufferRenderer()
@@ -1244,12 +1299,8 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
             return true;
         }
 
-        if (qwoutput()->handle()->software_cursor_locks > 0) {
-            qCDebug(lcWlCursor) << "Skipping hardware cursor because software cursor is locked"
-                                << "output" << output()->output()
-                                << "locks" << qwoutput()->handle()->software_cursor_locks;
+        if (qwoutput()->handle()->software_cursor_locks > 0)
             break;
-        }
 
         auto move_cursor = qwoutput()->handle()->impl->move_cursor;
 
@@ -1344,19 +1395,31 @@ bool OutputHelper::tryToHardwareCursor(const LayerData *layer)
                 newBuffer = m_cursorRenderer->beginRender(pixelSize, 1.0, DRM_FORMAT_ARGB8888,
                                                           WBufferRenderer::UseCursorFormats);
                 if (newBuffer) {
-                    if (!m_cursorRenderer->render(0, {})) {
-                        qCWarning(lcWlBufferRenderer) << "Skipping cursor buffer because render pass failed"
-                                                      << "renderer" << m_cursorRenderer
-                                                      << "currentBuffer" << m_cursorRenderer->currentBuffer();
-                        (void)renderWindowD()->releaseRenderBuffer(m_cursorRenderer, "cursor-render-buffer-abort");
-                        newBuffer = nullptr;
-                    } else if (!renderWindowD()->releaseRenderBuffer(m_cursorRenderer, "cursor-render-buffer")) {
-                        newBuffer = nullptr;
+                    if (WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                        != QSGRendererInterface::Vulkan) {
+                        m_cursorRenderer->render(0, {});
+                    } else {
+                        if (!m_cursorRenderer->render(0, {})) {
+                            qCWarning(lcWlBufferRenderer)
+                                << "Skipping cursor buffer because render pass failed"
+                                << "renderer" << m_cursorRenderer
+                                << "currentBuffer" << m_cursorRenderer->currentBuffer();
+                            (void)renderWindowD()->releaseRenderBuffer(
+                                m_cursorRenderer, "cursor-render-buffer-abort");
+                            newBuffer = nullptr;
+                        } else if (!renderWindowD()->releaseRenderBuffer(
+                                       m_cursorRenderer, "cursor-render-buffer")) {
+                            newBuffer = nullptr;
+                        }
                     }
                     m_cursorRenderer->endRender();
                 }
 
-                m_cursorDirty = !newBuffer;
+                m_cursorDirty =
+                    WRenderHelper::getGraphicsApi(renderWindowD()->rc())
+                        == QSGRendererInterface::Vulkan
+                    ? !newBuffer
+                    : false;
             }
 
             if (newBuffer) {
@@ -1607,6 +1670,77 @@ QVector<std::pair<OutputHelper*, WBufferRenderer*>>
 WOutputRenderWindowPrivate::doRenderOutputs(qw_output *needsFrameOutput, const QList<OutputHelper*> &outputs,
                                             bool forceRender)
 {
+    if (WRenderHelper::getGraphicsApi(rc()) != QSGRendererInterface::Vulkan) {
+        QVector<OutputHelper *> renderResults;
+        renderResults.reserve(outputs.size());
+        for (OutputHelper *helper : std::as_const(outputs)) {
+            if (Q_LIKELY(needsFrameOutput)) {
+                if (helper->qwoutput() != needsFrameOutput)
+                    continue;
+                else
+                    Q_ASSERT(!helper->framePending());
+            }
+
+            if (Q_LIKELY(!forceRender)) {
+                if (helper->framePending())
+                    continue;
+
+                // Render if output will be enabled OR has extraState to commit
+                // Note: Even when disabling, we need to render once to commit the disabled state
+                // (extraState will contain the ENABLED=false change)
+                bool shouldRender = helper->willBeEnabled() || helper->extraState();
+                if (Q_UNLIKELY(!WOutputViewportPrivate::get(helper->output())->renderable())
+                    || !shouldRender)
+                    continue;
+
+                if (!(helper->needsFrame() || helper->contentIsDirty()))
+                    continue;
+
+                if (!helper->contentIsDirty()) {
+                    renderResults.append(helper);
+                    continue;
+                }
+            }
+
+            Q_ASSERT(helper->output()->output()->scale()
+                     <= helper->output()->devicePixelRatio());
+
+            const auto &format = helper->qwoutput()->handle()->render_format;
+            const auto renderMatrix = helper->output()->renderMatrix();
+
+            // maybe using the other WOutputViewport's QSGTextureProvider
+            if (!helper->output()->depends().isEmpty())
+                updateDirtyNodes();
+
+            qw_buffer *buffer = helper->beginRender(
+                helper->bufferRenderer(),
+                helper->output()->output()->size(),
+                format,
+                WBufferRenderer::RedirectOpenGLContextDefaultFrameBufferObject);
+            Q_ASSERT(buffer == helper->bufferRenderer()->currentBuffer());
+            if (buffer) {
+                helper->render(helper->bufferRenderer(),
+                               0,
+                               renderMatrix,
+                               helper->output()->effectiveSourceRect(),
+                               helper->output()->targetRect(),
+                               helper->output()->preserveColorContents());
+            }
+            renderResults.append(helper);
+        }
+
+        QVector<std::pair<OutputHelper *, WBufferRenderer *>> needsCommit;
+        needsCommit.reserve(renderResults.size());
+        for (auto helper : std::as_const(renderResults)) {
+            auto bufferRenderer = helper->afterRender();
+            if (bufferRenderer)
+                needsCommit.append({ helper, bufferRenderer });
+        }
+
+        rendererList.clear();
+        return needsCommit;
+    }
+
     QVector<OutputHelper*> renderResults;
     renderResults.reserve(outputs.size());
     for (OutputHelper *helper : std::as_const(outputs)) {
@@ -1796,10 +1930,13 @@ bool WOutputRenderWindowPrivate::prepareTextureSamplingForRenderPass(qw_buffer *
 {
     Q_ASSERT(preparedTextures);
     preparedTextures->clear();
+    m_currentPreparedTextures = nullptr;
+    m_currentPreparedTextureSet.clear();
 
     if (WRenderHelper::getGraphicsApi(rc()) != QSGRendererInterface::Vulkan)
         return true;
 
+    m_currentPreparedTextures = preparedTextures;
     W_Q(WOutputRenderWindow);
     QSet<qw_texture *> seenTextures;
     qsizetype skippedCurrentRenderTarget = 0;
@@ -1883,6 +2020,7 @@ bool WOutputRenderWindowPrivate::prepareTextureSamplingForRenderPass(qw_buffer *
         }
 
         preparedTextures->append(texture);
+        m_currentPreparedTextureSet.insert(texture);
     }
 
     return true;
@@ -1900,10 +2038,20 @@ bool WOutputRenderWindowPrivate::prepareTextureForCurrentRenderPass(qw_texture *
     if (m_currentPreparedTextureSet.contains(texture))
         return true;
 
+    W_Q(WOutputRenderWindow);
+    QElapsedTimer prepareTimer;
+    if (WVulkanTrace::enabled())
+        prepareTimer.start();
     const bool prepareOk = WRenderHelper::prepareTextureForSampling(rc(),
                                                                     m_renderer,
                                                                     texture,
                                                                     purpose);
+    WVulkanTrace::sampleDynamicDisposition(
+        q,
+        texture,
+        prepareOk ? WVulkanTrace::SampleDisposition::Prepared
+                  : WVulkanTrace::SampleDisposition::PrepareFailed,
+        prepareTimer.isValid() ? prepareTimer.nsecsElapsed() / 1000 : 0);
     if (!prepareOk) {
         failCurrentFrame();
         return false;
@@ -1918,8 +2066,11 @@ bool WOutputRenderWindowPrivate::finishTextureSamplingForRenderPass(const QVecto
                                                                     const char *purpose,
                                                                     int sourceIndex)
 {
-    if (WRenderHelper::getGraphicsApi(rc()) != QSGRendererInterface::Vulkan)
+    if (WRenderHelper::getGraphicsApi(rc()) != QSGRendererInterface::Vulkan) {
+        m_currentPreparedTextures = nullptr;
+        m_currentPreparedTextureSet.clear();
         return true;
+    }
 
     W_Q(WOutputRenderWindow);
     bool ok = true;
@@ -2040,6 +2191,79 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
     Q_ASSERT(!inRendering);
     if (!renderEnabled)
         return;
+
+    if (WRenderHelper::getGraphicsApi(rc()) != QSGRendererInterface::Vulkan) {
+        inRendering = true;
+
+        W_Q(WOutputRenderWindow);
+        for (OutputLayer *layer : std::as_const(layers)) {
+            layer->beforeRender(q);
+        }
+
+        rc()->polishItems();
+
+        if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
+            rc()->beginFrame();
+        rc()->sync();
+
+        QQuickAnimatorController_advance(animationController.get());
+        Q_EMIT q->beforeRendering();
+        runAndClearJobs(&beforeRenderingJobs);
+
+        auto needsCommit = doRenderOutputs(needsFrameOutput, outputs, forceRender);
+
+        Q_EMIT q->afterRendering();
+        runAndClearJobs(&afterRenderingJobs);
+
+        if (QSGRendererInterface::isApiRhiBased(WRenderHelper::getGraphicsApi()))
+            rc()->endFrame();
+
+        // prevent gles2-render exception in wlroots.
+        // wlroots may have render operations after commit, so do
+        // not move the location during the reset operation.
+        // eg: screencopy ext-image-capture
+        resetGlState();
+
+        QList<QPointer<WOutput>> committedOutputs;
+        if (doCommit) {
+            committedOutputs.reserve(needsCommit.size());
+            for (auto i : std::as_const(needsCommit)) {
+                if (Q_UNLIKELY(!i.first->framePending())) {
+                    if (Q_LIKELY(i.first->commit(i.second))) {
+                        // Make sure the output is still valid after commit
+                        auto output = i.first->output()->output();
+                        if (Q_LIKELY(needsFrameOutput)) {
+                            Q_ASSERT(output->handle() == needsFrameOutput);
+                            if (committedOutputs.isEmpty())
+                                committedOutputs.append(output);
+                        } else if (!committedOutputs.contains(output)) {
+                            committedOutputs.append(output);
+                        }
+                    }
+                }
+
+                if (i.second->currentBuffer()) {
+                    i.second->endRender();
+                }
+
+                i.first->resetState();
+            }
+        }
+
+        resetGlState();
+
+        // On Intel&Nvidia multi-GPU environment, wlroots using Intel card do render for all
+        // outputs, and blit nvidia's output buffer in drm_connector_state_update_primary_fb,
+        // the 'blit' behavior will make EGL context to Nvidia renderer. So must done current
+        // OpenGL context here in order to ensure QtQuick always make EGL context to Intel
+        // renderer before next frame.
+        if (glContext)
+            glContext->doneCurrent();
+
+        inRendering = false;
+        Q_EMIT q->renderEnd(committedOutputs);
+        return;
+    }
 
     inRendering = true;
     frameFailed = false;
@@ -2527,6 +2751,13 @@ bool WOutputRenderWindow::prepareTextureSamplingForRenderPass(qw_buffer *current
                                                   purpose,
                                                   sourceIndex,
                                                   preparedTextures);
+}
+
+bool WOutputRenderWindow::prepareTextureForCurrentRenderPass(qw_texture *texture,
+                                                             const char *purpose)
+{
+    Q_D(WOutputRenderWindow);
+    return d->prepareTextureForCurrentRenderPass(texture, purpose);
 }
 
 bool WOutputRenderWindow::finishTextureSamplingForRenderPass(const QVector<qw_texture *> &preparedTextures,

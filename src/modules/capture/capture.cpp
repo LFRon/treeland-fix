@@ -32,6 +32,7 @@
 #include <QQueue>
 #include <QQuickItemGrabResult>
 #include <QSGTextureProvider>
+#include <rhi/qrhi.h>
 
 #include <cstring>
 #include <memory>
@@ -966,6 +967,26 @@ static QImage normalizeCaptureImage(QImage image)
 
 void CaptureSource::createImage()
 {
+    auto *renderWindow = m_sourceList.size() == 1 && m_sourceList.first().second
+        ? m_sourceList.first().second->outputRenderWindow()
+        : nullptr;
+    const bool vulkanRenderer = renderWindow && renderWindow->rhi()
+        && renderWindow->rhi()->backend() == QRhi::Vulkan;
+    if (!vulkanRenderer) {
+        if (m_sourceList.size() == 1 && m_sourceList.first().first) {
+            auto grabber = new WTextureCapturer(m_sourceList.first().second, this);
+            grabber->grabToImage()
+                .then([this](QImage image) {
+                    m_image = std::move(image);
+                    Q_EMIT imageReady();
+                })
+                .onFailed([](const std::exception &e) {
+                    qCCritical(lcTlCapture) << e.what();
+                });
+        }
+        return;
+    }
+
     if (m_sourceList.size() != 1 || !m_sourceList.first().first || !m_sourceList.first().second) {
         qCWarning(lcTlCapture) << "Cannot create capture image from invalid source list"
                                << "sourceCount" << m_sourceList.size();
@@ -973,7 +994,6 @@ void CaptureSource::createImage()
         return;
     }
 
-    auto renderWindow = m_sourceList.first().second->outputRenderWindow();
     auto renderer = renderWindow ? renderWindow->renderer() : nullptr;
     auto buffer = sourceDMABuffer();
     if (!buffer || !renderer) {
@@ -1104,10 +1124,17 @@ CaptureSourceOutput::CaptureSourceOutput(WOutputViewport *viewport)
 qw_buffer *CaptureSourceOutput::internalBuffer()
 {
     Q_ASSERT(m_sourceList.size() == 1);
-    if (m_sourceList.first().first && m_outputViewport)
+    if (!m_sourceList.first().first || !m_outputViewport)
+        return nullptr;
+
+    auto *renderWindow = m_sourceList.first().second->outputRenderWindow();
+    const bool vulkanRenderer = renderWindow && renderWindow->rhi()
+        && renderWindow->rhi()->backend() == QRhi::Vulkan;
+    if (vulkanRenderer)
         return m_outputViewport->lastBuffer();
 
-    qCWarning(lcTlCapture) << "Output capture source has no valid output viewport";
+    if (m_outputViewport->wTextureProvider())
+        return m_outputViewport->wTextureProvider()->qwBuffer();
     return nullptr;
 }
 
@@ -1137,12 +1164,19 @@ CaptureSourceRegion::CaptureSourceRegion(WOutputViewport *viewport, const QRect 
 
 qw_buffer *CaptureSourceRegion::internalBuffer()
 {
-    if (m_sourceList.size() == 1 && m_sourceList.first().first
-        && !m_viewportRegions.isEmpty() && m_viewportRegions.first().first) {
-        return m_viewportRegions.first().first->lastBuffer();
+    if (m_sourceList.size() != 1 || !m_sourceList.first().first
+        || m_viewportRegions.isEmpty() || !m_viewportRegions.first().first) {
+        return nullptr;
     }
 
-    qCWarning(lcTlCapture) << "Region capture source has no valid output viewport";
+    auto *renderWindow = m_sourceList.first().second->outputRenderWindow();
+    const bool vulkanRenderer = renderWindow && renderWindow->rhi()
+        && renderWindow->rhi()->backend() == QRhi::Vulkan;
+    if (vulkanRenderer)
+        return m_viewportRegions.first().first->lastBuffer();
+
+    if (m_sourceList.first().second->wTextureProvider())
+        return m_sourceList.first().second->wTextureProvider()->qwBuffer();
     return nullptr;
 }
 
