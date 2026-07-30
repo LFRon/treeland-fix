@@ -195,6 +195,8 @@ qt_add_qml_module(libtreeland
         surface/surfaceproxy.h
         surface/surfacewrapper.cpp
         surface/surfacewrapper.h
+        surface/quicktile.cpp
+        surface/quicktile.h
         utils/cmdline.cpp
         utils/cmdline.h
         utils/propertymonitor.cpp
@@ -261,6 +263,7 @@ qt_add_qml_module(libtreeland
         core/qml/FadeBehavior.qml
         core/qml/CaptureSelectorLayer.qml
         core/qml/WindowPickerLayer.qml
+        core/qml/EdgeTilePreview.qml
         core/qml/LockScreenFallback.qml
         core/qml/PrelaunchSplash.qml
     RESOURCE_PREFIX

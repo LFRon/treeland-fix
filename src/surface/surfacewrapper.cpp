@@ -196,6 +196,7 @@ void SurfaceWrapper::invalidate()
 {
     Q_ASSERT_X(!m_wrapperAboutToRemove, Q_FUNC_INFO, "Can't call `invalidate` twice!");
     m_wrapperAboutToRemove = true;
+    m_pendingPrelaunchXWaylandStackSync = false;
     Q_EMIT aboutToBeInvalidated();
 
     if (!m_skipDockPreView)
@@ -482,6 +483,10 @@ void SurfaceWrapper::setup()
                     updateX11SkipFlags();
                     updateSizeCapabilities();
                 });
+        connect(xwaylandSurface,
+                &WXWaylandSurface::x11MapCompleted,
+                this,
+                &SurfaceWrapper::syncPrelaunchXWaylandStacking);
         updateX11SkipFlags();
     }
     // Connect DConfig windowRadius change so QML bindings re-evaluate radius()
@@ -549,6 +554,8 @@ void SurfaceWrapper::setActivate(bool activate)
 
     Q_ASSERT(!activate || hasActiveCapability());
     m_isActivated = activate;
+    if (!activate)
+        m_pendingPrelaunchXWaylandStackSync = false;
 
     if (m_attention && m_isActivated)
         setAttention(false);
@@ -714,6 +721,8 @@ void SurfaceWrapper::completeSplashTransition(const QSizeF &targetImplicitSize, 
         m_decoration->stackBefore(m_surfaceItem);
     }
 
+    requestPrelaunchXWaylandStackSync();
+
     m_surfaceItem->setVisible(true);
     Q_ASSERT(m_prelaunchSplash);
     m_prelaunchSplash->setVisible(false);
@@ -724,6 +733,52 @@ void SurfaceWrapper::completeSplashTransition(const QSizeF &targetImplicitSize, 
     // Now that the splash is hidden and deleted, the surface can be considered active if it's
     // mapped
     updateHasActiveCapability(ActiveControlState::MappedOrSplash, surface() && surface()->mapped());
+}
+
+void SurfaceWrapper::requestPrelaunchXWaylandStackSync()
+{
+    if (m_isProxy || !m_isActivated || m_type != Type::XWayland)
+        return;
+
+    auto *xwaylandSurface = qobject_cast<WXWaylandSurface *>(m_shellSurface);
+    if (!xwaylandSurface || xwaylandSurface->isBypassManager())
+        return;
+
+    m_pendingPrelaunchXWaylandStackSync = true;
+    if (!xwaylandSurface->isX11Mapped()) {
+        qCDebug(lcTlSurface)
+            << "Deferring active prelaunch XWayland stacking until X11 map completes for"
+            << appId();
+        return;
+    }
+
+    syncPrelaunchXWaylandStacking();
+}
+
+void SurfaceWrapper::syncPrelaunchXWaylandStacking()
+{
+    if (!m_pendingPrelaunchXWaylandStackSync)
+        return;
+
+    auto *xwaylandSurface = qobject_cast<WXWaylandSurface *>(m_shellSurface);
+    if (m_wrapperAboutToRemove || m_isProxy || !m_isActivated || m_type != Type::XWayland
+        || !xwaylandSurface || xwaylandSurface->isBypassManager()) {
+        m_pendingPrelaunchXWaylandStackSync = false;
+        return;
+    }
+
+    if (!xwaylandSurface->isX11Mapped())
+        return;
+
+    // wlroots initially places a managed XWayland window at the bottom of the native X11
+    // stack. A prelaunch wrapper is already activated, so the normal activation path cannot
+    // observe a wrapper change and raise the newly attached X11 window. Synchronize both
+    // stacks after wlroots has finished handling XCB_MAP_NOTIFY.
+    stackToLast();
+    xwaylandSurface->restack(nullptr, WXWaylandSurface::XCB_STACK_MODE_ABOVE);
+    m_pendingPrelaunchXWaylandStackSync = false;
+    qCDebug(lcTlSurface)
+        << "Synchronized active prelaunch XWayland stacking after X11 map for" << appId();
 }
 
 WSurface *SurfaceWrapper::surface() const
@@ -1012,42 +1067,87 @@ SurfaceWrapper::State SurfaceWrapper::surfaceState() const
     return m_surfaceState;
 }
 
-void SurfaceWrapper::setSurfaceState(State newSurfaceState)
+bool SurfaceWrapper::checkSetSurfaceState(State newSurfaceState)
 {
     if (m_wrapperAboutToRemove)
-        return;
+        return false;
 
     if (m_geometryAnimation)
-        return;
+        return false;
 
     if (m_surfaceState == newSurfaceState)
-        return;
+        return false;
 
     if (container()->filterSurfaceStateChange(this, newSurfaceState, m_surfaceState))
+        return false;
+
+    return true;
+}
+
+void SurfaceWrapper::setSurfaceState(State newSurfaceState)
+{
+    if (!checkSetSurfaceState(newSurfaceState))
         return;
 
-    QRectF targetGeometry;
-
-    if (newSurfaceState == State::Maximized) {
-        targetGeometry = m_maximizedGeometry;
-    } else if (newSurfaceState == State::Fullscreen) {
-        targetGeometry = m_fullscreenGeometry;
-    } else if (newSurfaceState == State::Normal) {
-        targetGeometry = m_normalGeometry;
-    } else if (newSurfaceState == State::Tiling) {
-        targetGeometry = m_tilingGeometry;
-    }
+    const QRectF targetGeometry = targetGeometryForState(newSurfaceState);
 
     if (targetGeometry.isValid()) {
         startStateChangeAnimation(newSurfaceState, targetGeometry);
     } else {
-        if (m_geometryAnimation) {
-            m_geometryAnimation->disconnect(this);
-            m_geometryAnimation->deleteLater();
-            m_geometryAnimation = nullptr;
-        }
-
+        abortGeometryAnimation();
         doSetSurfaceState(newSurfaceState);
+    }
+}
+
+void SurfaceWrapper::setSurfaceStateDirectly(State newSurfaceState)
+{
+    if (!checkSetSurfaceState(newSurfaceState))
+        return;
+
+    const QRectF targetGeometry = targetGeometryForState(newSurfaceState);
+    abortGeometryAnimation();
+
+    if (targetGeometry.isValid()) {
+        if (!applySurfaceStateGeometry(newSurfaceState, targetGeometry))
+            return;
+    } else {
+        doSetSurfaceState(newSurfaceState);
+    }
+}
+
+QRectF SurfaceWrapper::targetGeometryForState(State state) const
+{
+    switch (state) {
+    case State::Maximized:
+        return m_maximizedGeometry;
+    case State::Fullscreen:
+        return m_fullscreenGeometry;
+    case State::Normal:
+        return m_normalGeometry;
+    case State::Tiling:
+        return m_tilingGeometry;
+    default:
+        return QRectF();
+    }
+}
+
+bool SurfaceWrapper::applySurfaceStateGeometry(State state, const QRectF &targetGeometry)
+{
+    if (!resize(targetGeometry.size(), true))
+        return false;
+
+    setPosition(alignToPixelGrid(targetGeometry.topLeft()));
+    doSetSurfaceState(state);
+    resize(targetGeometry.size());
+    return true;
+}
+
+void SurfaceWrapper::abortGeometryAnimation()
+{
+    if (m_geometryAnimation) {
+        m_geometryAnimation->disconnect(this);
+        m_geometryAnimation->deleteLater();
+        m_geometryAnimation = nullptr;
     }
 }
 
@@ -1508,27 +1608,18 @@ void SurfaceWrapper::onAnimationReady()
     Q_ASSERT(m_pendingState != m_surfaceState);
     Q_ASSERT(m_pendingGeometry.isValid());
 
-    if (!resize(m_pendingGeometry.size(), true)) {
+    if (!applySurfaceStateGeometry(m_pendingState, m_pendingGeometry)) {
         // abort change state if cannot resize
-        m_geometryAnimation->disconnect(this);
-        m_geometryAnimation->deleteLater();
-        m_geometryAnimation = nullptr;
+        abortGeometryAnimation();
         return;
     }
-
-    QPointF alignedPos = alignToPixelGrid(m_pendingGeometry.topLeft());
-    setPosition(alignedPos);
-    doSetSurfaceState(m_pendingState);
-    resize(m_pendingGeometry.size());
 }
 
 void SurfaceWrapper::onAnimationFinished()
 {
     setXwaylandPositionFromSurface(true);
     Q_ASSERT(m_geometryAnimation);
-    m_geometryAnimation->disconnect(this);
-    m_geometryAnimation->deleteLater();
-    m_geometryAnimation = nullptr;
+    abortGeometryAnimation();
 }
 
 bool SurfaceWrapper::startStateChangeAnimation(State targetState, const QRectF &targetGeometry)

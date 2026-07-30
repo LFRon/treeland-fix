@@ -5,6 +5,7 @@
 #include "qwglobal.h"
 #include "wseat.h"
 #include "private/wsurface_p.h"
+#include "utils/private/wvulkantrace_p.h"
 #include "woutput.h"
 
 #include <qwoutput.h>
@@ -85,6 +86,13 @@ void WSurfacePrivate::connect()
     QObject::connect(handle(), &qw_surface::notify_commit, q, [this] {
         on_commit();
     });
+    if (WVulkanTrace::enabled()) {
+        QObject::connect(handle(), &qw_surface::notify_commit, q, [q, this] {
+            WVulkanTrace::surfaceCommit(q, q->pid(), nativeHandle()->current.seq,
+                                        nativeHandle()->current.committed,
+                                        q->buffer());
+        });
+    }
     QObject::connect(handle(), &qw_surface::notify_map, q, &WSurface::mappedChanged);
     QObject::connect(handle(), &qw_surface::notify_unmap, q, &WSurface::mappedChanged);
     QObject::connect(handle(), &qw_surface::notify_new_subsurface, q, [q, this] (wlr_subsurface *sub) {
@@ -126,14 +134,13 @@ void WSurfacePrivate::setBuffer(qw_buffer *newBuffer)
 {
     if (buffer) {
         if (auto clientBuffer = qw_client_buffer::get(*buffer)) {
-            Q_ASSERT(clientBuffer->handle()->n_ignore_locks > 0);
-            clientBuffer->handle()->n_ignore_locks--;
+            clientBuffer->remove_ignore_lock();
         }
     }
 
     if (newBuffer) {
         if (auto clientBuffer = qw_client_buffer::get(*newBuffer)) {
-            clientBuffer->handle()->n_ignore_locks++;
+            clientBuffer->add_ignore_lock();
         }
 
         newBuffer->lock();

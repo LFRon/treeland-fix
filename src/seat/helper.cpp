@@ -69,7 +69,9 @@
 
 #include <WBackend>
 #include <WForeignToplevel>
+#include <WLinuxDmabufV1>
 #include <WOutput>
+#include <WPresentation>
 #include <WServer>
 #include <WSurfaceItem>
 #include <WXdgOutput>
@@ -84,7 +86,9 @@
 #include <woutputrenderwindow.h>
 #include <woutputviewport.h>
 #include <wqmlcreator.h>
+#include <wpointerconstraintsv1.h>
 #include <wquickcursor.h>
+#include <wrelativepointermanagerv1.h>
 #include <wrenderhelper.h>
 #include <wseat.h>
 #include <wsecuritycontextmanager.h>
@@ -1660,6 +1664,8 @@ void Helper::init(Treeland::Treeland *treeland)
 
     m_foreignToplevel = m_server->attach<WForeignToplevel>();
     m_extForeignToplevelListV1 = m_server->attach<WExtForeignToplevelListV1>();
+    m_server->attach<WRelativePointerManagerV1>();
+    auto *pointerConstraints = m_server->attach<WPointerConstraintsV1>();
 
     connect(m_shellHandler,
             &ShellHandler::surfaceWrapperAdded,
@@ -1839,6 +1845,135 @@ void Helper::init(Treeland::Treeland *treeland)
         m_rootSurfaceContainer->setupSeatManagement();
     }
 
+    auto installPointerConstraintPolicy = [this](WSeat *seat) {
+        if (!seat)
+            return;
+
+        seat->setPointerConstraintActivationFilter(
+            [this](const WSeat::PointerConstraintActivationContext &context, QString *reason) {
+                auto setReason = [reason](const QString &text) {
+                    if (reason)
+                        *reason = text;
+                };
+
+                if (context.constraintType == WSeat::PointerConstraintType::Confined)
+                    return true;
+
+                if (!context.seat) {
+                    setReason(QStringLiteral("seat is null"));
+                    return false;
+                }
+
+                if (!context.surface) {
+                    setReason(QStringLiteral("surface is null"));
+                    return false;
+                }
+
+                if (m_currentMode != CurrentMode::Normal) {
+                    setReason(QStringLiteral("current mode is %1, not normal")
+                                  .arg(static_cast<int>(m_currentMode)));
+                    return false;
+                }
+
+                if (m_showDesktop == WindowManagementInterfaceV1::DesktopState::Show) {
+                    setReason(QStringLiteral("show desktop is active"));
+                    return false;
+                }
+
+                auto *currentWorkspace = workspace();
+                if (!m_rootSurfaceContainer || !currentWorkspace || !currentWorkspace->current()) {
+                    setReason(QStringLiteral("workspace/root container is not ready"));
+                    return false;
+                }
+
+                auto *wrapper = m_rootSurfaceContainer->getSurface(context.surface);
+                if (!wrapper) {
+                    setReason(QStringLiteral("surface has no wrapper"));
+                    return false;
+                }
+
+                if (!wrapper->surface() || !wrapper->surface()->mapped()) {
+                    setReason(QStringLiteral("wrapper surface is not mapped"));
+                    return false;
+                }
+
+                if (!wrapper->isVisible()) {
+                    setReason(QStringLiteral("wrapper is not visible"));
+                    return false;
+                }
+
+                if (wrapper->isMinimized()) {
+                    setReason(QStringLiteral("wrapper is minimized"));
+                    return false;
+                }
+
+                if (!wrapper->showOnWorkspace(currentWorkspace->current()->id())) {
+                    setReason(QStringLiteral("wrapper is not on current workspace"));
+                    return false;
+                }
+
+                auto *activated = m_rootSurfaceContainer->getActivatedSurfaceForSeat(context.seat);
+                if (activated != wrapper) {
+                    setReason(QStringLiteral("wrapper is not activated for seat"));
+                    return false;
+                }
+
+                return true;
+            });
+
+        connect(this,
+                &Helper::currentModeChanged,
+                seat,
+                &WSeat::reevaluatePointerConstraint,
+                Qt::UniqueConnection);
+
+        if (m_windowManagementInterfaceV1) {
+            connect(m_windowManagementInterfaceV1,
+                    &WindowManagementInterfaceV1::desktopStateChanged,
+                    seat,
+                    &WSeat::reevaluatePointerConstraint,
+                    Qt::UniqueConnection);
+        }
+
+        if (auto *currentWorkspace = workspace()) {
+            connect(currentWorkspace,
+                    &Workspace::currentChanged,
+                    seat,
+                    &WSeat::reevaluatePointerConstraint,
+                    Qt::UniqueConnection);
+        }
+
+        if (auto *seatContainer = m_rootSurfaceContainer
+                ? m_rootSurfaceContainer->getSeatContainer(seat)
+                : nullptr) {
+            connect(seatContainer,
+                    &SeatSurfaceManager::activatedSurfaceChanged,
+                    seat,
+                    &WSeat::reevaluatePointerConstraint,
+                    Qt::UniqueConnection);
+        }
+
+        seat->reevaluatePointerConstraint();
+    };
+
+    for (auto *seat : m_seatManager->seats()) {
+        installPointerConstraintPolicy(seat);
+    }
+
+    connect(m_seatManager,
+            &SeatsManager::seatAdded,
+            this,
+            installPointerConstraintPolicy);
+
+    connect(pointerConstraints,
+            &WPointerConstraintsV1::newConstraint,
+            this,
+            [this](qw_pointer_constraint_v1 *) {
+                for (auto *seat : m_seatManager->seats()) {
+                    seat->reevaluatePointerConstraint();
+                }
+            });
+
     if (!m_primarySeat) {
         qCCritical(lcTlCore) << "No seat available after initialization, cannot continue";
         return;
@@ -1856,8 +1991,29 @@ void Helper::init(Treeland::Treeland *treeland)
     }
 
     m_allocator = qw_allocator::autocreate(*m_backend->handle(), *m_renderer);
-    m_renderer->init_wl_display(*m_server->handle());
-    qw_drm::create(*m_server->handle(), *m_renderer);
+    const bool vulkanRenderer =
+        WRenderHelper::getGraphicsApi() == QSGRendererInterface::Vulkan;
+    if (vulkanRenderer) {
+        if (!m_renderer->init_wl_shm(*m_server->handle()))
+            qCFatal(lcTlCore) << "Failed to initialize wl_shm for Vulkan renderer";
+
+        m_server->attach<WLinuxDmabufV1>(m_renderer);
+        auto *presentation = m_server->attach<WPresentation>(m_backend->handle());
+        m_renderWindow->setPresentation(presentation);
+
+        if (m_renderer->supports_implicit_dmabuf_texture_formats()) {
+            if (!qw_drm::create(*m_server->handle(), *m_renderer)) {
+                qCWarning(lcTlCore)
+                    << "Failed to create legacy wl_drm global despite implicit DMA-BUF support";
+            }
+        } else {
+            qCInfo(lcTlCore)
+                << "Skipping legacy wl_drm global: Vulkan renderer does not support implicit DMA-BUF modifiers";
+        }
+    } else {
+        m_renderer->init_wl_display(*m_server->handle());
+        qw_drm::create(*m_server->handle(), *m_renderer);
+    }
 
     // free follow display
     m_compositor = qw_compositor::create(*m_server->handle(), 6, *m_renderer);
@@ -2367,6 +2523,9 @@ bool Helper::beforeDisposeEvent(WSeat *seat, QWindow *targetWindow, QInputEvent 
 
             auto increment_pos = ev->globalPosition() - moveResizeState.initialPosition;
             m_rootSurfaceContainer->doMoveResizeForSeat(seat, increment_pos);
+            // Edge-tiling detection during move (resize is not tiled).
+            if (moveResizeState.edges == Qt::Edges())
+                m_rootSurfaceContainer->detectEdgeTilingForSeat(seat);
 
             return true;
         } else if (event->type() == QEvent::KeyPress
