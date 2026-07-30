@@ -382,11 +382,25 @@ IME::Features WTextInputV2::features() const
 void WTextInputV2::sendEnter(WSurface *surface)
 {
     W_D(WTextInputV2);
+    if (d->focusedSurface == surface)
+        return;
+    if (d->focusedSurface) {
+        disconnect(d->focusedSurface, &WSurface::aboutToBeInvalidated, this, &WTextInputV2::sendLeave);
+        if (d->enabledSurface == d->focusedSurface) {
+            qCInfo(lcWlTextInput) << "TIv2 sendEnter: implicit leave (enabled) from" << d->focusedSurface;
+            Q_EMIT disabled();
+        }
+        zwp_text_input_v2_send_leave(d->resource, 0, d->focusedSurface->handle()->handle()->resource);
+    }
     d->focusedSurface = surface;
     connect(d->focusedSurface, &WSurface::aboutToBeInvalidated, this, &WTextInputV2::sendLeave, Qt::UniqueConnection);
     zwp_text_input_v2_send_enter(d->resource, 0, surface->handle()->handle()->resource);
     if (d->enabledSurface == d->focusedSurface) {
+        qCInfo(lcWlTextInput) << "TIv2 sendEnter: enabled (enabledSurface == focusedSurface)" << surface;
         Q_EMIT enabled();
+    } else {
+        qCInfo(lcWlTextInput) << "TIv2 sendEnter: NOT enabled. focused:" << surface
+                              << "enabled:" << d->enabledSurface;
     }
 }
 
@@ -397,6 +411,10 @@ void WTextInputV2::sendLeave()
         qCWarning(lcWlTextInput()) << "Send leave to a null focused surface.";
         return;
     }
+    qCInfo(lcWlTextInput) << "TIv2 sendLeave: focused:" << d->focusedSurface
+                          << "enabled:" << d->enabledSurface
+                          << "wasEnabled:" << (d->enabledSurface == d->focusedSurface);
+    disconnect(d->focusedSurface, &WSurface::aboutToBeInvalidated, this, &WTextInputV2::sendLeave);
     zwp_text_input_v2_send_leave(d->resource, 0, d->focusedSurface->handle()->handle()->resource);
     if (d->enabledSurface == d->focusedSurface) {
         Q_EMIT disabled();
@@ -430,6 +448,15 @@ WTextInputV2::WTextInputV2(QObject *parent)
     connect(this, &WTextInputV2::enableOnSurface, this, [this] {
         if (focusedSurface()) {
             Q_EMIT enabled();
+        } else if (d_func()->enabledSurface) {
+            auto *s = seat();
+            if (s) {
+                auto *focus = s->keyboardFocusSurface();
+                if (focus && focus->handle()->handle() == d_func()->enabledSurface->handle()->handle()) {
+                    qCInfo(lcWlTextInput) << "TIv2 enableOnSurface: focusedSurface was lost, re-entering from seat focus";
+                    sendEnter(focus);
+                }
+            }
         }
     });
     connect(this, &WTextInputV2::disableOnSurface, this, [this] {
