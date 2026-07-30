@@ -184,6 +184,10 @@ public:
             // will call 'xdg_pointer_grab_enter' in wlroots, and the 'xdg_pointer_grab_enter'
             // will call 'wlr_seat_pointer_clear_focus' if the surface's client and the popup's
             // client is not equal.
+            qCInfo(lcWlSeat) << "doEnter FAILED: pointer_notify_enter cleared focus."
+                             << "target surface:" << surface
+                             << "old focused:" << tmp
+                             << "has pointer grab:" << handle()->handle()->pointer_state.grab;
             oldPointerFocusSurface = tmp;
             return false;
         }
@@ -1029,8 +1033,13 @@ bool WSeat::sendEvent(WSurface *target, QObject *shellObject, QObject *eventObje
     case QEvent::HoverMove: Q_FALLTHROUGH();
     case QEvent::MouseMove: {
         // Maybe this event is eat by the event grabber
-        if (target != seat->pointerFocusSurface())
+        if (target != seat->pointerFocusSurface()) {
+            if (event->type() == QEvent::MouseButtonPress)
+                qCInfo(lcWlSeat) << "sendEvent: MouseButtonPress skipped afterHandleEvent."
+                                 << "target:" << target
+                                 << "pointerFocus:" << seat->pointerFocusSurface();
             return true;
+        }
         break;
     case QEvent::KeyPress:
     case QEvent::KeyRelease:

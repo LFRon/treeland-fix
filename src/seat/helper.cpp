@@ -2109,6 +2109,11 @@ void Helper::activateSurface(SurfaceWrapper *wrapper, Qt::FocusReason reason, WS
     if (wrapper && wrapper->isIMCandidatePanel())
         return;
 
+    qCDebug(lcTlActivation) << "activateSurface:" << wrapper
+                            << "reason:" << reason
+                            << "hasActive:" << (wrapper ? wrapper->hasActiveCapability() : true)
+                            << "hasFocus:" << (wrapper ? wrapper->hasFocusCapability() : true);
+
     // Plain activation: if the deepest modal is minimized, refuse to activate the parent
     // entirely. The user must explicitly unminimize the modal first (e.g., click it).
     SurfaceWrapper *originalWrapper = wrapper;
@@ -2703,6 +2708,9 @@ void Helper::setActivatedSurface(SurfaceWrapper *newActivateSurface, WSeat *seat
 
     if (seatContainer->activatedSurface() == newActivateSurface)
         return;
+
+    qCDebug(lcTlActivation) << "setActivatedSurface:" << newActivateSurface
+                            << "old:" << seatContainer->activatedSurface();
 
     const bool isPrimarySeat = (targetSeat == m_primarySeat);
     auto *oldPrimarySurface = isPrimarySeat ? activatedSurface() : nullptr;
