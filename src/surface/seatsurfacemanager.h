@@ -71,4 +71,5 @@ private:
 
     // Popup grab state
     bool m_hasPopupGrab = false;
+    QPointer<SurfaceWrapper> m_prePopupFocusSurface;
 };

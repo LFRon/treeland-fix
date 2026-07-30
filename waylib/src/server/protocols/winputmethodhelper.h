@@ -61,6 +61,7 @@ private:
     void notifyLeave();
     void resendKeyboardFocus();
     void handleKeyboardGrabBegin();
+    void handleKeyboardGrabEnd();
     void connectToTI(WTextInput *ti);
     void disableTI(WTextInput *ti);
     void handleTIEnabled();
