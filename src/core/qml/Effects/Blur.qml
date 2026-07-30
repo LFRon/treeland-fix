@@ -29,7 +29,7 @@ Item {
 
     // On Vulkan the RenderBufferBlitter backdrop-capture path is not supported
     // yet. Skip creating it (and dependent effect components) and fall back to
-    // a plain semi-transparent rectangle.
+    // a plain white rectangle.
     Loader {
         anchors.fill: parent
         sourceComponent: WaylibHelper.isVulkanBackend ? vulkanFallback : blitterContent
@@ -124,7 +124,7 @@ Item {
         Rectangle {
             anchors.fill: parent
             radius: root.radius
-            color: Qt.rgba(0, 0, 0, 0.3)
+            color: "white"
         }
     }
 }
