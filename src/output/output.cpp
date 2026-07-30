@@ -31,7 +31,6 @@
 #include <qwoutputlayout.h>
 
 #include <QQmlEngine>
-#include <QQuickWindow>
 
 #include <algorithm>
 #include <optional>
@@ -42,11 +41,8 @@
 
 Output *Output::create(WOutput *output, QQmlEngine *engine, QObject *parent)
 {
-    const bool vulkanRenderer =
-        QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan;
-    auto isSoftwareCursor = [vulkanRenderer](WOutput *output) -> bool {
-        return vulkanRenderer
-            || output->handle()->is_x11()
+    auto isSoftwareCursor = [](WOutput *output) -> bool {
+        return output->handle()->is_x11()
             || Helper::instance()->globalConfig()->forceSoftwareCursor();
     };
     QQmlComponent delegate(engine, "Treeland", "PrimaryOutput");
