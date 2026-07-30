@@ -4,12 +4,15 @@
 #include "seatsurfacemanager.h"
 
 #include "rootsurfacecontainer.h"
+#include "treelanduserconfig.hpp"
 #include "common/treelandlogging.h"
 #include "seat/helper.h"
 #include "seat/seatsmanager.h"
 #include "core/shellhandler.h"
+#include "output/output.h"
 
 #include <winputdevice.h>
+#include <wcursor.h>
 #include <woutput.h>
 #include <woutputitem.h>
 #include <woutputlayout.h>
@@ -25,6 +28,7 @@
 #include <wlr/types/wlr_data_device.h>
 
 #include <QDateTime>
+#include <QTimer>
 
 WAYLIB_SERVER_USE_NAMESPACE
 
@@ -158,6 +162,14 @@ void SeatSurfaceManager::beginMoveResize(SurfaceWrapper *surface, Qt::Edges edge
 {
     if (m_moveResizeState.surface)
         endMoveResize();
+    // Move of a tiled/maximized window: instantly de-tile to Normal BEFORE
+    // recording startGeometry, so startGeometry captures normalGeometry and no
+    // state-change animation contends with doMoveResize's setPosition.
+    if (edges == Qt::Edges()) {
+        const auto st = surface->surfaceState();
+        if (st == SurfaceWrapper::State::Tiling || st == SurfaceWrapper::State::Maximized)
+            surface->setSurfaceStateDirectly(SurfaceWrapper::State::Normal);
+    }
 
     if (surface->surfaceState() != SurfaceWrapper::State::Normal ||
         surface->isAnimationRunning())
@@ -167,6 +179,10 @@ void SeatSurfaceManager::beginMoveResize(SurfaceWrapper *surface, Qt::Edges edge
     m_moveResizeState.edges = edges;
     m_moveResizeState.startGeometry = surface->geometry();
     m_moveResizeState.settingPositionFlag = false;
+    m_moveResizeState.detectedTileMode = QuickTile::Mode::None;
+    m_moveResizeState.edgeTilePreviewActive = false;
+    m_moveResizeState.edgeTileInnerBorder = false;
+    m_moveResizeState.detectedTileOutput = nullptr;
 
     surface->setXwaylandPositionFromSurface(false);
     surface->setPositionAutomatic(false);
@@ -202,28 +218,42 @@ void SeatSurfaceManager::doMoveResize(const QPointF &delta)
 
 void SeatSurfaceManager::endMoveResize()
 {
+    stopEdgeTileDelay();
     if (!m_moveResizeState.surface)
         return;
 
     auto surface = m_moveResizeState.surface;
-    auto *sh = surface->shellSurface();
-    if (sh && sh->isInitialized()) {
-        // Mark resize operation as complete
-        surface->shellSurface()->setResizeing(false);
+    const auto detectedMode = m_moveResizeState.detectedTileMode;
+    const bool previewActive = m_moveResizeState.edgeTilePreviewActive;
 
-        // Ensure window is still visible on screen after move/resize
-        if (m_rootContainer) {
-            m_rootContainer->ensureSurfaceNormalPositionValid(surface);
-        }
-
-        surface->setXwaylandPositionFromSurface(true);
-    }
-
-    // Clear state and notify
+    // Clear state first so filterSurfaceStateChange won't intercept the
+    // subsequent setSurfaceState(Tiling) issued by QuickTile::apply.
     m_moveResizeState.surface = nullptr;
     m_moveResizeState.edges = Qt::Edges();
     m_moveResizeState.startGeometry = QRectF();
     m_moveResizeState.initialPosition = QPointF();
+    m_moveResizeState.settingPositionFlag = false;
+    m_moveResizeState.detectedTileMode = QuickTile::Mode::None;
+    m_moveResizeState.edgeTilePreviewActive = false;
+    m_moveResizeState.edgeTileInnerBorder = false;
+    m_moveResizeState.detectedTileOutput = nullptr;
+
+    auto *sh = surface->shellSurface();
+    if (sh && sh->isInitialized()) {
+        // Mark resize operation as complete
+        surface->shellSurface()->setResizeing(false);
+        surface->setXwaylandPositionFromSurface(true);
+    }
+    if (!previewActive || detectedMode == QuickTile::Mode::None) {
+        // Ensure window is still visible on screen after a plain move/resize.
+        if (m_rootContainer)
+            m_rootContainer->ensureSurfaceNormalPositionValid(surface);
+    } else {
+        Output *out = nullptr;
+        if (m_rootContainer && m_seat && m_seat->cursor())
+            out = m_rootContainer->outputAt(m_seat->cursor()->position());
+        QuickTile::apply(surface, detectedMode, out);
+    }
 
     Q_EMIT moveResizeChanged();
 }
@@ -240,6 +270,12 @@ void SeatSurfaceManager::cancelMoveResize()
 
     auto surface = m_moveResizeState.surface;
     auto startGeo = m_moveResizeState.startGeometry;
+    // Cancel discards any edge-tiling detected during the move: restore the
+    // original (normal) geometry captured at beginMoveResize.
+    m_moveResizeState.detectedTileMode = QuickTile::Mode::None;
+    m_moveResizeState.detectedTileOutput = nullptr;
+    m_moveResizeState.edgeTilePreviewActive = false;
+    m_moveResizeState.edgeTileInnerBorder = false;
 
     // Restore original geometry before ending
     if (m_moveResizeState.edges != Qt::Edges()) {
@@ -257,6 +293,36 @@ void SeatSurfaceManager::cancelMoveResize(SurfaceWrapper *surface)
     if (m_moveResizeState.surface != surface)
         return;
     endMoveResize();
+}
+
+void SeatSurfaceManager::startEdgeTileDelay()
+{
+    if (!m_edgeTileDelayTimer) {
+        m_edgeTileDelayTimer = new QTimer(this);
+        m_edgeTileDelayTimer->setSingleShot(true);
+        connect(m_edgeTileDelayTimer, &QTimer::timeout, this, [this]() {
+            auto &mr = m_moveResizeState;
+            if (mr.surface && mr.edges == Qt::Edges()
+                && mr.detectedTileMode != QuickTile::Mode::None) {
+                mr.edgeTilePreviewActive = true;
+                Output *out = nullptr;
+                if (m_rootContainer && m_seat && m_seat->cursor())
+                    out = m_rootContainer->outputAt(m_seat->cursor()->position());
+                if (m_rootContainer)
+                    m_rootContainer->updateEdgeTilePreview(mr.detectedTileMode, out);
+            }
+        });
+    }
+    auto *helper = Helper::instance();
+    auto *cfg = helper ? helper->config() : nullptr;
+    m_edgeTileDelayTimer->setInterval(cfg ? cfg->edgeInnerDelayMs() : 250);
+    m_edgeTileDelayTimer->start();
+}
+
+void SeatSurfaceManager::stopEdgeTileDelay()
+{
+    if (m_edgeTileDelayTimer)
+        m_edgeTileDelayTimer->stop();
 }
 
 bool SeatSurfaceManager::shouldHandleShortcuts() const

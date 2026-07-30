@@ -4,11 +4,15 @@
 #pragma once
 
 #include "surface/surfacewrapper.h"
+#include "surface/quicktile.h"
 #include <wseat.h>
 #include <QQuickItem>
 #include <QMap>
 
+class QTimer;
+
 class RootSurfaceContainer;
+class Output;
 class Helper;
 
 class SeatSurfaceManager : public QObject
@@ -32,6 +36,11 @@ public:
         QRectF startGeometry;               ///< Geometry at start of move/resize
         QPointF initialPosition;            ///< Initial cursor position
         bool settingPositionFlag = false;   ///< Flag to prevent recursive updates
+        QuickTile::Mode detectedTileMode =
+            QuickTile::Mode::None;          ///< Edge-tiling mode detected during move
+        bool edgeTilePreviewActive = false; ///< Whether the edge-tiling preview is activated
+        bool edgeTileInnerBorder = false;   ///< Whether the detected edge is shared with an adjacent output (inner edge)
+        Output *detectedTileOutput = nullptr;  ///< The output on which the edge was detected (for cross-screen preview updates)
     };
 
     MoveResizeState &moveResizeState() { return m_moveResizeState; }
@@ -42,6 +51,8 @@ public:
     SurfaceWrapper *moveResizeSurface() const;
     void cancelMoveResize(SurfaceWrapper *surface);
     void cancelMoveResize();
+    void startEdgeTileDelay();
+    void stopEdgeTileDelay();
     bool shouldHandleShortcuts() const;
     bool metaKeyPressed() const { return m_metaKeyPressed; }
     void setMetaKeyPressed(bool pressed);
@@ -71,4 +82,5 @@ private:
 
     // Popup grab state
     bool m_hasPopupGrab = false;
+    QTimer *m_edgeTileDelayTimer = nullptr;
 };
