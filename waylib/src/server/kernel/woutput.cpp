@@ -21,9 +21,15 @@
 #include <QCoreApplication>
 #include <QQuickWindow>
 #include <QCursor>
+#include <QScopeGuard>
 
 #include <xf86drm.h>
 #include <drm_fourcc.h>
+#ifdef ENABLE_VULKAN_RENDER
+extern "C" {
+#include <wlr/render/vulkan.h>
+}
+#endif
 
 QW_USE_NAMESPACE
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -241,6 +247,35 @@ static bool output_pick_format(struct wlr_output *output,
         return false;
     }
 
+#ifdef ENABLE_VULKAN_RENDER
+    // radv-rendered DCC surfaces are not compatible with AMD display-engine
+    // scanout: the display reads them as white. When the Vulkan renderer is
+    // active, drop AMD DCC modifiers from the output buffer format so the
+    // swapchain picks modifiers the display engine can actually scan out.
+    struct wlr_drm_format dcc_filtered{};
+    dcc_filtered.format = fmt;
+    const auto dccFilteredGuard = qScopeGuard([&dcc_filtered] {
+        wlr_drm_format_finish(&dcc_filtered);
+    });
+    const struct wlr_drm_format *effective_render_format = render_format;
+    if (wlr_renderer_is_vk(renderer)) {
+        for (size_t i = 0; i < render_format->len; i++) {
+            uint64_t mod = render_format->modifiers[i];
+            if (IS_AMD_FMT_MOD(mod)
+                && ((mod >> AMD_FMT_MOD_DCC_SHIFT) & AMD_FMT_MOD_DCC_MASK)) {
+                continue;
+            }
+            if (!wlr_drm_format_add(&dcc_filtered, mod)) {
+                return false;
+            }
+        }
+        if (dcc_filtered.len > 0)
+            effective_render_format = &dcc_filtered;
+    }
+#else
+    const struct wlr_drm_format *effective_render_format = render_format;
+#endif
+
     if (display_formats != NULL) {
         const struct wlr_drm_format *display_format =
             wlr_drm_format_set_get(display_formats, fmt);
@@ -248,7 +283,7 @@ static bool output_pick_format(struct wlr_output *output,
             qCDebug(lcWlOutputDrm) << "Output does not support format:" << QString("0x%1").arg(fmt, 0, 16);
             return false;
         }
-        if (!wlr_drm_format_intersect(format, display_format, render_format)) {
+        if (!wlr_drm_format_intersect(format, display_format, effective_render_format)) {
             qCWarning(lcWlOutputDrm) << "Failed to find compatible format modifiers for format" 
                                      << QString("0x%1").arg(fmt, 0, 16) 
                                      << "on output:" << QString::fromUtf8(output->name);
@@ -256,7 +291,7 @@ static bool output_pick_format(struct wlr_output *output,
         }
     } else {
         // The output can display any format
-        if (!wlr_drm_format_copy(format, render_format)) {
+        if (!wlr_drm_format_copy(format, effective_render_format)) {
             return false;
         }
     }
