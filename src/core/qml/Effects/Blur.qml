@@ -9,6 +9,14 @@ import Treeland
 
 Item {
     id: root
+    // Keep DTK's default-property contract while giving the non-Vulkan
+    // RenderBufferBlitter a single content item to capture.
+    default property alias data: contentHost.data
+
+    Item {
+        id: contentHost
+        anchors.fill: parent
+    }
     smooth: true
 
     property real radius: 0
@@ -23,14 +31,18 @@ Item {
     property real glassSpecular: Helper.config.glassSpecular
     property real glassTint: 0.0
     property bool glassEnabled: Helper.config.glassEnabled
+    // Kept writable to match DTK's InWindowBlur.valid contract.
+    property bool valid: true
 
     z: parent.z ? parent.z - 1 : -1
     anchors.fill: parent
 
     // On Vulkan the RenderBufferBlitter backdrop-capture path is not supported
     // yet. Skip creating it (and dependent effect components) and fall back to
-    // a plain translucent black rectangle.
+    // a plain translucent rectangle.
     Loader {
+        visible: root.valid
+        z: WaylibHelper.isVulkanBackend ? -1 : 0
         anchors.fill: parent
         sourceComponent: WaylibHelper.isVulkanBackend ? vulkanFallback : blitterContent
     }
@@ -38,6 +50,7 @@ Item {
     Component {
         id: blitterContent
         RenderBufferBlitter {
+            data: [contentHost]
             id: blitter
             smooth: true
             anchors.fill: parent
