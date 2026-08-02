@@ -2119,6 +2119,93 @@ void WRenderHelper::abortTextureSyncBatch(qw_renderer *renderer)
 #endif
 }
 
+bool WRenderHelper::beginTextureBarrierBatch(qw_renderer *renderer, bool release)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!renderer || !qw_vulkan::isRenderer(renderer))
+        return true;
+
+    if (!qw_vulkan::beginTextureBarrierBatch(renderer, release)) {
+        qCWarning(lcWlRenderHelper) << "Failed to begin Vulkan texture barrier batch"
+                                    << "release" << release;
+        return false;
+    }
+#else
+    Q_UNUSED(renderer);
+    Q_UNUSED(release);
+#endif
+    return true;
+}
+
+bool WRenderHelper::flushTextureBarrierBatch(QQuickRenderControl *rc,
+                                             qw_renderer *renderer,
+                                             const char *purpose)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (!renderer || !qw_vulkan::isRenderer(renderer))
+        return true;
+
+    if (!rc || !rc->rhi() || rc->rhi()->backend() != QRhi::Vulkan) {
+        qCWarning(lcWlRenderHelper) << "Cannot flush Vulkan texture barrier batch: missing Vulkan QRhi"
+                                    << "purpose" << purpose;
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+        return false;
+    }
+
+    if (rc->rhi()->isDeviceLost() || !rc->rhi()->isRecordingFrame()) {
+        qCWarning(lcWlRenderHelper) << "Cannot flush Vulkan texture barrier batch: QRhi frame is not usable"
+                                    << "purpose" << purpose
+                                    << "deviceLost" << rc->rhi()->isDeviceLost()
+                                    << "recordingFrame" << rc->rhi()->isRecordingFrame();
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+        return false;
+    }
+
+    auto commandBuffer = rc->commandBuffer();
+    if (!commandBuffer) {
+        qCWarning(lcWlRenderHelper) << "Cannot flush Vulkan texture barrier batch: missing QRhi command buffer"
+                                    << "purpose" << purpose;
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+        return false;
+    }
+
+    commandBuffer->beginExternal();
+    auto handles = static_cast<const QRhiVulkanCommandBufferNativeHandles *>(commandBuffer->nativeHandles());
+    if (!handles || handles->commandBuffer == VK_NULL_HANDLE) {
+        commandBuffer->endExternal();
+        qCWarning(lcWlRenderHelper) << "Cannot flush Vulkan texture barrier batch: missing native Vulkan command buffer"
+                                    << "purpose" << purpose;
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+        return false;
+    }
+
+    const bool ok = qw_vulkan::flushTextureBarrierBatch(renderer, handles->commandBuffer);
+    commandBuffer->endExternal();
+
+    if (!ok) {
+        qCWarning(lcWlRenderHelper) << "Failed to flush Vulkan texture barrier batch"
+                                    << "purpose" << purpose;
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+    }
+    return ok;
+#else
+    Q_UNUSED(rc);
+    Q_UNUSED(renderer);
+    Q_UNUSED(purpose);
+    return true;
+#endif
+}
+
+void WRenderHelper::abortTextureBarrierBatch(qw_renderer *renderer)
+{
+#ifdef ENABLE_VULKAN_RENDER
+    if (renderer && qw_vulkan::isRenderer(renderer))
+        qw_vulkan::abortTextureBarrierBatch(renderer);
+#else
+    Q_UNUSED(renderer);
+#endif
+}
+
 bool WRenderHelper::prepareTextureForSampling(QQuickRenderControl *rc,
                                               qw_renderer *renderer,
                                               qw_texture *texture,

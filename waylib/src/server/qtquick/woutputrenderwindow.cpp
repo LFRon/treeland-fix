@@ -2075,6 +2075,10 @@ bool WOutputRenderWindowPrivate::prepareTextureSamplingForRenderPass(qw_buffer *
 
     m_currentPreparedTextures = preparedTextures;
     W_Q(WOutputRenderWindow);
+    // Accumulate the per-texture foreign-acquire barriers and record them as a
+    // single vkCmdPipelineBarrier once every provider has been prepared, just
+    // before the Qt draw. Mirrors wlroots' own render-pass barrier batching.
+    WRenderHelper::beginTextureBarrierBatch(m_renderer, false);
     QSet<qw_texture *> seenTextures;
     qsizetype skippedCurrentRenderTarget = 0;
     qsizetype invalidProviderCount = 0;
@@ -2147,9 +2151,11 @@ bool WOutputRenderWindowPrivate::prepareTextureSamplingForRenderPass(qw_buffer *
                                           << "skippedCurrentRenderTarget" << skippedCurrentRenderTarget
                                           << "invalidProviderCount" << invalidProviderCount;
             failCurrentFrame();
-            // The pass has not drawn yet. Return ownership of every texture
-            // acquired earlier in the prepass and keep all providers bound to
-            // their previously valid texture.
+            // Record the acquire barriers deferred so far so they stay matched
+            // with the release barriers recorded by the rollback below, then
+            // return ownership of every texture acquired earlier in the prepass
+            // and keep all providers bound to their previously valid texture.
+            (void)WRenderHelper::flushTextureBarrierBatch(rc(), m_renderer, purpose);
             (void)finishTextureSamplingForRenderPass(*preparedTextures,
                                                       purpose,
                                                       sourceIndex);
@@ -2158,6 +2164,18 @@ bool WOutputRenderWindowPrivate::prepareTextureSamplingForRenderPass(qw_buffer *
 
         preparedTextures->append(texture);
         m_currentPreparedTextureSet.insert(texture);
+    }
+
+    if (!WRenderHelper::flushTextureBarrierBatch(rc(), m_renderer, purpose)) {
+        qCWarning(lcWlQtQuickTexture) << "Failed to record batched Vulkan texture acquire barriers; rolling back the render pass"
+                                      << "purpose" << purpose
+                                      << "sourceIndex" << sourceIndex
+                                      << "preparedTextureCount" << preparedTextures->size();
+        failCurrentFrame();
+        (void)finishTextureSamplingForRenderPass(*preparedTextures,
+                                                  purpose,
+                                                  sourceIndex);
+        return false;
     }
 
     return true;
@@ -2210,6 +2228,10 @@ bool WOutputRenderWindowPrivate::finishTextureSamplingForRenderPass(const QVecto
     }
 
     W_Q(WOutputRenderWindow);
+    // Accumulate the per-texture foreign-release barriers and record them as a
+    // single vkCmdPipelineBarrier once every provider has been released, right
+    // after the Qt draw.
+    WRenderHelper::beginTextureBarrierBatch(m_renderer, true);
     bool ok = true;
     for (qsizetype i = preparedTextures.size() - 1; i >= 0; --i) {
         auto texture = preparedTextures.at(i);
@@ -2233,6 +2255,14 @@ bool WOutputRenderWindowPrivate::finishTextureSamplingForRenderPass(const QVecto
                                           << "releaseIndex" << i;
             ok = false;
         }
+    }
+
+    if (!WRenderHelper::flushTextureBarrierBatch(rc(), m_renderer, purpose)) {
+        qCWarning(lcWlQtQuickTexture) << "Failed to record batched Vulkan texture release barriers"
+                                      << "purpose" << purpose
+                                      << "sourceIndex" << sourceIndex
+                                      << "preparedTextureCount" << preparedTextures.size();
+        ok = false;
     }
 
     m_currentPreparedTextures = nullptr;

@@ -83,6 +83,12 @@ public:
                                       bool verifyQueue);
     static bool flushTextureSyncBatch(QW_NAMESPACE::qw_renderer *renderer);
     static void abortTextureSyncBatch(QW_NAMESPACE::qw_renderer *renderer);
+    static bool beginTextureBarrierBatch(QW_NAMESPACE::qw_renderer *renderer,
+                                         bool release);
+    static bool flushTextureBarrierBatch(QQuickRenderControl *rc,
+                                         QW_NAMESPACE::qw_renderer *renderer,
+                                         const char *purpose);
+    static void abortTextureBarrierBatch(QW_NAMESPACE::qw_renderer *renderer);
 
     struct TextureEntry {
         wlr_buffer *buffer;
