@@ -99,6 +99,21 @@ inline void abortTextureSyncBatch(qw_renderer *renderer)
     wlr_vk_renderer_abort_texture_sync_batch(renderer->handle());
 }
 
+inline bool beginTextureBarrierBatch(qw_renderer *renderer, bool release)
+{
+    return wlr_vk_renderer_begin_texture_barrier_batch(renderer->handle(), release);
+}
+
+inline bool flushTextureBarrierBatch(qw_renderer *renderer, VkCommandBuffer commandBuffer)
+{
+    return wlr_vk_renderer_flush_texture_barrier_batch(renderer->handle(), commandBuffer);
+}
+
+inline void abortTextureBarrierBatch(qw_renderer *renderer)
+{
+    wlr_vk_renderer_abort_texture_barrier_batch(renderer->handle());
+}
+
 inline bool renderBufferAttribs(qw_renderer *renderer, wlr_buffer *buffer,
                                 wlr_vk_image_attribs *attribs)
 {
