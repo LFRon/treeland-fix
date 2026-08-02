@@ -114,6 +114,11 @@ inline void abortTextureBarrierBatch(qw_renderer *renderer)
     wlr_vk_renderer_abort_texture_barrier_batch(renderer->handle());
 }
 
+inline void setStageAsyncEnabled(qw_renderer *renderer, bool enabled)
+{
+    wlr_vk_renderer_set_stage_async_enabled(renderer->handle(), enabled);
+}
+
 inline bool renderBufferAttribs(qw_renderer *renderer, wlr_buffer *buffer,
                                 wlr_vk_image_attribs *attribs)
 {

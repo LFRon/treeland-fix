@@ -2497,6 +2497,12 @@ void WOutputRenderWindowPrivate::doRender(qw_output *needsFrameOutput,
                 const bool batchStarted = WRenderHelper::beginTextureSyncBatch(
                     rc(), m_renderer, !textureSyncQueueValidated);
                 if (batchStarted) {
+                    if (!textureSyncQueueValidated) {
+                        // Qt and wlroots share the same VkQueue, so the GPU-side
+                        // asynchronous staging-upload path (which relies on queue
+                        // submission ordering) is safe to enable.
+                        WRenderHelper::setStageAsyncEnabled(m_renderer, true);
+                    }
                     textureSyncQueueValidated = true;
                 } else {
                     // The immediate CPU-wait path remains correct, and avoids

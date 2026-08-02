@@ -89,6 +89,8 @@ public:
                                          QW_NAMESPACE::qw_renderer *renderer,
                                          const char *purpose);
     static void abortTextureBarrierBatch(QW_NAMESPACE::qw_renderer *renderer);
+    static void setStageAsyncEnabled(QW_NAMESPACE::qw_renderer *renderer,
+                                     bool enabled);
 
     struct TextureEntry {
         wlr_buffer *buffer;
