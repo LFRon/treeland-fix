@@ -180,6 +180,7 @@ WInputMethodHelper::WInputMethodHelper(WServer *server, WSeat *seat)
             d->setKeyboard(activeKG, d->seat->keyboard());
     });
     connect(d->seat->handle(), &QW_NAMESPACE::qw_seat::notify_keyboard_grab_begin, this, &WInputMethodHelper::handleKeyboardGrabBegin);
+    connect(d->seat->handle(), &QW_NAMESPACE::qw_seat::notify_keyboard_grab_end, this, &WInputMethodHelper::handleKeyboardGrabEnd);
     connect(d->inputMethodManagerV2, &WInputMethodManagerV2::newInputMethod, this, &WInputMethodHelper::handleNewIMV2);
     connect(d->textInputManagerV3, &WTextInputManagerV3::newTextInput, this, &WInputMethodHelper::handleNewTI);
     connect(d->virtualKeyboardManagerV1, &WVirtualKeyboardManagerV1::newVirtualKeyboard, this, &WInputMethodHelper::handleNewVKV1);
@@ -307,6 +308,7 @@ void WInputMethodHelper::handleNewKGV2(qw_input_method_keyboard_grab_v2 *kgv2)
     if (auto activeKG = activeKeyboardGrab()) {
         disconnect(d->activeKeyboardGrabDestroyConnection);
         d->activeKeyboardGrabDestroyConnection = {};
+        d->activeKeyboardGrab = nullptr;
         d->endGrab(activeKG);
     }
     d->activeKeyboardGrab = kgv2;
@@ -325,10 +327,10 @@ void WInputMethodHelper::handleNewKGV2(qw_input_method_keyboard_grab_v2 *kgv2)
             qCDebug(lcWlInputMethod) << "IME keyboard grab before_destroy";
             auto *kgv2 = qobject_cast<qw_input_method_keyboard_grab_v2 *>(sender());
             Q_ASSERT(activeKeyboardGrab() == kgv2);
-            d->endGrab(kgv2);
+            d->activeKeyboardGrabDestroyConnection = {};
             d->activeKeyboardGrab = nullptr;
             d->handlerArg.grab = nullptr;
-            d->activeKeyboardGrabDestroyConnection = {};
+            d->endGrab(kgv2);
         });
 }
 
@@ -388,23 +390,41 @@ void WInputMethodHelper::handleKeyboardGrabBegin()
     }
 }
 
+void WInputMethodHelper::handleKeyboardGrabEnd()
+{
+    W_D(WInputMethodHelper);
+    if (d->activeKeyboardGrab && d->seat->nativeHandle()->keyboard_state.grab != &d->keyboardGrab) {
+        qCDebug(lcWlInputMethod) << "Replacing grab ended, re-installing IME keyboard grab";
+        d->seat->handle()->keyboard_start_grab(&d->keyboardGrab);
+    }
+}
+
 void WInputMethodHelper::resendKeyboardFocus()
 {
     W_D(WInputMethodHelper);
     qCInfo(lcWlInputMethod()) << "resend keyboard focus";
-    notifyLeave();
     auto focus = d->seat->keyboardFocusSurface();
-    if (!focus)
-        return;
-    qCDebug(lcWlInputMethod) << "focus" << focus << "from client" << focus->waylandClient();
-    for (auto textInput : std::as_const(d->textInputs)) {
-        qCDebug(lcWlInputMethod()) << "trying to send focus to" << textInput << "from client" << textInput->waylandClient();
-        if (focus->waylandClient() == textInput->waylandClient()) {
-            qCDebug(lcWlInputMethod) << "focus sent to" << textInput;
-            if (!textInput->seat() || textInput->seat() == d->seat) {
-                textInput->sendEnter(focus);
+
+    for (auto *ti : std::as_const(d->textInputs)) {
+        if (ti->focusedSurface() && (!focus || focus->waylandClient() != ti->waylandClient())) {
+            ti->sendLeave();
+        }
+    }
+
+    if (focus) {
+        for (auto *ti : std::as_const(d->textInputs)) {
+            if (focus->waylandClient() == ti->waylandClient()) {
+                if (!ti->seat() || ti->seat() == d->seat) {
+                    ti->sendEnter(focus);
+                }
             }
         }
+    }
+
+    auto *enabledTI = d->enabledTextInput;
+    if (enabledTI && (!focus || focus->waylandClient() != enabledTI->waylandClient())) {
+        qCInfo(lcWlInputMethod) << "Disabling stale enabled text input (client mismatch with focus)";
+        disableTI(enabledTI);
     }
 }
 

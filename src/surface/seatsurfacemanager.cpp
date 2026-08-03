@@ -373,6 +373,7 @@ void SeatSurfaceManager::onKeyboardGrabBegin()
         }
     }
 
+    m_prePopupFocusSurface = m_keyboardFocusSurface;
     m_hasPopupGrab = true;
     qCDebug(lcTlPopupFocus) << "Popup keyboard grab started";
 }
@@ -384,10 +385,16 @@ void SeatSurfaceManager::onKeyboardGrabEnd()
 
     m_hasPopupGrab = false;
 
-    qCDebug(lcTlPopupFocus) << "Popup keyboard grab ended, restoring focus to:"
-                            << m_activatedSurface;
+    auto *restoreTarget = m_prePopupFocusSurface.data();
+    m_prePopupFocusSurface.clear();
 
-    if (m_activatedSurface && m_activatedSurface->hasFocusCapability()) {
-        setKeyboardFocusSurface(m_activatedSurface, Qt::ActiveWindowFocusReason);
+    if (!restoreTarget || !restoreTarget->hasFocusCapability())
+        restoreTarget = m_activatedSurface;
+
+    qCDebug(lcTlPopupFocus) << "Popup keyboard grab ended, restoring focus to:"
+                            << restoreTarget;
+
+    if (restoreTarget && restoreTarget->hasFocusCapability()) {
+        setKeyboardFocusSurface(restoreTarget, Qt::ActiveWindowFocusReason);
     }
 }
