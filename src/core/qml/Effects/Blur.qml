@@ -7,8 +7,16 @@ import QtQuick.Shapes
 import Waylib.Server
 import Treeland
 
-RenderBufferBlitter {
-    id: blitter
+Item {
+    id: root
+    // Keep DTK's default-property contract while giving the non-Vulkan
+    // RenderBufferBlitter a single content item to capture.
+    default property alias data: contentHost.data
+
+    Item {
+        id: contentHost
+        anchors.fill: parent
+    }
     smooth: true
 
     property real radius: 0
@@ -23,82 +31,113 @@ RenderBufferBlitter {
     property real glassSpecular: Helper.config.glassSpecular
     property real glassTint: 0.0
     property bool glassEnabled: Helper.config.glassEnabled
+    // Kept writable to match DTK's InWindowBlur.valid contract.
+    property bool valid: true
 
     z: parent.z ? parent.z - 1 : -1
     anchors.fill: parent
 
-    // Dispatch between Liquid Glass and traditional blur via a Loader so only
-    // the active branch is instantiated.  Toggling the DConfig key unloads one
-    // Component and loads the other.
+    // On Vulkan the RenderBufferBlitter backdrop-capture path is not supported
+    // yet. Skip creating it (and dependent effect components) and fall back to
+    // a plain translucent rectangle.
     Loader {
+        visible: root.valid
+        z: WaylibHelper.isVulkanBackend ? -1 : 0
         anchors.fill: parent
-        sourceComponent: blitter.glassEnabled ? glassComponent : blurComponent
+        sourceComponent: WaylibHelper.isVulkanBackend ? vulkanFallback : blitterContent
     }
 
     Component {
-        id: glassComponent
-        GlassEffect {
-            anchors.fill: parent
-            source: blitter.content
-            radius: blitter.radius
-            blurEnabled: blitter.blurEnabled
-            blurMax: blitter.blurMax
-            blurAmount: blitter.blurAmount
-            blurMultiplier: blitter.multiplier
-            bezelWidth: Helper.config.glassBezel
-            thickness: Helper.config.glassThickness
-            ior: 1.33
-            specular: blitter.glassSpecular
-            tint: blitter.glassTint
-            brightness: blitter.brightness
-            contrast: blitter.contrast
-            saturation: blitter.saturation
-            contentEdgePull: 0.0
-            contentRampEnd: 0.0
-            refractionMaxTan: 3.3
-            profilePower: Helper.config.glassProfilePower
-            innerShadow: 0.0
-        }
-    }
-
-    Component {
-        id: blurComponent
-        Item {
+        id: blitterContent
+        RenderBufferBlitter {
+            data: [contentHost]
+            id: blitter
+            smooth: true
             anchors.fill: parent
 
-            MultiEffect {
-                id: blur
+            // Dispatch between Liquid Glass and traditional blur via a Loader so only
+            // the active branch is instantiated.  Toggling the DConfig key unloads one
+            // Component and loads the other.
+            Loader {
                 anchors.fill: parent
-                layer.enabled: blitter.radiusEnabled
-                smooth: blitter.radiusEnabled
-                opacity: blitter.radiusEnabled ? 0 : blitter.opacity
-                source: blitter.content
-                autoPaddingEnabled: false
-                blurEnabled: blitter.blurEnabled
-                blur: blitter.blurAmount
-                blurMax: blitter.blurMax
-                blurMultiplier: blitter.multiplier
-                saturation: 0.2
+                sourceComponent: root.glassEnabled ? glassComponent : blurComponent
             }
 
-            Loader {
-                x: blur.x
-                y: blur.y
-                active: blitter.radiusEnabled
-                sourceComponent: Shape {
+            Component {
+                id: glassComponent
+                GlassEffect {
                     anchors.fill: parent
-                    preferredRendererType: Shape.CurveRenderer
-                    ShapePath {
-                        strokeWidth: 0
-                        fillItem: blur
-                        PathRectangle {
-                            width: blur.width
-                            height: blur.height
-                            radius: blitter.radius
+                    source: blitter.content
+                    radius: root.radius
+                    blurEnabled: root.blurEnabled
+                    blurMax: root.blurMax
+                    blurAmount: root.blurAmount
+                    blurMultiplier: root.multiplier
+                    bezelWidth: Helper.config.glassBezel
+                    thickness: Helper.config.glassThickness
+                    ior: 1.33
+                    specular: root.glassSpecular
+                    tint: root.glassTint
+                    brightness: root.brightness
+                    contrast: root.contrast
+                    saturation: root.saturation
+                    contentEdgePull: 0.0
+                    contentRampEnd: 0.0
+                    refractionMaxTan: 3.3
+                    profilePower: Helper.config.glassProfilePower
+                    innerShadow: 0.0
+                }
+            }
+
+            Component {
+                id: blurComponent
+                Item {
+                    anchors.fill: parent
+
+                    MultiEffect {
+                        id: blur
+                        anchors.fill: parent
+                        layer.enabled: root.radiusEnabled
+                        smooth: root.radiusEnabled
+                        opacity: root.radiusEnabled ? 0 : root.opacity
+                        source: blitter.content
+                        autoPaddingEnabled: false
+                        blurEnabled: root.blurEnabled
+                        blur: root.blurAmount
+                        blurMax: root.blurMax
+                        blurMultiplier: root.multiplier
+                        saturation: 0.2
+                    }
+
+                    Loader {
+                        x: blur.x
+                        y: blur.y
+                        active: root.radiusEnabled
+                        sourceComponent: Shape {
+                            anchors.fill: parent
+                            preferredRendererType: Shape.CurveRenderer
+                            ShapePath {
+                                strokeWidth: 0
+                                fillItem: blur
+                                PathRectangle {
+                                    width: blur.width
+                                    height: blur.height
+                                    radius: root.radius
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+
+    Component {
+        id: vulkanFallback
+        Rectangle {
+            anchors.fill: parent
+            radius: root.radius
+            color: Qt.rgba(0, 0, 0, 0.15)
         }
     }
 }

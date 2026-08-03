@@ -83,6 +83,7 @@ public:
     }
 
 private:
+    QObject *const dtkInWindowBlurInterceptor;
     QQmlComponent titleBarComponent;
     QQmlComponent decorationComponent;
     QQmlComponent windowMenuComponent;

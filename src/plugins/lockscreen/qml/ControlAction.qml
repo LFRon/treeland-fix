@@ -57,8 +57,9 @@ RowLayout {
 
         UserList {
             id: userList
-            x: (userItem.width - userList.width) / 2 - 10
-            y: -userList.height - 10
+            parent: rootItem
+            x: userItem.mapToItem(rootItem, (userItem.width - width) / 2 - 10, 0).x
+            y: userItem.mapToItem(rootItem, 0, 0).y - height - 10
             onClosed: userItem.expand = false
             onOtherUserRequested: bottomGroup.otherUserRequested()
         }

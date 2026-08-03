@@ -14,9 +14,38 @@
 #include <woutputitem.h>
 
 #include <QQuickItem>
+#include <QQmlAbstractUrlInterceptor>
+
+namespace {
+
+class DtkInWindowBlurInterceptor final : public QObject, public QQmlAbstractUrlInterceptor
+{
+public:
+    using QObject::QObject;
+
+    QUrl intercept(const QUrl &url, DataType type) override
+    {
+        if (type == DataType::QmlFile
+            && url.path().endsWith(QStringLiteral("/overridable/InWindowBlur.qml"))) {
+            return QUrl(QStringLiteral("qrc:/treeland/override/dtk/InWindowBlur.qml"));
+        }
+
+        return url;
+    }
+};
+
+QObject *installDtkInWindowBlurInterceptor(QQmlEngine *engine)
+{
+    auto interceptor = new DtkInWindowBlurInterceptor(engine);
+    engine->addUrlInterceptor(interceptor);
+    return interceptor;
+}
+
+} // namespace
 
 QmlEngine::QmlEngine(QObject *parent)
     : QQmlApplicationEngine(parent)
+    , dtkInWindowBlurInterceptor(installDtkInWindowBlurInterceptor(this))
     , titleBarComponent(this, "Treeland", "TitleBar")
     , decorationComponent(this, "Treeland", "Decoration")
     , windowMenuComponent(this, "Treeland", "WindowMenu")

@@ -304,6 +304,16 @@ qt_add_shaders(libtreeland "treeland_liquidglass_shaders"
         ${PROJECT_RESOURCES_DIR}/shaders/liquidglass.frag
 )
 
+set_source_files_properties(core/qml/overridable/InWindowBlur.qml
+    PROPERTIES
+        QT_RESOURCE_ALIAS "InWindowBlur.qml"
+)
+qt_add_resources(libtreeland "override_dtkdeclarative_qml"
+    PREFIX "/treeland/override/dtk"
+    FILES
+        core/qml/overridable/InWindowBlur.qml
+)
+
 qt_add_resources(libtreeland "treeland_assets"
     PREFIX "/dsg/icons"
     BASE ${PROJECT_RESOURCES_DIR}/icons

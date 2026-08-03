@@ -31,7 +31,7 @@ D.Popup {
     function selectCurrentUser(userName, index) {
         UserModel.currentUserName = userName
         users.lastCheckedIndex = index
-        userList.close()
+        users.close()
     }
 
     onAboutToShow: {
