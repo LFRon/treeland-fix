@@ -294,8 +294,12 @@ public:
 
     // for keyboard event
     inline bool doNotifyKey(WInputDevice *device, uint32_t keycode, uint32_t state, uint32_t timestamp) {
-        q_func()->setKeyboard(device);
+        if (keyboardFocusSurface() && keyboardFilter
+            && keyboardFilter->filterKey(q_func(), device, keycode, state, timestamp)) {
+            return true;
+        }
 
+        q_func()->setKeyboard(device);
         if (!keyboardFocusSurface())
             return false;
 
@@ -305,6 +309,11 @@ public:
     }
     inline bool doNotifyModifiers(WInputDevice *device) {
         auto keyboard = wlr_keyboard_from_input_device(device->handle());
+
+        if (keyboardFocusSurface() && keyboardFilter
+            && keyboardFilter->filterModifiers(q_func(), device, &keyboard->modifiers)) {
+            return true;
+        }
 
         // wlr_seat_set_keyboard() already sends modifiers when the keyboard
         // changes, so skip the explicit send to avoid a duplicate.
@@ -363,6 +372,7 @@ public:
     QVector<WInputDevice*> deviceList;
     QVector<WInputDevice*> touchDeviceList;
     QPointer<WSeatEventFilter> eventFilter;
+    WSeatKeyboardFilter *keyboardFilter = nullptr;
     QPointer<QWindow> focusWindow;
     QPointer<QObject> pointerFocusEventObject;
     QPointer<WSurface> m_keyboardFocusSurface;
@@ -1534,6 +1544,19 @@ void WSeat::setEventFilter(WSeatEventFilter *filter)
     d->eventFilter = filter;
 }
 
+WSeatKeyboardFilter *WSeat::keyboardFilter() const
+{
+    W_DC(WSeat);
+    return d->keyboardFilter;
+}
+
+void WSeat::setKeyboardFilter(WSeatKeyboardFilter *filter)
+{
+    W_D(WSeat);
+    Q_ASSERT(!filter || !d->keyboardFilter || d->keyboardFilter == filter);
+    d->keyboardFilter = filter;
+}
+
 void WSeat::create(WServer *server)
 {
     W_D(WSeat);
@@ -1582,6 +1605,7 @@ void WSeat::destroy(WServer *)
         i->setSeat(nullptr);
 
     d->deviceList.clear();
+    d->keyboardFilter = nullptr;
 
     // Need not call the DCursor::detachInputDevice on destroy WSeat, so do
     // call the detachCursor at clear the deviceList after.
