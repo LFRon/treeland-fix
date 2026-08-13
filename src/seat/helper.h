@@ -28,6 +28,7 @@
 #include <wxdgtopleveltagmanager.h>
 
 #include <QSet>
+#include <QPointer>
 #include <QList>
 #include <vector>
 #include <QMap>
@@ -372,6 +373,7 @@ private:
     bool isNvidiaCardPresent();
     void setWorkspaceVisible(bool visible);
     void restoreFromShowDesktop(SurfaceWrapper *activeSurface = nullptr);
+    void restoreShowDesktopFocusSurfaces(WSeat *exceptSeat = nullptr);
     void setNoAnimation(bool noAnimation);
 
     void updateSurfaceSeatInteraction(SurfaceWrapper *surface, WSeat *seat);
@@ -457,6 +459,7 @@ private:
     WindowManagementInterfaceV1 *m_windowManagementInterfaceV1 = nullptr;
     WindowManagementInterfaceV1::DesktopState m_showDesktop = WindowManagementInterfaceV1::DesktopState::Normal;
     DDEShellManagerInterfaceV1 *m_ddeShellV1 = nullptr;
+    QMap<WSeat *, QPointer<SurfaceWrapper>> m_showDesktopFocusSurfaces;
     VirtualOutputManagerInterfaceV1 *m_virtualOutputInterfaceV1 = nullptr;
     OutputManagerV1 *m_outputManagerV1 = nullptr;
     DDMInterfaceV1 *m_ddmInterfaceV1 = nullptr;
