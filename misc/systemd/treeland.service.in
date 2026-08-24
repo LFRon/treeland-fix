@@ -32,7 +32,17 @@ RestartSec=1s
 StandardOutput=null
 StandardError=null
 
-NoNewPrivileges=true
+# NOTE: NoNewPrivileges=true is intentionally NOT enabled here.
+#
+# wlroots spawns Xwayland inside treeland, and Xwayland needs to attach to
+# SysV shared-memory segments (MIT-SHM / XShmPutImage) created by X11
+# clients that run under a different UID than the Xwayland process itself
+# (e.g. Electron apps launched by the real login user against the
+# DDM-owned session). This requires the cap_ipc_owner file capability on
+# the Xwayland binary (applied by ddm at startup), but no_new_privs makes
+# the kernel ignore file capabilities entirely at execve(), leaving such
+# windows blank (XShmAttach → BadAccess). See Xext/shm.c:ProcShmAttach.
+# NoNewPrivileges=true
 OOMScoreAdjust=-1000
 Nice=-20
 CPUWeight=10000
@@ -51,7 +61,16 @@ IOSchedulingPriority=0
 #
 # MemoryDenyWriteExecute=true
 
-PrivateIPC=true
+# NOTE: PrivateIPC=true is intentionally NOT enabled here.
+#
+# Xwayland (spawned by wlroots inside treeland, IPC-namespace isolated when
+# PrivateIPC=true) must share the host IPC namespace with X11 clients so that
+# MIT-SHM (XShmAttach → shmat) can find the SysV shared-memory segments the
+# clients create via shmget(). Otherwise shmat() fails with EINVAL (segment
+# invisible in the private namespace) and every XShmPutImage window renders
+# blank. Combined with the cap_ipc_owner setup above, Xwayland can both find
+# and attach cross-UID client segments. See Xext/shm.c:ProcShmAttach.
+# PrivateIPC=true
 ProtectSystem=full
 ProtectHome=true
 ProtectClock=true
