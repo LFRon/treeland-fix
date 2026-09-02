@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <wlr/render/wlr_texture.h>
 #include <wlr/render/vulkan.h>
+#include <wlr/types/wlr_buffer.h>
 #include <wlr/util/log.h>
 #include <xf86drm.h>
 #include "render/pixel_format.h"
@@ -1553,12 +1554,23 @@ bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *wlr_re
 			return false;
 		}
 
-		int sync_file_fds[WLR_DMABUF_MAX_PLANES];
-		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
-			sync_file_fds[i] = -1;
-		}
+		// Skip the producer fence export/wait when the client has not
+		// re-attached (committed) this buffer since its current content was
+		// already synchronized: there is no new producer write to wait for.
+		// Only client buffers (wlr_client_buffer) ever set qt_content_synced;
+		// every other texture (e.g. an output swapchain buffer sampled for
+		// mirroring) keeps waiting on every acquire.
+		struct wlr_client_buffer *client_buffer = texture->buffer != NULL
+			? wlr_client_buffer_get(texture->buffer) : NULL;
+		const bool skip_producer_wait = client_buffer != NULL
+			&& texture->qt_content_synced;
 
-		if (texture->buffer != NULL) {
+		if (texture->buffer != NULL && !skip_producer_wait) {
+			int sync_file_fds[WLR_DMABUF_MAX_PLANES];
+			for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
+				sync_file_fds[i] = -1;
+			}
+
 			if (!vulkan_sync_foreign_texture_acquire(texture, sync_file_fds)) {
 				close_sync_file_fds(sync_file_fds);
 				wlr_log(WLR_ERROR, "Failed to wait for foreign texture DMA-BUF fence");
@@ -1578,6 +1590,10 @@ bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *wlr_re
 				: wait_sync_file_fds(sync_file_fds);
 			if (!waited) {
 				return false;
+			}
+
+			if (client_buffer != NULL) {
+				texture->qt_content_synced = true;
 			}
 		}
 
@@ -1717,6 +1733,26 @@ bool waylib_vk_renderer_finish_texture_sampling(struct wlr_renderer *wlr_rendere
 	}
 	texture->qt_sampling_acquired = false;
 	return true;
+}
+
+void waylib_vk_renderer_mark_buffer_content_dirty(struct wlr_renderer *wlr_renderer,
+		struct wlr_buffer *wlr_buffer) {
+	if (wlr_renderer == NULL || wlr_buffer == NULL
+			|| !wlr_renderer_is_vk(wlr_renderer)) {
+		return;
+	}
+
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	struct wlr_vk_texture *texture;
+	wl_list_for_each(texture, &renderer->textures, link) {
+		if (texture->buffer == wlr_buffer) {
+			// The client re-attached a buffer it owns again: its producer may
+			// have written new content, so the next sampling acquire must wait
+			// for a fresh producer fence even though the previous content was
+			// already synchronized.
+			texture->qt_content_synced = false;
+		}
+	}
 }
 
 // A deferred acquire/release barrier that is never recorded must not leave the
