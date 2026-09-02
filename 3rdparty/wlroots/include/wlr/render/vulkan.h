@@ -65,6 +65,15 @@ bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *render
 bool waylib_vk_renderer_finish_texture_sampling(struct wlr_renderer *renderer,
 	struct wlr_texture *texture, VkCommandBuffer cb);
 
+// Clear the "content already synchronized" shortcut for every wlroots Vulkan
+// texture currently importing the given wlr_buffer. Call from the surface
+// commit path when the client (re-)attaches a buffer: the producer may have
+// written new content, so the next sampling acquire must export and wait for a
+// fresh producer fence instead of reusing the previous one. No-op for a
+// NULL/invalid renderer, a NULL buffer, or a non-Vulkan renderer.
+void waylib_vk_renderer_mark_buffer_content_dirty(struct wlr_renderer *renderer,
+	struct wlr_buffer *buffer);
+
 // Collect foreign-texture sync_files while a compositor frame is recorded,
 // then submit one semaphore wait with a bridge barrier before the compositor
 // command buffer is submitted to the same queue. The barrier extends the wait

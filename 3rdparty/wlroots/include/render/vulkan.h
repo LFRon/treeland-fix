@@ -617,6 +617,13 @@ struct wlr_vk_texture {
 	// waylib_vk_renderer_begin_readback()) currently holds a foreign->own
 	// acquire. Decoupled from 'owned', which is reserved for wlroots' own render-pass bookkeeping.
 	bool readback_acquired; // waylib/Qt-only: a readback acquire is in flight
+	// waylib/Qt-only: the DMA-BUF content of this client buffer was already
+	// waited on (producer sync_file / imported semaphore) since the client
+	// last attached it. Set after a successful producer wait; cleared by
+	// waylib_vk_renderer_mark_buffer_content_dirty() when the client
+	// re-attaches (commits) the buffer. Only ever set for client buffers
+	// (wlr_client_buffer); every other texture keeps waiting unconditionally.
+	bool qt_content_synced;
 	bool transitioned; // if dma_imported: whether we transitioned it away from preinit
 	bool has_alpha; // whether the image is has alpha channel
 	bool using_mutable_srgb; // can be accessed through _SRGB format view
