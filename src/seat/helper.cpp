@@ -72,6 +72,7 @@
 #include "wallpapershellinterfacev1.h"
 #include "workspace/workspace.h"
 
+#include <drm_fourcc.h>
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
 
@@ -139,6 +140,24 @@ static bool userConfigInitializationFinished(TreelandUserConfig *config)
 static bool seatConfigInitializationFinished(SeatUserDConfig *config)
 {
     return config && (config->isInitializeSucceeded() || config->isInitializeFailed());
+}
+
+static bool rendererSupportsImplicitDmabufFormats(wlr_renderer *renderer)
+{
+    const auto *formats = renderer
+        ? wlr_renderer_get_texture_formats(renderer, WLR_BUFFER_CAP_DMABUF)
+        : nullptr;
+    if (!formats)
+        return false;
+
+    for (size_t i = 0; i < formats->len; ++i) {
+        const auto &format = formats->formats[i];
+        for (size_t j = 0; j < format.len; ++j) {
+            if (format.modifiers[j] == DRM_FORMAT_MOD_INVALID)
+                return true;
+        }
+    }
+    return false;
 }
 
 Helper *Helper::m_instance = nullptr;
@@ -1128,9 +1147,14 @@ void Helper::init(Treeland::Treeland *treeland)
         auto *presentation = m_server->attach<WPresentation>(m_backend->handle());
         m_renderWindow->setPresentation(presentation);
 
-        if (!wlr_drm_create(m_server->handle(), m_renderer)) {
-            qCCritical(lcTlCore)
-                << "Failed to create legacy wl_drm global";
+        if (rendererSupportsImplicitDmabufFormats(m_renderer)) {
+            if (!wlr_drm_create(m_server->handle(), m_renderer)) {
+                qCWarning(lcTlCore)
+                    << "Failed to create legacy wl_drm global despite implicit DMA-BUF support";
+            }
+        } else {
+            qCInfo(lcTlCore)
+                << "Skipping legacy wl_drm global: Vulkan renderer does not support implicit DMA-BUF modifiers";
         }
     } else {
         if (!wlr_renderer_init_wl_display(m_renderer, m_server->handle()))
