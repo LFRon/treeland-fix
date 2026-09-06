@@ -1526,7 +1526,11 @@ static void record_frame_render_barrier(struct wlr_vk_renderer *renderer,
 bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *wlr_renderer,
 		struct wlr_texture *wlr_texture, struct wlr_buffer *sampled_buffer,
 		VkCommandBuffer cb, struct wlr_vk_image_attribs *attribs) {
-	if (wlr_renderer == NULL || wlr_texture == NULL || cb == VK_NULL_HANDLE) {
+	if (wlr_renderer == NULL || wlr_texture == NULL) {
+		return false;
+	}
+	if (cb == VK_NULL_HANDLE && !waylib_vk_renderer_texture_barrier_will_defer(
+			wlr_renderer, false)) {
 		return false;
 	}
 	if (!wlr_renderer_is_vk(wlr_renderer) || !wlr_texture_is_vk(wlr_texture)) {
@@ -1658,6 +1662,11 @@ bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *wlr_re
 		if (!deferred) {
 			// The acquire's second scope must cover every stage the consumer
 			// may sample from, not only the fragment stage.
+			if (cb == VK_NULL_HANDLE) {
+				wlr_log(WLR_ERROR, "Failed to queue Vulkan texture acquire "
+					"barrier without a command buffer");
+				return false;
+			}
 			vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
 				0, NULL, 0, NULL, 1, &barrier);
@@ -1675,7 +1684,11 @@ bool waylib_vk_renderer_prepare_texture_for_sampling(struct wlr_renderer *wlr_re
 
 bool waylib_vk_renderer_finish_texture_sampling(struct wlr_renderer *wlr_renderer,
 		struct wlr_texture *wlr_texture, VkCommandBuffer cb) {
-	if (wlr_renderer == NULL || wlr_texture == NULL || cb == VK_NULL_HANDLE) {
+	if (wlr_renderer == NULL || wlr_texture == NULL) {
+		return false;
+	}
+	if (cb == VK_NULL_HANDLE && !waylib_vk_renderer_texture_barrier_will_defer(
+			wlr_renderer, true)) {
 		return false;
 	}
 	if (!wlr_renderer_is_vk(wlr_renderer) || !wlr_texture_is_vk(wlr_texture)) {
@@ -1734,6 +1747,11 @@ bool waylib_vk_renderer_finish_texture_sampling(struct wlr_renderer *wlr_rendere
 	if (!deferred) {
 		// The release's first scope must cover every stage that may still be
 		// reading the texture, not only the fragment stage.
+		if (cb == VK_NULL_HANDLE) {
+			wlr_log(WLR_ERROR, "Failed to queue Vulkan texture release "
+				"barrier without a command buffer");
+			return false;
+		}
 		vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
 			0, NULL, 0, NULL, 1, &barrier);
@@ -1909,6 +1927,17 @@ bool waylib_vk_renderer_flush_texture_barrier_batch(struct wlr_renderer *wlr_ren
 	renderer->texture_barrier_batch_active = false;
 	renderer->texture_barrier_batch_release = false;
 	return true;
+}
+
+bool waylib_vk_renderer_texture_barrier_will_defer(struct wlr_renderer *wlr_renderer,
+		bool release) {
+	if (wlr_renderer == NULL || !wlr_renderer_is_vk(wlr_renderer)) {
+		return false;
+	}
+
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	return renderer->texture_barrier_batch_active
+		&& renderer->texture_barrier_batch_release == release;
 }
 
 void waylib_vk_renderer_abort_texture_barrier_batch(struct wlr_renderer *wlr_renderer) {
