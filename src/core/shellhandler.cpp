@@ -730,7 +730,7 @@ void ShellHandler::onXdgToplevelSurfaceRemoved(WXdgToplevelSurface *surface)
     // Persist the last size of a normal window (prefer normalGeometry) when an appId is present
     if (m_windowConfigStore && !wrapper->appId().isEmpty()) {
         QSizeF sz = wrapper->normalGeometry().size();
-        if (!sz.isValid() || sz.isEmpty()) {
+        if ((!sz.isValid() || sz.isEmpty()) && wrapper->isNormal()) {
             sz = wrapper->geometry().size();
         }
         const QSize s = sz.toSize();
@@ -1216,6 +1216,8 @@ void ShellHandler::updateLayerSurfaceContainer(SurfaceWrapper *surface)
         break;
     case WLayerSurface::LayerType::Top:
         m_topContainer->addSurface(surface);
+        if (surface->isLaunchpad() || surface->isQuickLaunchpad())
+            surface->setZ(-1);
         break;
     case WLayerSurface::LayerType::Overlay:
         m_overlayContainer->addSurface(surface);
@@ -1342,20 +1344,4 @@ void ShellHandler::handleDdeShellSurfaceAdded(WSurface *surface, SurfaceWrapper 
             [wrapper](bool accept) {
                 wrapper->setAcceptKeyboardFocus(accept);
             });
-}
-
-void ShellHandler::setResourceManagerAtom(WAYLIB_SERVER_NAMESPACE::WXWayland *xwayland,
-                                          const QByteArray &value)
-{
-    auto xcb_conn = xwayland->xcbConnection();
-    auto root = xwayland->xcbScreen()->root;
-    xcb_change_property(xcb_conn,
-                        XCB_PROP_MODE_REPLACE,
-                        root,
-                        xwayland->atom("RESOURCE_MANAGER"),
-                        XCB_ATOM_STRING,
-                        8,
-                        value.size(),
-                        value.constData());
-    xcb_flush(xcb_conn);
 }

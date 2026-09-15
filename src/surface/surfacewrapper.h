@@ -319,6 +319,8 @@ public:
     bool isIMCandidatePanel() const;
     void setIMCandidatePanel(bool isIMCandidatePanel);
     bool isInputPopupLike() const;
+    bool isLaunchpad() const;
+    bool isQuickLaunchpad() const;
 
     bool attention() const;
     bool setAttention(bool attention);
@@ -428,7 +430,9 @@ private:
     QRectF targetGeometryForState(State state) const;
     bool applySurfaceStateGeometry(State state, const QRectF &targetGeometry);
     bool checkSetSurfaceState(State newSurfaceState, bool allowRetarget = false);
+    bool shouldUpdateNormalGeometry() const;
     void abortGeometryAnimation();
+    void applySurfaceStateWithoutGeometry(State state);
     void doSetSurfaceState(State newSurfaceState);
     Q_SLOT void onAnimationReady();
     Q_SLOT void onAnimationFinished();
