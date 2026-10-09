@@ -22,7 +22,7 @@ class Session : public QObject {
 public:
     ~Session();
 
-    int id() const;
+    const QString &id() const;
     uid_t uid() const;
     const QString &username() const;
     WSocket *socket() const;
@@ -35,7 +35,7 @@ Q_SIGNALS:
 private:
     friend class SessionManager;
 
-    int m_id = 0;
+    QString m_id;
     uid_t m_uid = 0;
     QString m_username = {};
     WSocket *m_socket = nullptr;
@@ -73,11 +73,11 @@ public:
         }
     };
 
-    ActiveSessionUpdate prepareActiveUserSession(const QString &username, int id);
+    ActiveSessionUpdate prepareActiveUserSession(const QString &username, const QString &id);
     void commitActiveUserSession(const ActiveSessionUpdate &update);
-    void updateActiveUserSession(const QString &username, int id);
+    void updateActiveUserSession(const QString &username, const QString &id);
     void removeSession(std::shared_ptr<Session> session);
-    std::shared_ptr<Session> sessionForId(int id) const;
+    std::shared_ptr<Session> sessionForId(const QString &id) const;
     std::shared_ptr<Session> sessionForUid(uid_t uid) const;
     std::shared_ptr<Session> sessionForUser(const QString &username) const;
     std::shared_ptr<Session> sessionForXWayland(WXWayland *xwayland) const;
@@ -92,7 +92,7 @@ Q_SIGNALS:
     void xwaylandAuthChanged();
 
 private:
-    std::shared_ptr<Session> ensureSession(int id, QString username);
+    std::shared_ptr<Session> ensureSession(const QString &id, QString username);
 
     std::weak_ptr<Session> m_activeSession;
     QList<std::shared_ptr<Session>> m_sessions;
