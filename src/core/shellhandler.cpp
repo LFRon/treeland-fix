@@ -1098,10 +1098,6 @@ void ShellHandler::setupDockPreview()
             this,
             &ShellHandler::onDockPreviewTooltip);
     connect(m_treelandForeignToplevel,
-            &ForeignToplevelManagerInterfaceV3::requestDockHideTooltip,
-            this,
-            &ShellHandler::onDockHideTooltip);
-    connect(m_treelandForeignToplevel,
             &ForeignToplevelManagerInterfaceV3::requestDockClose,
             this,
             &ShellHandler::onDockClose);
@@ -1143,14 +1139,6 @@ void ShellHandler::onDockPreviewTooltip(
                               QVariant::fromValue(dockWrapper),
                               QVariant::fromValue(pos),
                               QVariant::fromValue(direction));
-}
-
-void ShellHandler::onDockHideTooltip()
-{
-    if (!m_dockPreview)
-        return;
-
-    QMetaObject::invokeMethod(m_dockPreview, "hideTooltip");
 }
 
 void ShellHandler::onDockClose()

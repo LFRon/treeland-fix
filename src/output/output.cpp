@@ -739,6 +739,12 @@ void Output::arrangeNonLayerSurface(SurfaceWrapper *surface, ArrangeReason reaso
     Q_ASSERT(surface->type() != SurfaceWrapper::Type::Layer);
     if (surface->isIMCandidatePanel())
         return;
+    // Output::addSurface() hooks width/height/hasInitializeContainer straight to
+    // this function, bypassing the arrangeNonLayerSurfaces() filter. A lock surface
+    // must cover the whole output: arranging it would shrink it to validGeometry()
+    // (exclusive zone removed) and center it, i.e. the maximized rect.
+    if (surface->type() == SurfaceWrapper::Type::LockScreen)
+        return;
 
     surface->setFullscreenGeometry(geometry());
     const auto validGeo = this->validGeometry();
@@ -1079,8 +1085,7 @@ void Output::retargetInputPopupSurface(SurfaceWrapper *popup)
 void Output::arrangeNonLayerSurfaces(ArrangeReason reason)
 {
     for (SurfaceWrapper *surface : std::as_const(surfaces())) {
-        if (surface->type() == SurfaceWrapper::Type::Layer
-            || surface->type() == SurfaceWrapper::Type::LockScreen || surface->isInputPopupLike()
+        if (surface->type() == SurfaceWrapper::Type::Layer || surface->isInputPopupLike()
             || !surface->hasInitializeContainer())
             continue;
         arrangeNonLayerSurface(surface, reason);

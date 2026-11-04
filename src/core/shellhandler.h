@@ -16,6 +16,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QSet>
+#include <QSize>
 
 Q_MOC_INCLUDE("workspace/workspace.h")
 Q_MOC_INCLUDE(<wlayersurface.h>)
@@ -126,7 +127,6 @@ private Q_SLOTS:
                               WAYLIB_SERVER_NAMESPACE::WSurface *target,
                               QPoint pos,
                               ForeignToplevelManagerInterfaceV3::PreviewDirection direction);
-    void onDockHideTooltip();
     void onDockClose();
 
     void setupDockPreview();

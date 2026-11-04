@@ -9,7 +9,6 @@
 #include <QObject>
 #include <QList>
 #include <QPoint>
-#include <QSize>
 #include <QString>
 #include <memory>
 
@@ -38,7 +37,6 @@ Q_SIGNALS:
     void requestShowTooltip(WSurface *surface,
                             const QPoint &pos,
                             ForeignToplevelManagerInterfaceV3::PreviewDirection direction);
-    void requestHideTooltip();
     void requestClose();
     void beforeDestroy();
 

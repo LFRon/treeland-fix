@@ -8,7 +8,6 @@
 
 #include <QPoint>
 #include <QObject>
-#include <QSize>
 #include <QString>
 #include <memory>
 #include <vector>
@@ -59,7 +58,6 @@ Q_SIGNALS:
                                    WSurface *target,
                                    QPoint abs,
                                    PreviewDirection direction);
-    void requestDockHideTooltip();
     void requestDockClose();
 
 protected:
