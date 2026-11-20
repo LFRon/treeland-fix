@@ -397,8 +397,18 @@ class Compositor1Adaptor: public QDBusAbstractAdaptor
                 "      <arg direction=\"out\" type=\"ay\" name=\"auth\"/>\n"
                 "    </method>\n"
 #endif
+                "    <method name=\"InputMethodState\">\n"
+                "      <arg direction=\"in\" type=\"u\" name=\"uid\"/>\n"
+                "      <arg direction=\"out\" type=\"b\" name=\"connected\"/>\n"
+                "    </method>\n"
                 "    <signal name=\"SessionChanged\"/>\n"
+#ifndef DISABLE_XWAYLAND
                 "    <signal name=\"XWaylandAuthChanged\"/>\n"
+#endif
+                "    <signal name=\"InputMethodChanged\">\n"
+                "      <arg type=\"u\" name=\"uid\"/>\n"
+                "      <arg type=\"b\" name=\"connected\"/>\n"
+                "    </signal>\n"
                 "  </interface>\n"
                 "")
 public:
@@ -418,6 +428,11 @@ public Q_SLOTS: // METHODS
         return parent()->ActivateWayland(fd);
     }
 
+    bool InputMethodState(uint uid)
+    {
+        return parent()->InputMethodState(uid);
+    }
+
 #ifndef DISABLE_XWAYLAND
     void XWaylandName()
     {
@@ -427,7 +442,10 @@ public Q_SLOTS: // METHODS
 
 Q_SIGNALS: // SIGNALS
     void SessionChanged();
+#ifndef DISABLE_XWAYLAND
     void XWaylandAuthChanged();
+#endif
+    void InputMethodChanged(uint uid, bool connected);
 };
 
 Treeland::Treeland()
@@ -455,6 +473,9 @@ void Treeland::onLoginStateQueried(bool hasLoggedInUser)
 void Treeland::initialize()
 {
     Q_D(Treeland);
+
+    connect(d->server, &WaylandServer::inputMethodChanged,
+            this, &Treeland::InputMethodChanged);
 
     auto globalSession = d->server->sessionManager()->globalSession();
     Q_ASSERT(globalSession);
@@ -590,6 +611,12 @@ RootSurfaceContainer *Treeland::rootSurfaceContainer() const
     Q_D(const Treeland);
 
     return d->server->rootSurfaceContainer();
+}
+
+bool Treeland::InputMethodState(uint uid)
+{
+    auto *server = WaylandServer::instance();
+    return server && server->inputMethodStateForUid(uid);
 }
 
 bool Treeland::ActivateWayland(QDBusUnixFileDescriptor _fd)
